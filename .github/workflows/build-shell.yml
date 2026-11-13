@@ -6,21 +6,21 @@ on:
   workflow_dispatch:
     inputs:
       s2arm_repo:
-        description: "S2Arm 仓库（你的 fork）"
+        description: "S2Arm 仓库"
         required: true
         default: "jhaizhou-ops/S2Arm"
       s2arm_ref:
-        description: "S2Arm 的分支 / 提交"
+        description: "S2Arm 的分支 / 提交（要和本机 S2Arm 版本一致，例如 v0.3.4）"
         required: true
-        default: "main"
+        default: "v0.3.4"
       patch_in_repo:
         description: "本仓库里的补丁路径（空 = 不打补丁）"
         required: false
-        default: "hostfix/nvn_tbuf_align.patch"
+        default: "hostfix/nvn_tbuf_align_v034.patch"
       runner:
-        description: "runner 标签：有 Xcode 27 的大 runner 填 xcode-27，否则用 macos-26 / macos-15"
+        description: "runner 标签（xcode-27 提供 Xcode 27.2 / iOS SDK 27.2）"
         required: true
-        default: "macos-26"
+        default: "xcode-27"
 
 permissions:
   contents: read
@@ -28,7 +28,7 @@ permissions:
 jobs:
   shell:
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Checkout this helper repo
@@ -52,7 +52,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          brew install make || true
+          brew install make meson ninja || true
           xcodebuild -version
           echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
           echo "DEVELOPER_DIR: $(xcode-select -p)"
@@ -70,7 +70,7 @@ jobs:
           PIN="$(awk -F= '$1=="IPHONEOS_SDK_MAJOR"{print $2}' tools/toolchain.env)"
           echo "runner SDK major = $SDK_MAJOR, toolchain.env pins $PIN"
           if [ "$SDK_MAJOR" != "$PIN" ]; then
-            # 壳编号按 toolchain.env 算；runner 的 Xcode 大版本不同就改成实际值（自用壳，不追求与发行壳同号）
+            # 壳编号按 toolchain.env 算；runner 的 Xcode 大版本不同就改成实际值（自用壳）
             sed -i.bak "s/^IPHONEOS_SDK_MAJOR=.*/IPHONEOS_SDK_MAJOR=$SDK_MAJOR/" tools/toolchain.env
             rm -f tools/toolchain.env.bak
           fi
