@@ -1,0 +1,316 @@
+﻿diff --git a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/BindlessElimination.cs b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/BindlessElimination.cs
+index 6afc7cf..aaf8fca 100644
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/BindlessElimination.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/BindlessElimination.cs
+@@ -8,7 +8,16 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+ {
+     class BindlessElimination
+     {
++        // c[2]：NVN 的贴图 / 采样器句柄表（见 IsTableWord）
++        private const int NvnTextureBufferIndex = 2;
++
+         public static void RunPass(BasicBlock block, ResourceManager resourceManager, IGpuAccessor gpuAccessor)
++        {
++            RunPass(block, resourceManager, gpuAccessor, deferSeveral: false);
++        }
++
++        // S2A（FINAL FANTASY RESONANCE 招式特效缺失；nxnative #168 / 上游参考实现 99d0aae）：deferSeveral 把「句柄汇合出多个 c[2] 句柄」的读留到全篇第二趟（见 TryTableHandle）
++        public static void RunPass(BasicBlock block, ResourceManager resourceManager, IGpuAccessor gpuAccessor, bool deferSeveral)
+         {
+             // We can turn a bindless into regular access by recognizing the pattern
+             // produced by the compiler for separate texture and sampler.
+@@ -32,8 +41,24 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+                     continue;
+                 }
+ 
+-                if (!TryConvertBindless(block, resourceManager, gpuAccessor, texOp) &&
+-                    !GenerateBindlessAccess(block, resourceManager, gpuAccessor, texOp, node))
++                if (TryConvertBindless(block, resourceManager, gpuAccessor, texOp))
++                {
++                    continue;
++                }
++
++                TableHandle table = TryTableHandle(block, resourceManager, gpuAccessor, texOp, node, deferSeveral);
++
++                if (table == TableHandle.Deferred)
++                {
++                    continue;
++                }
++
++                if ((table == TableHandle.Set && TryConvertBindless(block, resourceManager, gpuAccessor, texOp)) ||
++                    GenerateBindlessAccess(block, resourceManager, gpuAccessor, texOp, node))
++                {
++                    continue;
++                }
++
+                 {
+                     // If we can't do bindless elimination, remove the texture operation.
+                     // Set any destination variables to zero.
+@@ -54,6 +79,213 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+             }
+         }
+ 
++        // S2A（FINAL FANTASY RESONANCE 招式特效缺失；nxnative #168 / 上游参考实现 99d0aae 的 TryTableHandle）：NVN 的贴图和图像句柄都在 c[2]。
++        // 句柄经 phi 到达时，phi 的其它输入并不都是 c[2] 的字：未定义，或编译器在读不执行的路径上留在同一寄存器里的别的值
++        // （属性读按发射器、浮点还是半精度分支，BlockConditionsMatch 看不穿这种谓词）。这时读只可能取那些 c[2] 字给出的贴图。
++        // UE Niagara 的粒子顶点工厂正是这样读粒子属性；上游原样把读删掉、结果置 0，粒子大小读成 0，火与烟网格缩成一点
++        // （本款约 8.6 万条读、约 6100 支着色器）。只有一个候选就顶替 phi；多个候选（浮点与半精度两个缓冲到同一条读）各发一条读，
++        // 按句柄运行时的值选结果（宿主把已绑定的句柄，动态句柄数组则把互不相同的槽号，写进 c[2]）。同一句柄的所有用途共用一个
++        // 按读者定型的绑定，所以被别的读当成另一种形状（这里 2D、那里 2D 数组）的候选会让这条读失效，要剔掉：这些读留到第二趟
++        // （deferSeveral），等其它读都登记完贴图类型再转。
++        private enum TableHandle { None, Set, Deferred }
++
++        private static TableHandle TryTableHandle(BasicBlock block, ResourceManager resourceManager, IGpuAccessor gpuAccessor, TextureOperation texOp, LinkedListNode<INode> node, bool deferSeveral)
++        {
++            Operand handle = texOp.GetSource(0);
++
++            if (!gpuAccessor.QueryBindlessPhiSeeThrough())
++            {
++                // 只在直连（Metal）翻译器上开：Vulkan / OpenGL 后端按上游原样，避免改到别的平台的翻译结果
++                return TableHandle.None;
++            }
++
++            if (handle.AsgOp is not PhiNode)
++            {
++                return TableHandle.None;
++            }
++
++            List<(Operand Texture, Operand Sampler)> found = new();
++
++            foreach (Operand leaf in PhiLeaves(handle))
++            {
++                if (IsTableWord(leaf))
++                {
++                    AddCandidate(found, leaf, null);
++                }
++                else if (!texOp.Inst.IsImage() && leaf.AsgOp is Operation orOp && orOp.Inst == Instruction.BitwiseOr)
++                {
++                    foreach (Operand texture in PhiLeaves(orOp.GetSource(0)))
++                    {
++                        foreach (Operand sampler in PhiLeaves(orOp.GetSource(1)))
++                        {
++                            if (IsTableWord(texture) && (IsTableWord(sampler) || (sampler.Type == OperandType.Constant && (sampler.Value & 0xfffff) == 0)))
++                            {
++                                AddCandidate(found, texture, sampler);
++                            }
++                        }
++                    }
++                }
++                else if (leaf.AsgOp is Operation load && load.Inst == Instruction.Load)
++                {
++                    return TableHandle.None;   // 从内存或输入装载的句柄是真无绑定访问（交给 GenerateBindlessAccess）
++                }
++            }
++
++            if (found.Count > 1)
++            {
++                if (deferSeveral)
++                {
++                    return TableHandle.Deferred;
++                }
++
++                found = found.FindAll(candidate => resourceManager.GetTextureTypes(NvnTextureBufferIndex, candidate.Texture.GetCbufOffset(), texOp.Inst.IsImage())
++                    .TrueForAll(type => SameShape(type, texOp.Type)));
++            }
++
++            if (found.Count == 0)
++            {
++                return TableHandle.None;
++            }
++
++            int last = found.Count - 1;
++            Operand[] matches = new Operand[last];
++            Operand[][] results = new Operand[last][];
++
++            for (int index = 0; index < last; index++)
++            {
++                Operand candidate = CandidateHandle(block, node, found[index]);
++                Operand[] sources = new Operand[texOp.SourcesCount];
++                results[index] = new Operand[texOp.DestsCount];
++
++                for (int srcIndex = 0; srcIndex < sources.Length; srcIndex++)
++                {
++                    sources[srcIndex] = srcIndex == 0 ? candidate : texOp.GetSource(srcIndex);
++                }
++
++                for (int destIndex = 0; destIndex < results[index].Length; destIndex++)
++                {
++                    results[index][destIndex] = OperandHelper.Local();
++                }
++
++                TextureOperation read = new(texOp.Inst, texOp.Type, texOp.Format, texOp.Flags, texOp.Set, texOp.Binding, texOp.Index, results[index], sources);
++                LinkedListNode<INode> readNode = block.Operations.AddBefore(node, read);
++
++                if (!TryConvertBindless(block, resourceManager, gpuAccessor, read))
++                {
++                    for (int destIndex = 0; destIndex < results[index].Length; destIndex++)
++                    {
++                        block.Operations.AddBefore(readNode, new Operation(Instruction.Copy, results[index][destIndex], OperandHelper.Const(0)));
++                    }
++
++                    Utils.DeleteNode(readNode, read);
++                }
++
++                matches[index] = OperandHelper.Local();
++                block.Operations.AddBefore(node, new Operation(Instruction.CompareEqual, matches[index], handle, candidate));
++            }
++
++            texOp.SetSource(0, CandidateHandle(block, node, found[last]));
++
++            LinkedListNode<INode> after = node;
++
++            for (int destIndex = 0; destIndex < texOp.DestsCount && last > 0; destIndex++)
++            {
++                Operand dest = texOp.GetDest(destIndex);
++                Operand value = OperandHelper.Local();
++                texOp.SetDest(destIndex, value);
++
++                for (int index = last - 1; index >= 0; index--)
++                {
++                    Operand selected = index == 0 ? dest : OperandHelper.Local();
++                    after = block.Operations.AddAfter(after, new Operation(Instruction.ConditionalSelect, selected, matches[index], results[index][destIndex], value));
++                    value = selected;
++                }
++            }
++
++            gpuAccessor.Log(found.Count == 1
++                ? "Bindless handle taken from the one c[2] handle among its phi inputs."
++                : $"Bindless handle chosen at run time among {found.Count} c[2] handles of its phi inputs.");
++
++            return TableHandle.Set;
++        }
++
++        // 这个形状的贴图能不能按这条指令的读法读（1D 与贴图缓冲只由描述符区分）
++        private static bool SameShape(SamplerType type, SamplerType opType)
++        {
++            const SamplerType Shape = SamplerType.Mask | SamplerType.Array | SamplerType.Multisample;
++
++            static SamplerType Of(SamplerType t)
++            {
++                t &= Shape;
++
++                return t == SamplerType.TextureBuffer ? SamplerType.Texture1D : t;
++            }
++
++            return Of(type) == Of(opType);
++        }
++
++        private static Operand CandidateHandle(BasicBlock block, LinkedListNode<INode> node, (Operand Texture, Operand Sampler) candidate)
++        {
++            if (candidate.Sampler == null)
++            {
++                return candidate.Texture;
++            }
++
++            Operand combined = OperandHelper.Local();
++            block.Operations.AddBefore(node, new Operation(Instruction.BitwiseOr, combined, candidate.Texture, candidate.Sampler));
++
++            return combined;
++        }
++
++        private static bool IsTableWord(Operand operand)
++        {
++            return operand.Type == OperandType.ConstantBuffer && operand.GetCbufSlot() == NvnTextureBufferIndex;
++        }
++
++        private static void AddCandidate(List<(Operand Texture, Operand Sampler)> found, Operand texture, Operand sampler)
++        {
++            foreach ((Operand t, Operand s) in found)
++            {
++                if (t.Value == texture.Value && (s == null ? sampler == null : sampler != null && s.Type == sampler.Type && s.Value == sampler.Value))
++                {
++                    return;
++                }
++            }
++
++            found.Add((texture, sampler));
++        }
++
++        // 一个 phi 能取到的值，穿过它汇合的 phi（每个只走一次）
++        private static List<Operand> PhiLeaves(Operand operand)
++        {
++            List<Operand> leaves = new();
++            HashSet<PhiNode> visited = new();
++            Stack<Operand> pending = new();
++            pending.Push(operand);
++
++            while (pending.Count > 0)
++            {
++                Operand current = pending.Pop();
++
++                if (current.AsgOp is PhiNode phi)
++                {
++                    if (visited.Add(phi))
++                    {
++                        for (int index = 0; index < phi.SourcesCount; index++)
++                        {
++                            pending.Push(phi.GetSource(index));
++                        }
++                    }
++                }
++                else
++                {
++                    leaves.Add(current);
++                }
++            }
++
++            return leaves;
++        }
++
+         private static bool GenerateBindlessAccess(
+             BasicBlock block,
+             ResourceManager resourceManager,
+diff --git a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/Optimizer.cs b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/Optimizer.cs
+index e0045f7..4ea5223 100644
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/Optimizer.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/Optimizer.cs
+@@ -34,7 +34,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+                     BindlessToArray.RunPass(context.Blocks[blkIndex], context.ResourceManager, context.GpuAccessor, context.Definitions.Ampere);
+                 }
+ 
+-                BindlessElimination.RunPass(context.Blocks[blkIndex], context.ResourceManager, context.GpuAccessor);
++                BindlessElimination.RunPass(context.Blocks[blkIndex], context.ResourceManager, context.GpuAccessor, deferSeveral: true);
+ 
+                 // FragmentCoord only exists on fragment shaders, so we don't need to check other stages.
+                 if (context.Stage == ShaderStage.Fragment)
+@@ -49,6 +49,12 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+                 }
+             }
+ 
++            // S2A（nxnative #168）：句柄汇合出多个 c[2] 句柄的读，等其它读都登记完贴图类型后再转（BindlessElimination.TryTableHandle）
++            for (int blkIndex = 0; blkIndex < context.Blocks.Length; blkIndex++)
++            {
++                BindlessElimination.RunPass(context.Blocks[blkIndex], context.ResourceManager, context.GpuAccessor);
++            }
++
+             // Run optimizations one last time to remove any code that is now optimizable after above passes.
+             RunOptimizationPasses(context.Blocks, context.ResourceManager);
+         }
+diff --git a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+index f435114..77ed1d4 100644
+--- a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+@@ -501,6 +501,23 @@ namespace Ryujinx.Graphics.Shader.Translation
+             return new SetBindingPair(setIndex, binding);
+         }
+ 
++        // S2A（nxnative #168）：别的指令给「常量缓冲 cbufSlot 里偏移 textureOffset 处的句柄」登记过的贴图类型（不管配的是哪个采样器），
++        // 给 BindlessElimination.TryTableHandle 用；句柄数组（ArrayLength > 1）不算——它们的绑定形状由数组决定。
++        public List<SamplerType> GetTextureTypes(int cbufSlot, int textureOffset, bool isImage)
++        {
++            List<SamplerType> types = new();
++
++            foreach ((TextureInfo info, TextureMeta meta) in isImage ? _usedImages : _usedTextures)
++            {
++                if (info.ArrayLength == 1 && meta.AccurateType && info.CbufSlot == cbufSlot && info.Handle == textureOffset)
++                {
++                    types.Add(meta.Type);
++                }
++            }
++
++            return types;
++        }
++
+         private static TextureMeta MergeTextureMeta(TextureMeta meta, TextureMeta existingMeta)
+         {
+             meta.Set = existingMeta.Set;
