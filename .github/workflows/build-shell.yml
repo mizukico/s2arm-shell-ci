@@ -5,27 +5,29 @@ name: build-s2arm-shell
 on:
   workflow_dispatch:
     inputs:
-      s2arm_ref:
-        description: "S2Arm 的分支 / 提交（建议填你 fork 的分支名）"
-        required: true
-        default: "main"
       s2arm_repo:
         description: "S2Arm 仓库（你的 fork）"
         required: true
         default: "jhaizhou-ops/S2Arm"
+      s2arm_ref:
+        description: "S2Arm 的分支 / 提交"
+        required: true
+        default: "main"
       patch_in_repo:
-        description: "本仓库里的补丁路径（相对根目录；空 = 不打补丁，先验证链路）"
+        description: "本仓库里的补丁路径（空 = 不打补丁）"
         required: false
-        default: ""
+        default: "hostfix/nvn_tbuf_align.patch"
+      runner:
+        description: "runner 标签：有 Xcode 27 的大 runner 填 xcode-27，否则用 macos-26 / macos-15"
+        required: true
+        default: "macos-26"
 
 permissions:
   contents: read
 
 jobs:
   shell:
-    # 需要带 Xcode 27 的 macOS runner。标准 macos-* 标签通常只有 Xcode 26；
-    # 这个标签来自你账号可用的镜像（Bayo3-T 那个 run 用的就是它）。
-    runs-on: xcode-27
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 180
 
     steps:
@@ -41,17 +43,6 @@ jobs:
           fetch-depth: 0          # shell_build.sh 用 git 对象号算壳编号，要完整历史
           persist-credentials: false
 
-      - name: Apply host patch (optional)
-        if: inputs.patch_in_repo != ''
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd s2arm
-          git apply -v "$GITHUB_WORKSPACE/${{ inputs.patch_in_repo }}"
-          # shell_build.sh 要求壳输入表里的文件 git 干净，补丁必须落成一个提交
-          git -c user.name=s2arm-ci -c user.email=ci@local add -A
-          git -c user.name=s2arm-ci -c user.email=ci@local commit -m "ci: apply ${{ inputs.patch_in_repo }}"
-
       - name: Set up .NET SDK
         uses: actions/setup-dotnet@v4
         with:
@@ -66,11 +57,26 @@ jobs:
           echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
           echo "DEVELOPER_DIR: $(xcode-select -p)"
           dotnet --version
-          # shell_build.sh 只比较主版本；对不上就先别跑后面的步骤
+
+      - name: Apply patch and align the SDK pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd s2arm
+          if [ -n "${{ inputs.patch_in_repo }}" ]; then
+            git apply -v "$GITHUB_WORKSPACE/${{ inputs.patch_in_repo }}"
+          fi
           SDK_MAJOR="$(xcrun --sdk iphoneos --show-sdk-version | cut -d. -f1)"
-          PIN="$(awk -F= '$1=="IPHONEOS_SDK_MAJOR"{print $2}' s2arm/tools/toolchain.env)"
-          echo "sdk major = $SDK_MAJOR, toolchain.env pins $PIN"
-          test "$SDK_MAJOR" = "$PIN" || { echo "::error::iOS SDK 主版本不一致：runner=$SDK_MAJOR, toolchain.env=$PIN"; exit 1; }
+          PIN="$(awk -F= '$1=="IPHONEOS_SDK_MAJOR"{print $2}' tools/toolchain.env)"
+          echo "runner SDK major = $SDK_MAJOR, toolchain.env pins $PIN"
+          if [ "$SDK_MAJOR" != "$PIN" ]; then
+            # 壳编号按 toolchain.env 算；runner 的 Xcode 大版本不同就改成实际值（自用壳，不追求与发行壳同号）
+            sed -i.bak "s/^IPHONEOS_SDK_MAJOR=.*/IPHONEOS_SDK_MAJOR=$SDK_MAJOR/" tools/toolchain.env
+            rm -f tools/toolchain.env.bak
+          fi
+          # shell_build.sh 要求壳输入表里的文件 git 干净：把补丁与 pin 落成一个提交
+          git add -A
+          git -c user.name=s2arm-ci -c user.email=ci@local commit -m "ci: host patch + iOS SDK pin ($SDK_MAJOR)" || echo "nothing to commit"
 
       - name: Build shell
         shell: bash
