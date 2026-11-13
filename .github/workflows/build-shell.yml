@@ -1,0 +1,88 @@
+name: build-s2arm-shell
+
+# 只编 iOS 壳（含 Metal host），不碰游戏、不需要 prod.keys。
+# 产物：out-shell/（root/ + manifest.json），下载后替换 S2Arm 安装目录里的 Shell/。
+on:
+  workflow_dispatch:
+    inputs:
+      s2arm_ref:
+        description: "S2Arm 的分支 / 提交（建议填你 fork 的分支名）"
+        required: true
+        default: "main"
+      s2arm_repo:
+        description: "S2Arm 仓库（你的 fork）"
+        required: true
+        default: "jhaizhou-ops/S2Arm"
+      patch_in_repo:
+        description: "本仓库里的补丁路径（相对根目录；空 = 不打补丁，先验证链路）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    # 需要带 Xcode 27 的 macOS runner。标准 macos-* 标签通常只有 Xcode 26；
+    # 这个标签来自你账号可用的镜像（Bayo3-T 那个 run 用的就是它）。
+    runs-on: xcode-27
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout this helper repo
+        uses: actions/checkout@v4
+
+      - name: Checkout S2Arm
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.s2arm_repo }}
+          ref: ${{ inputs.s2arm_ref }}
+          path: s2arm
+          fetch-depth: 0          # shell_build.sh 用 git 对象号算壳编号，要完整历史
+          persist-credentials: false
+
+      - name: Apply host patch (optional)
+        if: inputs.patch_in_repo != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd s2arm
+          git apply -v "$GITHUB_WORKSPACE/${{ inputs.patch_in_repo }}"
+          # shell_build.sh 要求壳输入表里的文件 git 干净，补丁必须落成一个提交
+          git -c user.name=s2arm-ci -c user.email=ci@local add -A
+          git -c user.name=s2arm-ci -c user.email=ci@local commit -m "ci: apply ${{ inputs.patch_in_repo }}"
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Toolchain check
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install make || true
+          xcodebuild -version
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "DEVELOPER_DIR: $(xcode-select -p)"
+          dotnet --version
+          # shell_build.sh 只比较主版本；对不上就先别跑后面的步骤
+          SDK_MAJOR="$(xcrun --sdk iphoneos --show-sdk-version | cut -d. -f1)"
+          PIN="$(awk -F= '$1=="IPHONEOS_SDK_MAJOR"{print $2}' s2arm/tools/toolchain.env)"
+          echo "sdk major = $SDK_MAJOR, toolchain.env pins $PIN"
+          test "$SDK_MAJOR" = "$PIN" || { echo "::error::iOS SDK 主版本不一致：runner=$SDK_MAJOR, toolchain.env=$PIN"; exit 1; }
+
+      - name: Build shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd s2arm
+          bash pack/shell_build.sh "$GITHUB_WORKSPACE/out-shell"
+
+      - name: Upload shell artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2arm-shell
+          path: out-shell
+          if-no-files-found: error
+          retention-days: 7
