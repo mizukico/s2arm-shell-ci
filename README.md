@@ -83,3 +83,13 @@ audit #1534 P1-20 probe: shader ... stage 5 image slot 0 declares Metal type 9 c
 
 即 compute 核把 `texture_buffer<float, access::write>` 绑在 uint / sint 格式的缓冲上（数值类不同）。
 如果柱状/闪烁仍在，下一步是让翻译器按描述符真实格式声明 image 的数值类——那条在本地就能重出库验证，不用 GHA。
+
+## 第三次：带 #427 的补丁（`hostfix/nvn_tbuf_align_plus_fb_slot256_v034.patch`）
+
+和上一节同一个壳，多一处 `nvn_mtl.m` 的改动（S2Arm #427 / #839）：`fb_prepare` 找「这一笔采样了自己遍里的附件」
+时只扫 0–127 号贴图槽，改成扫满 256（`b->reg >= NTEX`）。空之轨迹 the 1st 99.99% 的采样贴图绑在 128–255 号分离贴图槽上，
+这项检查对它是整体失效的。
+
+跑法：`s2arm_ref = v0.3.4`，`patch_in_repo = hostfix/nvn_tbuf_align_plus_fb_slot256_v034.patch`。
+已跑过：run `43417052549`（11 分 41 秒），artifact `14033205940`，新壳 `shellId 9fa678a5591f5626`（chain `0be3f28548fd`）。
+换壳与重出包见本地仓库的 `report427/swap-shell.ps1` / `report427/repack-427.ps1`。
