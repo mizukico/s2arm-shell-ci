@@ -1,0 +1,136 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 6e1c778..786ef0c 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -6399,7 +6399,7 @@ static id<MTLBuffer> arena_find(const uint8_t *p, NSUInteger *off, NSUInteger *l
+ //   the slot read 0 again, the same flicker). Before a draw / dispatch that reads such a buffer texture as 2D rows, tba_prepare ends the open render pass and has the GPU copy
+ //   the bytes into the frame arena (256-byte aligned), after every earlier GPU write in queue order; the view is made on the copy. A copy holds until the next buffer write outside
+ //   a render pass or the next submission (g_wr_epoch / g_arena_gen, as the indirect-draw conversions)
+-typedef struct { uint64_t ser, off; MTLPixelFormat pf; __unsafe_unretained id<MTLBuffer> src; __strong id<MTLBuffer> buf; size_t boff, len; } tba_ent;
++typedef struct { uint64_t ser, off; MTLPixelFormat pf; __unsafe_unretained id<MTLBuffer> src; __strong id<MTLBuffer> buf; size_t boff, len; int plain; } tba_ent;   // plain = a whole-element copy for a plain texture-buffer view (tpa_copy); 0 = the 2D-row copy (tba_copy)
+ enum { TBA_MAX = 32 };
+ static tba_ent g_tba[TBA_MAX]; static int g_tba_n; static uint64_t g_tba_epoch, g_tba_sub, g_tba_copies, g_tba_bytes, g_tba_splits;
+ static void tba_valid(void) {
+@@ -6407,11 +6407,14 @@ static void tba_valid(void) {
+     for (int i = 0; i < g_tba_n; i++) g_tba[i].buf = nil;
+     g_tba_n = 0; g_tba_epoch = g_wr_epoch; g_tba_sub = g_arena_gen;
+ }
+-static const tba_ent *tba_find(uint64_t ser, id<MTLTexture> t) {
++static const tba_ent *tba_find(uint64_t ser, id<MTLTexture> t, int plain) {
+     tba_valid();
+-    for (int i = 0; i < g_tba_n; i++) if (g_tba[i].ser == ser && g_tba[i].src == t.buffer && g_tba[i].off == t.bufferOffset && g_tba[i].pf == t.pixelFormat) return &g_tba[i];
++    for (int i = 0; i < g_tba_n; i++) if (g_tba[i].ser == ser && g_tba[i].src == t.buffer && g_tba[i].off == t.bufferOffset && g_tba[i].pf == t.pixelFormat && g_tba[i].plain == plain) return &g_tba[i];
+     return NULL;
+ }
++// Plain (whole-element) texture-buffer views at unaligned pool offsets: copied on the GPU, view on the copy (tpa_copy / tpa_view)
++static int tpa_copy(int tid);
++static id<MTLTexture> tpa_view(int tid, id<MTLTexture> t, uint64_t *rid);
+ // The 2D-row geometry tbuf_as_2d uses (shared with tba_prepare so the copy covers exactly what the view reads); 0 = no 2D-row form
+ static int tbuf_geom(const tex_t *tt, id<MTLTexture> t, int exact, uint32_t *w, uint32_t *h, uint32_t *row) {
+     int bw, bh; uint32_t bpb = (uint32_t)nvn_fmt_bpb(tt->d.format, &bw, &bh); NSUInteger al = linear_align(t.pixelFormat);
+@@ -6420,7 +6423,7 @@ static int tbuf_geom(const tex_t *tt, id<MTLTexture> t, int exact, uint32_t *w,
+     return nvn_tbuf_rows(t.width, bpb, (uint32_t)al, w, h, row);
+ }
+ static id<MTLTexture> tbuf_rows_shadow(int tid, id<MTLTexture> t, const tex_t *tt, uint32_t w, uint32_t h, uint32_t row, uint64_t *rid) {
+-    const tba_ent *ge = tba_find(tt->serial, t);
++    const tba_ent *ge = tba_find(tt->serial, t, 0);
+     if (ge) {   // copied on the GPU before this draw / dispatch (tba_prepare)
+         while (h > 1 && (uint64_t)row * h > ge->len) h--;
+         MTLTextureDescriptor *gd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:t.pixelFormat width:w height:h mipmapped:NO];
+@@ -9949,6 +9952,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
+             if (bl) PD("B %llu st%d tbuf reg%d tid=%d %s ser=%llu fmt=%#x n=%u mem=%p", g_stat_pass, nvn_stage, reg, tid, t ? "real" : "dummy", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull,
+                        tid < g_ntreg ? g_treg[tid].t.d.format : 0, tid < g_ntreg ? g_treg[tid].t.d.width : 0, tid < g_ntreg ? (void *)g_treg[tid].t.mem : NULL);
+             if (!t) t = tbuf_expand(tid, 0, &trid);   // buffer textures of an expanded format: expanded copy (see tbuf_expand)
++            if (t) { uint64_t r3 = 0; id<MTLTexture> v = tpa_view(tid, t, &r3); if (v) { t = v; trid = r3; } }   // unaligned pool offset: the aligned copy (tpa_copy / tpa_view)
+             if (!t) { t = dummy_tbuf(b->dpf); trid = g_dummy_tbuf_rid[b->dpf & 3]; }
+             slots[aid] = trid;
+             USE(t, MTLResourceUsageRead);
+@@ -9960,6 +9964,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
+                 if (b->dtt == (uint8_t)MTLTextureTypeTextureBuffer) {
+                     if (t && t.textureType != MTLTextureTypeTextureBuffer) t = nil;   // a slot the shader does not pick here may hold another kind of texture
+                     if (!t) t = tbuf_expand(tid, 0, &trid);   // buffer textures of an expanded format: expanded copy (see tbuf_expand)
++                    if (t) { uint64_t r3 = 0; id<MTLTexture> v = tpa_view(tid, t, &r3); if (v) { t = v; trid = r3; } }   // unaligned pool offset: the aligned copy (tpa_copy / tpa_view)
+                     if (!t) { t = dummy_tbuf(b->dpf); trid = g_dummy_tbuf_rid[b->dpf & 3]; }
+                 } else {
+                     if (t && t.textureType != (MTLTextureType)b->dtt) { uint64_t r2 = 0; id<MTLTexture> v = tex_fit_elem(tid, t, (MTLTextureType)b->dtt, &r2); t = v; trid = v ? r2 : 0; }
+@@ -10270,18 +10275,52 @@ static int tba_copy(int tid, int exact) {
+     void *tv = NULL; (void)tex_fast_rid(tid, &tv); __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
+     if (!t || t.textureType != MTLTextureTypeTextureBuffer || !t.buffer || !(t.bufferOffset % linear_align(t.pixelFormat))) return 0;
+     const tex_t *tt = &g_treg[tid].t; uint32_t w, h, row;
+-    if (!tbuf_geom(tt, t, exact, &w, &h, &row) || tba_find(tt->serial, t)) return 0;
++    if (!tbuf_geom(tt, t, exact, &w, &h, &row) || tba_find(tt->serial, t, 0)) return 0;
+     uint64_t avail = t.buffer.length > t.bufferOffset ? t.buffer.length - t.bufferOffset : 0, want = (uint64_t)row * h; size_t len = (size_t)(want < avail ? want : avail);
+     if (!len) return 0;
+     if (g_enc) { g_tba_splits++; PD("M %llu texture buffer aligned copy on the GPU: render pass split here", g_stat_pass); rp_end(); }
+     id<MTLBuffer> ab = nil; size_t off = arena_alloc(len, &ab); if (!ab) return 0;
+     enc_b_copy_buffer(blit(), t.buffer, t.bufferOffset, ab, off, len);
+-    g_tba[g_tba_n++] = (tba_ent){tt->serial, t.bufferOffset, t.pixelFormat, t.buffer, ab, off, len};
++    g_tba[g_tba_n++] = (tba_ent){tt->serial, t.bufferOffset, t.pixelFormat, t.buffer, ab, off, len, 0};
+     g_tba_copies++; g_tba_bytes += len;
+     if (g_tba_copies == 1 || g_tba_copies == 100 || g_tba_copies % 100000 == 0) MLOG("texture buffer at an unaligned pool offset (%lu, texture ID %d): copied on the GPU into the frame arena before use (%lu bytes; %llu copies so far)",
+         (unsigned long)t.bufferOffset, tid, (unsigned long)len, (unsigned long long)g_tba_copies);
+     return 1;
+ }
++// A buffer texture bound as a plain texture_buffer (not the 2D-row form of a wrapped 1D fetch) at a pool offset the linear-texture alignment refuses
++//   (S2Arm 11-13, FINAL FANTASY RESONANCE: pool offset 0xc8): on an Apple GPU such a view may read from the 16-byte boundary below the offset (measured on
++//   an M4). Copy the whole element range on the GPU into the frame arena and make the view on the copy (offset 0). Returns 1 when it made a copy.
++static int tpa_copy(int tid) {
++    if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok || g_tba_n >= TBA_MAX) return 0;
++    void *tv = NULL; (void)tex_fast_rid(tid, &tv); __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
++    if (!t || t.textureType != MTLTextureTypeTextureBuffer || !t.buffer) return 0;
++    NSUInteger al = linear_align(t.pixelFormat);
++    if (!al || !(t.bufferOffset % al)) return 0;
++    const tex_t *tt = &g_treg[tid].t;
++    if (tba_find(tt->serial, t, 1)) return 0;
++    int bw = 1, bh = 1; uint32_t bpb = (uint32_t)nvn_fmt_bpb(tt->d.format, &bw, &bh);
++    if (!bpb || bw != 1 || bh != 1 || !t.width) return 0;
++    size_t len = (size_t)t.width * bpb;
++    if (g_enc) { g_tba_splits++; PD("M %llu texture buffer aligned copy on the GPU: render pass split here", g_stat_pass); rp_end(); }
++    id<MTLBuffer> ab = nil; size_t off = arena_alloc(len, &ab); if (!ab) return 0;
++    enc_b_copy_buffer(blit(), t.buffer, t.bufferOffset, ab, off, len);
++    g_tba[g_tba_n++] = (tba_ent){tt->serial, t.bufferOffset, t.pixelFormat, t.buffer, ab, off, len, 1};
++    g_tba_copies++; g_tba_bytes += len;
++    if (g_tba_copies == 1 || g_tba_copies % 100000 == 0) MLOG("texture buffer at an unaligned pool offset (%lu, texture ID %d): copied on the GPU into the frame arena before use (%lu bytes; %llu copies so far; plain view)",
++        (unsigned long)t.bufferOffset, tid, (unsigned long)len, (unsigned long long)g_tba_copies);
++    return 1;
++}
++static id<MTLTexture> tpa_view(int tid, id<MTLTexture> t, uint64_t *rid) {
++    if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok || !t) return nil;
++    const tba_ent *ge = tba_find(g_treg[tid].t.serial, t, 1);
++    if (!ge) return nil;
++    NSUInteger al = linear_align(t.pixelFormat); size_t row = ge->len ? ((ge->len + al - 1) / al * al) : 0;
++    MTLTextureDescriptor *d = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:t.pixelFormat width:t.width resourceOptions:ge->buf.resourceOptions usage:MTLTextureUsageShaderRead];
++    id<MTLTexture> v = [ge->buf newTextureWithDescriptor:d offset:ge->boff bytesPerRow:row];
++    if (!v) { if (!g_tb2_shadow_fail++) MLOG("銆愮孩銆?cannot create the aligned shadow view of a texture buffer (texture ID %d)", tid); return nil; }
++    defer_obj_release(v); *rid = v.gpuResourceID._impl; g_tb2_binds++;
++    return v;
++}
+ // Before a draw / dispatch: every buffer texture the stages read as 2D rows (wrapped 1D fetch) gets its GPU copy if it needs one (tba_copy). sh / stage: the program's stages (draw)
+ //   or the compute shader (dispatch, stage 5)
+ static void tba_prepare(NvShader *x0, NvShader *x1, NvShader *x2, NvShader *x3, NvShader *x4, int compute) {
+@@ -10289,7 +10328,12 @@ static void tba_prepare(NvShader *x0, NvShader *x1, NvShader *x2, NvShader *x3,
+     for (int k = 0; k < 5; k++) { NvShader *x = sh[k]; if (!x) continue; int stage = compute ? 5 : k;
+         for (int i = 0; i < x->rf.nb; i++) { const nvn_rbind *b = &x->rf.b[i];
+             if (b->kind != NVN_RB_TEX || !b->f1d || (MTLTextureType)b->dtt != MTLTextureType2D) continue;
+-            made |= tba_copy((int)(tex_slot_h(S.tex[stage], S.img[stage], b->reg) & 0xfffff), b->f1d == 2); } }
++            made |= tba_copy((int)(tex_slot_h(S.tex[stage], S.img[stage], b->reg) & 0xfffff), b->f1d == 2); }
++        for (int i = 0; i < x->rf.nb; i++) { const nvn_rbind *b = &x->rf.b[i];
++            if (b->kind == NVN_RB_TBUF) made |= tpa_copy((int)(tex_slot_h(S.tex[stage], S.img[stage], b->reg) & 0xfffff));
++            else if (b->kind == NVN_RB_TBUFU) made |= tpa_copy(ubo_tex_id(ubo_packed(stage, b)));
++            else if (b->kind == NVN_RB_TEXD && b->dtt == (uint8_t)MTLTextureTypeTextureBuffer)
++                for (int k = 0; k < b->n; k++) { uint64_t hk = k < 128 ? (S.tex[stage][k] ? S.tex[stage][k] : S.tex[stage][NVN_SEPTEX_SLOT0 + k]) : 0; made |= tpa_copy((int)(hk & 0xfffff)); } } }
+     if (made && g_blit) { enc_b_end(g_blit); g_blit = nil; }   // the copies end their encoder: the next pass / dispatch begins with its barrier after them
+ }
+ static void draw(const p_draw *dw, const p_draw_idx *di);
+@@ -12172,7 +12216,10 @@ static void fb_prepare(NvProg *pr) {
+     if (!pr || !pr->sh[1] || !R.rt.n || g_fz.active || g_defer_replaying) return;
+     NvShader *fs = pr->sh[1]; int listed = fb_want(fs->key); if (g_fb_off) return;
+     id<MTLTexture> cbase[4] = {nil}, csnap[4] = {nil}; NSUInteger ckey[4][4]; int ncopy = 0, settled = 0;   // ④ copies of this draw by real subresource (base, levels, slices); clears landed
+-    for (int i = 0; i < fs->rf.nb && g_fb_n < 4; i++) { const nvn_rbind *b = &fs->rf.b[i]; if (b->kind != NVN_RB_TEX || b->reg >= 128) continue;
++    // 贴图槽表是 0..NTEX-1（256）：0-127 是组合句柄（BindTexture），128-255 是分离贴图上绑（NVN_SEPTEX_SLOT0，nvn_obj.h）。原先这里只查 128 号以下，
++    //   从 128 号以上读自己这一遍附件的绘制不换快照、原地边读边写，Metal 下读到写到一半的块：#839 一款动作游戏的 FXAA 从 128 号槽读正在写的场景图（NaN / Inf 进场景，
++    //   泛光扩散后整屏发绿带黑块）；#427 空之轨迹 the 1st 从 128 号槽读同一遍的深度附件（阴影遮罩后面的几遍算成 0，3D 全黑而视频 / UI 正常）。槽表 0..255 全查。
++    for (int i = 0; i < fs->rf.nb && g_fb_n < 4; i++) { const nvn_rbind *b = &fs->rf.b[i]; if (b->kind != NVN_RB_TEX || b->reg >= NTEX) continue;
+         int tid = (int)(tex_slot_h(S.tex[1], S.img[1], b->reg) & 0xfffff);
+         alias_key sampled;
+         pthread_mutex_lock(&g_rmu); uint64_t ser = tid < g_ntreg && g_treg[tid].ok ? g_treg[tid].t.serial : 0;
