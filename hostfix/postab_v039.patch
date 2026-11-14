@@ -685,7 +685,7 @@
      S.ds = ds0; S.poly = po0; S.has_vp = hv0; memcpy(S.vp[0], vp0, sizeof vp0); memcpy(S.dr, dr0, sizeof dr0); memcpy(S.vp_sw[0], sw0, sizeof sw0);
      g_dss_dirty = 1;
      if (!drawn) return;   // empty scissor
-@@ -13549,9 +13794,13 @@
+@@ -13549,11 +13794,16 @@
      // Draws that cannot draw anything (both faces culled, empty scissor) return before the render pass is opened: otherwise the render pass is already open and on TBDR the whole attachment is loaded and stored for nothing
      // (Mac character select page: 3 render passes are opened only because of such draws, all loaded, zero draws)
      // Diagnostic switch for measuring an upper bound DM_NVN_SKIP_FS=<fragment key>[,<fragment key>...] (none by default): drops all draws of these fragment shaders (the picture will be wrong; only used in real-device ABA to measure "how much GPU time this class of draws is worth in total")
@@ -699,9 +699,13 @@
 +                     nsk = 0; for (const char *q = e; q && *q && nsk < 16; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 19) n = 19; memcpy(sk[nsk], q, n); sk[nsk++][n] = 0; }
 +                     if (nsk) MLOG("%s: dropping the draws of %d fragment shaders (diagnostic; the picture is wrong)", own ? "S2A_DRAW_SKIP" : "DM_NVN_SKIP_FS", nsk); }
        if (g_ub_n > 0 && pr->sh[1] && !g_defer_replaying && ub_skip(pr->sh[1]->key)) return;   // In-process alternating measurement: this phase drops this class
-       if (nsk && pr->sh[1] && !g_defer_replaying) for (int i = 0; i < nsk; i++) if (!strncmp(pr->sh[1]->key, sk[i], strlen(sk[i]))) return;
+-      if (nsk && pr->sh[1] && !g_defer_replaying) for (int i = 0; i < nsk; i++) if (!strncmp(pr->sh[1]->key, sk[i], strlen(sk[i]))) return;
++      if (nsk && pr->sh[1] && !g_defer_replaying) for (int i = 0; i < nsk; i++) if (!strncmp(pr->sh[1]->key, sk[i], strlen(sk[i]))) {
++          static int once; if (!once++) MLOG("S2A_DRAW_SKIP: first draw skipped: pass %llu fragment %s (not encoded; the attachment keeps what it loaded)", (unsigned long long)g_stat_pass, pr->sh[1]->key); return; }
        if (ms_draw(pr)) return; }
-@@ -13628,7 +13877,7 @@
+     // Diagnostic DM_NVN_DRAW_MAX=<n> (frame replay, graphics/nvn/docs/frame_replay.md): draws past the n-th of a frame are dropped, and the n-th logs its program, blend state and targets
+     //   (DM_NVN_DRAWLOG=1: every draw up to the n-th logs it; DM_NVN_DRAW_SKIP=a-b drops the a-th to b-th draws of a frame) --
+@@ -13628,7 +13878,7 @@
      if (defer_q_draw) defer_replay();
      if (skip_d) { g_stat_ds_omit++; if (mode == 3) g_stat_s_only++; else if (mode == 4) g_stat_d_only++; }
      // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
@@ -710,7 +714,7 @@
      if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }
      else if (g_fbt.on && g_enc && !g_defer_replaying) {   // ⑤ 遍内自采样片上读取：本笔用可读瓦片版（输出不搬位置）
          g_pso_lmap = g_fbt.lmap; g_pso_fsfn = g_fbt.fn; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_fz.kind = 1; g_pso_fz.fbmask = g_fbt.fbmask;
-@@ -13638,10 +13887,11 @@
+@@ -13638,10 +13888,11 @@
      //   GPU has no native reduction (0 at once on Apple10)
      g_fold_sh[1] = NULL;   // reset here too: the readable-tile paths below skip se_want
      int fc = g_pso_lmap || g_pso_fsfn ? 0 : se_want(pr->gp, pr->sh[1], 1);
@@ -723,7 +727,7 @@
      g_udc_lmap = g_pso_lmap; g_udc_fsfn = g_pso_fsfn != nil;   // udc_note_draw (below) judges this draw's writes by the map its pipeline used
      if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // The next draw fetches again according to its own situation
      __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
-@@ -13949,7 +14199,8 @@
+@@ -13949,7 +14200,8 @@
          if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok) continue;
          nvn_be_pool_gpu_written(g_treg[tid].t.pool);   // before it resolves: a shader image is a GPU write into its pool (tex_cpu_content)
          id<MTLTexture> t = tex_mtl(&g_treg[tid].t); if (t.parentTexture) t = t.parentTexture;
@@ -733,7 +737,7 @@
      pthread_mutex_unlock(&g_rmu);
  }
  static void tensor_standin(NvShader *cs);   // nvn_tensor.inc
-@@ -14011,7 +14262,7 @@
+@@ -14011,7 +14263,7 @@
      }
      if (g_nubd && ubd_conflict_cs(cs, dp->ind)) { g_ubd_conflicts++; ubd_land(); }   // see ubd_conflict_cs
      if (!img_atomic_prepare(cs, 5)) return;
