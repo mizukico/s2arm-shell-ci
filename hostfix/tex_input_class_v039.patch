@@ -273,7 +273,22 @@
  // An image slot the shader declares as uint / int holding a texture of another class: on the Switch the shader's image format decides how the texel's bits are read. FINAL FANTASY TACTICS -
  // The Ivalice Chronicles' UI composite blends into the RGBA8 window texture in software, loading it as r32ui and unpacking the four bytes (uirender.tec, fragment 4cf1975ed1e36590); bound as
  // it was, an RGBA8Unorm texture in a texture2d<uint> argument read undefined values and translucent UI came out yellow and white. The slot gets a view of the same texel size in the
-@@ -7911,6 +7919,32 @@
+@@ -7010,6 +7018,14 @@
+         if (b && !(b.usage & MTLTextureUsagePixelFormatView)) tex_upgrade_pfv(&g_treg[tid].t, b, MTLPixelFormatR32Uint); }
+     g_imfit_npend = 0;
+     pthread_mutex_unlock(&g_rmu);
++}
++// S2Arm: a cube / cube-array texture bound to an image the shader declares texture2d_array (a compute kernel that writes a cubemap through its six faces). The host binds a face-array
++//   view of it (tex_fit below: six layers per cube, the level / slice range of the bound view); a texture made without the format-view usage cannot make that view, so its writes would go
++//   to the dummy image. Such a texture is queued here and upgraded before the next draw pass or dispatch opens (img_fit_upgrade), as img_fit does for a class view. Caller holds g_rmu
++static void img_pfv_note(int tid) {
++    if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok) return;
++    for (int i = 0; i < g_imfit_npend; i++) if (g_imfit_pend[i] == tid) return;
++    if (g_imfit_npend < 16) g_imfit_pend[g_imfit_npend++] = tid;
+ }
+ // A texture bound to an image slot that was made without the shader-write usage: the NVN object lacks NVN_TEXTURE_FLAGS_IMAGE, which the Switch's hardware does not check (Ryujinx gives
+ // every storage-capable format the storage usage). The Witcher 3 makes its 1x1 R32F eye-adaptation values with COMPRESSIBLE only and has a compute kernel write them as images: bound as
+@@ -7911,6 +7927,32 @@
  // S2Arm: the fragment shader's typed-output entry point for this need mask: cached, else loaded from the fallback directory's <key>_t<u>_<s>.metal that an earlier pso_fout_variant wrote (this run or
  // an earlier one: the background prewarm of a recorded pipeline has no guest program to translate from, but the variant is on disk). nil when there is none. Pipelines are built on several threads
  static pthread_mutex_t g_fnt_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -306,7 +321,7 @@
  static id<MTLFunction> fs_typed_fn(NvShader *fs, uint32_t need) {
      pthread_mutex_lock(&g_fnt_mu);
      id f = fs->fn_t[@(need)];
-@@ -8124,9 +8158,24 @@
+@@ -8124,9 +8166,24 @@
              if (hl) d.fragmentFunction = [hl newFunctionWithName:[NSString stringWithFormat:@"hl%d", i]];
              break; } }
      uint32_t need = fs && !fsfn && d.fragmentFunction == fs->fn ? pso_fout_need(k, fs, merged) : 0;
@@ -334,7 +349,7 @@
          id<MTLFunction> f = se_fn(fs, k->fc); if (f) d.fragmentFunction = f; else MLOG("【红】 fragment shader %s: pipeline keyed for its sampler-emulation variant (bits %d), which is not there: main0", fs->key, k->fc); }
      if (fs && (k->at || k->msoff) && (d.fragmentFunction == fs->fn || (fs->fn_u && d.fragmentFunction == fs->fn_u))) {   // gap families 34 / 37: main0 / main0_u with the alpha test / full sample mask
          id<MTLFunction> f = fs_atms_fn(fs, d.fragmentFunction == fs->fn_u, k->at, k->msoff); if (f) d.fragmentFunction = f; }
-@@ -8208,6 +8257,42 @@
+@@ -8208,6 +8265,42 @@
          k->blend[i].target = 0;   // pso_desc reads only the factors and equations
      }
  }
@@ -377,7 +392,7 @@
  // Pipeline key: current state S + pass formats (normal pass; a merged pass additionally carries lmap / specialized function, filled in by pso_get)
  static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t cfmt[8], uint32_t dfmt, uint32_t sfmt, uint32_t samples, int lmap) {
      memset(k, 0, sizeof *k);
-@@ -8221,6 +8306,7 @@
+@@ -8221,6 +8314,7 @@
      for (int i = 0; i < 8; i++) if (k->cfmt[i] || lmap) { k->blend[i] = S.blend[i]; k->blend[i].adv_mode = k->blend[i].adv_overlap = k->blend[i].adv_premul = k->blend[i].adv_normdst = 0; }
      const nvn_refl *rf = &vs->rf;
      for (int v = 0; v < rf->nv; v++) { int a = rf->v[v].nvn; if (a < 16 && a < S.nattr) { k->attr[a] = S.attr[a]; int st = S.attr[a].stream; if (st < 16) k->stream[st] = S.stream[st]; } }
@@ -385,7 +400,7 @@
      pso_key_norm(k, vs, fs, lmap);
  }
  // ---- Parallel precompile: pipelines met for the first time used to be compiled synchronously one by one on the submit thread; 9 misses in a row in one frame = 284 ms (heavy scene on a real device).
-@@ -8247,6 +8333,7 @@
+@@ -8247,6 +8341,7 @@
  static int pso_pend_find(const pso_key *k) { for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && !memcmp(&g_pp[i].k, k, sizeof *k)) return i; return -1; }
  static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // Called by the submit thread: kick only if it is neither in the cache nor in the table
      if (hm_get_id(&g_pso, k) || !pso_pair_ok(vs, fs, 0)) return;
@@ -393,7 +408,7 @@
      pthread_mutex_lock(&g_pp_mu);
      int at = pso_pend_find(k), slot = -1;
      if (at < 0) for (int i = 0; i < PSO_PEND_MAX; i++) if (!g_pp[i].used) { slot = i; break; }
-@@ -8367,6 +8454,49 @@
+@@ -8367,6 +8462,49 @@
      MLOG("fragment shader %s: typed-output variant %#x built in %.1f ms (%s)", fs->key, need, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6, path);
      return 1;
  }
@@ -443,7 +458,7 @@
  static int g_first_skipped;   // pso_get_ returned nil to skip this draw (the draw counts it instead of logging a failure)
  static uint64_t g_fsk_draws, g_fsk_frames, g_fsk_run, g_fsk_run_max, g_fsk_last_f, g_fsk_occl;   // g_fsk_occl: skipped while an occlusion query counted (its sample count reads low that frame)
  static int shader_writes(NvShader *s) { if (!s) return 0; for (int i = 0; i < s->rf.nb; i++) if (s->rf.b[i].rw) return 1; return 0; }
-@@ -8434,12 +8564,13 @@
+@@ -8434,12 +8572,13 @@
      g_pso_color_round = 0;
      if (!vs) { RED_ONCE(13, "program has no vertex shader (or it is not mapped)"); PSO_WHY("no vertex stage"); return nil; }
      pso_key k; pso_key_fill(&k, vs, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, g_pso_lmap != NULL);
@@ -458,7 +473,23 @@
          else { static int once; if (!once++) MLOG("【红】 fragment shader %s: a min / max sampler the GPU cannot reduce natively, bound with integer outputs or dual-source blending, which the reduction variant does not have: averaged (first case)", fs->key); }
      }
      id<MTLFunction> ms_fn = ms_fs_override(fs); if (ms_fn) k.fsfn = (__bridge void *)ms_fn;   // DM_NVN_MAGSCAN phases 2 / 3
-@@ -10858,6 +10989,7 @@
+@@ -10103,6 +10242,15 @@
+                 if (mtl_fmt_depth(t.pixelFormat) || fmt_compressed(g_treg[tid].t.d.format)) RED_ONCE(32, "texture bound to an image slot is a depth / stencil or compressed format, which takes no shader writes (texture ID %d)", tid);
+                 else { img_wr_note(tid); static int n; if (!n++) MLOG("image slot texture without shader writes (texture ID %d): upgraded before the next pass", tid); }
+                 t = nil; }
++            // S2Arm: an image declared texture2d_array on a cube / cube-array texture: the writes go through a face-array view (tex_fit below). That view needs the format-view usage,
++            //   which a texture made as a render target can lack; queue the upgrade (img_fit_upgrade, before the next pass / dispatch opens) and write into the dummy until then, as an
++            //   image without the shader-write usage does. nxnative 0a7d6643: Trails in the Sky 1st's cubemap copy / blend compute kernels (glass and armour reflections)
++            if (t && b->dtt == (uint8_t)MTLTextureType2DArray && (t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray) &&
++                !((t.parentTexture ? t.parentTexture : t).usage & MTLTextureUsagePixelFormatView)) {
++                img_pfv_note(tid);
++                { static int once; if (!once++) MLOG("image output declared texture2d_array bound to a cube / cube array (texture ID %d): its face-array view waits for the format-view usage upgrade", tid); }
++                t = nil;
++            }
+             // A class the image needs that no view gives (or not yet: upgraded before the next pass, img_fit): the dummy image, never the texture as is (Metal reads / writes undefined)
+             if (t && (swz_only || (b->dpf != NVN_DPF_FLOAT && mtl_pf_dpf(t.pixelFormat) != b->dpf))) { uint64_t r2 = 0; id<MTLTexture> v = img_fit(tid, t, b->dpf, &r2); if (v) { t = v; trid = r2; } else t = nil; }   // see img_fit
+             // An image of another texture type than the shader declares: Ryujinx binds only the same dimensions (Texture.GetTargetTexture); the rest is the dummy image of the declared type
+@@ -10858,6 +11006,7 @@
                  if (v && dv[v] == dv[0] && sv[v] == sv[0]) continue;
                  if (v == 2 && !sfull) continue; if (v == 3 && (!dfull || !sfull)) continue;
                  pso_key k; pso_key_fill(&k, vs, fs, cf, dv[v], sv[v], samples, 0);
@@ -466,7 +497,7 @@
                  if (hm_get_id(&g_pso, &k)) continue;
                  int dup = 0; for (int i = 0; i < na && !dup; i++) dup = !memcmp(&qa[i].k, &k, sizeof k);
                  if (dup) continue;
-@@ -13628,7 +13760,7 @@
+@@ -13628,7 +13777,7 @@
      if (defer_q_draw) defer_replay();
      if (skip_d) { g_stat_ds_omit++; if (mode == 3) g_stat_s_only++; else if (mode == 4) g_stat_d_only++; }
      // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
@@ -475,7 +506,7 @@
      if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }
      else if (g_fbt.on && g_enc && !g_defer_replaying) {   // ⑤ 遍内自采样片上读取：本笔用可读瓦片版（输出不搬位置）
          g_pso_lmap = g_fbt.lmap; g_pso_fsfn = g_fbt.fn; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_fz.kind = 1; g_pso_fz.fbmask = g_fbt.fbmask;
-@@ -13638,10 +13770,11 @@
+@@ -13638,10 +13787,11 @@
      //   GPU has no native reduction (0 at once on Apple10)
      g_fold_sh[1] = NULL;   // reset here too: the readable-tile paths below skip se_want
      int fc = g_pso_lmap || g_pso_fsfn ? 0 : se_want(pr->gp, pr->sh[1], 1);
@@ -488,3 +519,22 @@
      g_udc_lmap = g_pso_lmap; g_udc_fsfn = g_pso_fsfn != nil;   // udc_note_draw (below) judges this draw's writes by the map its pipeline used
      if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // The next draw fetches again according to its own situation
      __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
+@@ -13949,7 +14099,8 @@
+         if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok) continue;
+         nvn_be_pool_gpu_written(g_treg[tid].t.pool);   // before it resolves: a shader image is a GPU write into its pool (tex_cpu_content)
+         id<MTLTexture> t = tex_mtl(&g_treg[tid].t); if (t.parentTexture) t = t.parentTexture;
+-        if (t && !(t.usage & MTLTextureUsageShaderWrite) && !mtl_fmt_depth(t.pixelFormat)) img_wr_note(tid); }
++        if (t && !(t.usage & MTLTextureUsageShaderWrite) && !mtl_fmt_depth(t.pixelFormat)) img_wr_note(tid);
++        else if (t && b->dtt == (uint8_t)MTLTextureType2DArray && (t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray) && !(t.usage & MTLTextureUsagePixelFormatView)) img_pfv_note(tid); }   // S2Arm: the face-array view of a cube the shader writes through texture2d_array (img_pfv_note)
+     pthread_mutex_unlock(&g_rmu);
+ }
+ static void tensor_standin(NvShader *cs);   // nvn_tensor.inc
+@@ -14011,7 +14162,7 @@
+     }
+     if (g_nubd && ubd_conflict_cs(cs, dp->ind)) { g_ubd_conflicts++; ubd_land(); }   // see ubd_conflict_cs
+     if (!img_atomic_prepare(cs, 5)) return;
+-    img_wr_prescan(cs, 5); if (g_imwr_npend) img_wr_upgrade();   // image textures made without shader writes: upgraded before this dispatch's encoder opens (img_wr_note)
++    img_wr_prescan(cs, 5); if (g_imwr_npend) img_wr_upgrade(); if (g_imfit_npend) img_fit_upgrade();   // image textures made without shader writes: upgraded before this dispatch's encoder opens (img_wr_note); a cube bound to a texture2d_array image: its face-array view's format-view usage too (img_pfv_note)
+     rp_flush();   // a full clear with no draw after it waits for the next pass on its targets, but it comes before this dispatch, which may read or write them as images: land it first, as copy_t2t does (upstream reference implementation, MIT)
+     rs_pre_compute(cs);   // S2Arm internal resolution: scaled textures this dispatch reads / writes go back to 1 first (nvn_rscale_ops.inc)
+     tba_prepare(cs, nil, nil, nil, nil, 1);   // #309: as for draws (see tba_ent)
