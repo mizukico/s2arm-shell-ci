@@ -1,0 +1,63 @@
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -5590,6 +5590,7 @@
+     id<MTLLibrary> at_lib; NSString *at_main, *at_u; NSMutableDictionary<NSNumber *, id<MTLFunction>> *at_fns; uint8_t has_atms;   // gap families 34 / 37: a fragment main0 declaring S2A_AT / S2A_MSOFF (Dsh.cs FsAlphaMs): its library and entry names, specialized per (u, at, msoff) on demand (fs_atms_fn)
+     int load_depth_zero;   // captured with the identity, also used by its layer variant
+     uint8_t u_mask;   // S2Arm gap 2 A: the colour outputs fn_u returns as uint, bit n = color(n) (json u_mask; dmsh_build.py fs_uint turns only the integer-bit writers)
++    id<MTLLibrary> u_lib; NSString *u_entry_n; NSMutableDictionary<NSNumber *, id> *u_fns;   // S2Arm #427: main0_u's library and entry name, and its specializations by the pipeline's integer-output mask (fs_u_fn, Dsh.cs FsUintEntry); NSNull = a set that failed to build
+     uint16_t tf_stride[4]; uint32_t cb_ext[16], sb_ro; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, afr, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
+     uint32_t geo_vertices, geo_invocations, geo_output, geo_stride, geo_index_stride;
+     // NVN2 task / mesh shader (json msl_entry_kind object / mesh, at stage 3 / 4; nvn_geometry.inc mesh_tasks_draw): mesh_kind 1 object 2 mesh (0 = neither); its workgroup's threads,
+@@ -6084,7 +6085,7 @@
+         o->ts[o->nts++] = (typeof(o->ts[0])){(uint8_t)idx, (uint8_t)img, (uint8_t)reg};
+     }
+     if (stage == 5 && j[@"spill"]) { o->spill = [j[@"spill"] unsignedIntValue]; o->spill_slot = [j[@"spill_slot"] unsignedIntValue]; }   // shared-memory spill (dispatch)
+-    if (stage == 1 && j[@"entry_u"]) { o->u_mask = (uint8_t)[j[@"u_mask"] unsignedIntValue]; o->fn_u = [lib newFunctionWithName:fnn(o, j[@"entry_u"])]; if (!o->fn_u) MLOG("【红】 shader %s: no integer-output entry point %s in its library", pc.UTF8String, [j[@"entry_u"] UTF8String]); }
++    if (stage == 1 && j[@"entry_u"]) { o->u_mask = (uint8_t)[j[@"u_mask"] unsignedIntValue]; o->fn_u = [lib newFunctionWithName:fnn(o, j[@"entry_u"])]; if (!o->fn_u) MLOG("【红】 shader %s: no integer-output entry point %s in its library", pc.UTF8String, [j[@"entry_u"] UTF8String]); else { o->u_lib = lib; o->u_entry_n = fnn(o, j[@"entry_u"]); } }   // S2Arm #427: main0_u is specialized per pipeline (fs_u_fn)
+     // Stages 3 / 4 are the tessellation control / evaluation shaders on Switch 1 and task / mesh on NVN2. A tessellation shader's json carries tess (handled below) and its
+     //   msl_entry_kind is vertex / kernel, which is right for it: the task / mesh contract (object / mesh functions, workgroup limits) is not its contract. Applied to it, the
+     //   kind check printed a false red line and the workgroup check found no threads, called the shader not usable and skipped its draws (#418: 19 red lines on a Switch 1 game)
+@@ -7911,6 +7912,24 @@
+ // S2Arm: the fragment shader's typed-output entry point for this need mask: cached, else loaded from the fallback directory's <key>_t<u>_<s>.metal that an earlier pso_fout_variant wrote (this run or
+ // an earlier one: the background prewarm of a recorded pipeline has no guest program to translate from, but the variant is on disk). nil when there is none. Pipelines are built on several threads
+ static pthread_mutex_t g_fnt_mu = PTHREAD_MUTEX_INITIALIZER;
++// S2Arm #427: main0_u whose colour outputs are chosen by the pipeline's integer targets (Dsh.cs FsUintEntry: one float and one
++//   unsigned member per colour, each present by a bool function constant S2A_UI<n>). Before this, main0_u was used only when the
++//   pipeline's integer set equalled the mask the build guessed from the shader's code; any other set fell back to main0 (float
++//   output against an integer attachment), which Metal 4 accepts when the pipeline is specialised from a base: the integer target
++//   then holds undefined values with no red line (Trails in the Sky 1st: the G-buffer is float at colour 0 and RGBA8Uint at 1-3,
++//   and the lighting pass read zeros = a black 3D picture). Built once per set, kept; nil when the shader has no main0_u or the
++//   set does not build. Called on the submit thread only (like fs_typed_fn).
++static id<MTLFunction> fs_u_fn(NvShader *fs, uint32_t umask) {
++    if (!fs || !fs->u_lib || !fs->u_entry_n || !(umask & 0xff)) return nil;
++    if (!fs->u_fns) { pthread_mutex_lock(&g_fnt_mu); if (!fs->u_fns) fs->u_fns = [NSMutableDictionary dictionary]; pthread_mutex_unlock(&g_fnt_mu); }
++    id c = fs->u_fns[@(umask)]; if (c) return c == NSNull.null ? nil : c;
++    MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
++    for (int n = 0; n < 8; n++) { bool u = (umask >> n) & 1; [cv setConstantValue:&u type:MTLDataTypeBool withName:[NSString stringWithFormat:@"S2A_UI%d", n]]; }
++    NSError *e = nil; id<MTLFunction> f = [fs->u_lib newFunctionWithName:fs->u_entry_n constantValues:cv error:&e];
++    if (!f) { static int nlog; if (nlog++ < 8) MLOG("【红】 fragment shader %s: main0_u specialized for integer outputs %#x failed to build: %s", fs->key, umask, e.localizedDescription.UTF8String); f = NSNull.null; }
++    fs->u_fns[@(umask)] = f;
++    return f == NSNull.null ? nil : f;
++}
+ static id<MTLFunction> fs_typed_fn(NvShader *fs, uint32_t need) {
+     pthread_mutex_lock(&g_fnt_mu);
+     id f = fs->fn_t[@(need)];
+@@ -8124,8 +8143,16 @@
+             if (hl) d.fragmentFunction = [hl newFunctionWithName:[NSString stringWithFormat:@"hl%d", i]];
+             break; } }
+     uint32_t need = fs && !fsfn && d.fragmentFunction == fs->fn ? pso_fout_need(k, fs, merged) : 0;
+-    if (need && fs->fn_u && need == fs->u_mask) d.fragmentFunction = fs->fn_u;   // the integer attachments are exactly the outputs main0_u turns (dmsh_build.py fs_uint u_mask)
+-    else if (need) { id<MTLFunction> t = fs_typed_fn(fs, need); if (t) d.fragmentFunction = t; }   // S2Arm: mixed float / integer targets, dual-source blending (pso_fout_variant)
++    if (need) {   // S2Arm #427: the pipeline's integer targets pick main0_u's outputs (fs_u_fn, function constants); the on-device typed variant stays for dual-source blending and for shaders without main0_u
++        id<MTLFunction> t = nil;
++        if (!(need & ~0xffu) && !k->at && !k->msoff) t = fs_u_fn(fs, need);
++        if (!t && fs->fn_u && need == fs->u_mask) t = fs->fn_u;   // the old route still serves the alpha-test / sample-mask paths that specialise fn_u (fs_atms_fn)
++        if (!t) t = fs_typed_fn(fs, need);   // S2Arm: mixed float / integer targets, dual-source blending (pso_fout_variant)
++        if (t) d.fragmentFunction = t;
++        else if (!(fs->logged & 0x200)) {   // nothing fit: this draw keeps main0 (float outputs) against an integer target, which Metal 4 may accept silently (the target then holds undefined values)
++            fs->logged |= 0x200;
++            MLOG("【红】 fragment shader %s: its pipeline has integer colour targets %#x and no integer entry point fits (main0_u covers %#x): the draw keeps main0, those targets may hold undefined values", fs->key, need, fs->u_mask);
++        } }
+     else if (k->fc && fs && d.fragmentFunction == fs->fn) {   // S2Arm #800: the sampler-emulation variant (se_want: never with integer outputs)
+         id<MTLFunction> f = se_fn(fs, k->fc); if (f) d.fragmentFunction = f; else MLOG("【红】 fragment shader %s: pipeline keyed for its sampler-emulation variant (bits %d), which is not there: main0", fs->key, k->fc); }
+     if (fs && (k->at || k->msoff) && (d.fragmentFunction == fs->fn || (fs->fn_u && d.fragmentFunction == fs->fn_u))) {   // gap families 34 / 37: main0 / main0_u with the alpha test / full sample mask
