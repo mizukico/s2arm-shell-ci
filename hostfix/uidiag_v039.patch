@@ -1,0 +1,1074 @@
+--- a/graphics/tools/direct/dsh/Dsh.cs
++++ b/graphics/tools/direct/dsh/Dsh.cs
+@@ -436,7 +436,7 @@
+                 // 片元：Alpha 测试与多重采样关的可选函数常量（FsAlphaMs，族 34 / 37）进库里的主入口；src 不带它（反射、可读瓦片 _bf、输出类型 _ft 照旧读 src）
+                 string srcx = stage == "ps" ? FsAlphaMs(src) : src;
+                 if (stage == "ps") full = srcx;
+-                var (fu, uMask) = stage == "ps" ? FsUint(srcx, colorAnalysis) : (null, 0u);
++                var (fu, uMask) = stage == "ps" ? FsUint(srcx, colorAnalysis, Key) : (null, 0u);
+                 if (fu != null) { plain = srcx; full = fu; }
+                 var res = JsonNode.Parse(XIo.ReadAllText(Path.Combine(W, Key + ".res.json"))).AsObject();
+                 full = DshFlat.GiantFix(full).Item1;   // 巨型着色器的尾部阶梯压平（同 dmsh_build.py giant_fix）
+@@ -1954,9 +1954,73 @@
+             return (full + add, new PyDict { ["loc"] = (long)locs[name], ["comp"] = comp });
+         }
+ 
++        // ---- 片元整数输出的手工真值表（#427；nxnative PR #176 dm/games/01001E9023920000/shader_facts_manual.tsv @ f02463b1）----
++
++        /// <summary>片元键 → 整数颜色输出掩码（位 n = color(n) 画进整数目标；真值表 fout 里 "uint" 的位或起来）。
++        /// 为什么要有这张表：空之轨迹 the 1st 没有 PC 版，翻译器手上没有片元输出类型，只能从 MSL 猜「哪些输出装的是整数」；
++        /// 猜漏一位不会报错——Metal 把浮点输出接整数画布当合法（建管线成功），那个整数目标于是留着未定义值。这支游戏的
++        /// MSAA / 延迟 G-buffer 是 0 号浮点 + 1..3 号 RGBA8Uint / R32Uint / RGBA16Uint，后期光照读到零就是 3D 全黑。
++        /// 34 条键全部来自上游 nxnative PR #176 的手工真值表（人工在设备上按宿主的红线逐条核对过），所以表里有的键以表值为准，
++        /// 启发式只当兜底；表里没有的键（别的游戏 / 后续新增的片元）照旧按 IntOutputs 猜。</summary>
++        static readonly Dictionary<string, uint> FsFoutFacts = new(StringComparer.Ordinal)
++        {
++            // 标题 / UI 面：只有输出 1 是整数颜色目标（宿主的红线点名过这一行）
++            ["567fcd0c97a29418"] = 0x2,
++            // MSAA / 延迟 G-buffer 的片元：输出 1、2、3 全是整数目标（翻译器原先只认出两位，掩码 0xa / 0x6）
++            ["0028f62efe9e4e36"] = 0xe,
++            ["0827f9bcdc47c4b3"] = 0xe,
++            ["0c2181e7efb978e8"] = 0xe,
++            ["499567cfa6cce741"] = 0xe,
++            ["4dbc3a68a99a5e05"] = 0xe,
++            ["4ef57d405f87ea31"] = 0xe,
++            ["4ff75b6ec9231a3e"] = 0xe,
++            ["58cd5da94d831adc"] = 0xe,
++            ["590313d32e5a20c4"] = 0xe,
++            ["6ce42fb660d4733b"] = 0xe,
++            ["73feb86ef1c79f13"] = 0xe,
++            ["7d509f2fd2352e54"] = 0xe,
++            ["884774b074760f26"] = 0xe,
++            ["89581d9a1de10f6f"] = 0xe,
++            ["8b0849fd77d1d8d8"] = 0xe,
++            ["90a5e9dfeb72849a"] = 0xe,
++            ["9bea711aa494d844"] = 0xe,
++            ["a36ebdc4ae57913b"] = 0xe,
++            ["b22a7d33e67711ec"] = 0xe,
++            ["b394cadb60a724fa"] = 0xe,
++            ["b503751171dcdeff"] = 0xe,
++            ["bb46743e79171f4a"] = 0xe,
++            ["c08a291e9fc7cd53"] = 0xe,
++            ["d165704b67d086ec"] = 0xe,
++            ["e988f8655baebbee"] = 0xe,
++            ["eb53756b67128246"] = 0xe,
++            ["ece606b51bd40ec6"] = 0xe,
++            ["ee5756ef1989d719"] = 0xe,
++            ["f180f4609df4f801"] = 0xe,
++            ["f26d46909a5e0f4c"] = 0xe,
++            ["f2e6f8b3abe2214f"] = 0xe,
++            ["fbebc5fe19b041df"] = 0xe,
++            ["fbfb9669177a514d"] = 0xe,
++        };
++        static bool s_foutFactLogged;
++
++        /// <summary>表值优先（#427）：键在手工真值表里就直接给表值（猜出来的只当兜底），否则原样返回 guess。
++        /// 全进程第一次命中时往 stderr 记一行，方便看出这次翻译确实按表走（出包几万支片元只记这一行）。</summary>
++        static uint FsFoutFact(string key, uint guess)
++        {
++            if (string.IsNullOrEmpty(key) || !FsFoutFacts.TryGetValue(key, out uint t)) return guess;
++            if (!s_foutFactLogged)
++            {
++                s_foutFactLogged = true;
++                Console.Error.WriteLine($"[FOUT-FACT] {key}: 整数输出掩码 {guess:x} → {t:x}（按 nxnative PR #176 的手工真值表取 {FsFoutFacts.Count} 条之一，启发式只当兜底）");
++            }
++            return t;
++        }
++
+         /// <summary>整数输出入口 main0_u（同 dmsh_build.fs_uint，缺口 2 A 段）：只把按整数位写的颜色输出改 uint，其余照旧浮点；只写常量的（清屏）全部改 uint。
+-        /// → (接上 main0_u 的源码, u_mask：位 n = 改成 uint 的 color(n))；不像整数写的返回 (null, 0)</summary>
+-        internal static (string Src, uint UMask) FsUint(string src, string analysis = null)
++        /// → (接上 main0_u 的源码, u_mask：位 n = 改成 uint 的 color(n))；不像整数写的返回 (null, 0)
++        /// key = dm_ctl 键（16 位十六进制）：在手工真值表 FsFoutFacts 里就以表值为准（#427），并且必然出 main0_u
++        /// （管线按函数常量 S2A_UI&lt;n&gt; 挑输出，表说它是整数画布就不能只留浮点）。</summary>
++        internal static (string Src, uint UMask) FsUint(string src, string analysis = null, string key = null)
+         {
+             var m = Search(@"^.*\bfragment\s+main0_out\s+main0\s*\(", src, RegexOptions.Multiline); var st = Search(@"struct main0_out\s*\{(.*?)\};", src, RegexOptions.Singleline);
+             if (!m.Success || !st.Success) return (null, 0);
+@@ -1970,11 +2034,60 @@
+             var pm = Search(@"^.*\bfragment\s+main0_out\s+main0\s*\(", probe, RegexOptions.Multiline);
+             string body = pm.Success ? probe[pm.Index..] : ""; int ret = body.IndexOf("return out;", StringComparison.Ordinal); if (ret >= 0) body = body[..(ret + 1)];
+             var ints = IntOutputs(body, cols.Keys);
+-            if (fromInt.Count == 0 && ints.Count == 0 && !(writes.Count > 0 && writes.All(w => Full(@"-?[0-9.]+f?|float\d\([-0-9., ]*\)", w.Trim()).Success))) return (null, 0);
++            bool fact = !string.IsNullOrEmpty(key) && FsFoutFacts.ContainsKey(key);   // #427 手工真值表：猜不出也要留 main0_u（管线按 S2A_UI<n> 挑输出）
++            if (!fact && fromInt.Count == 0 && ints.Count == 0 && !(writes.Count > 0 && writes.All(w => Full(@"-?[0-9.]+f?|float\d\([-0-9., ]*\)", w.Trim()).Success))) return (null, 0);
+             if (ints.Count == 0) ints = fromInt;   // 一个都说不清：照旧，按整数位写出的都算
+             bool U((string Ty, string Nm, string At) x) => cols.ContainsKey(x.Nm) && (ints.Count == 0 || ints.Contains(x.Nm));
+             uint mask = 0; foreach (var x in mem) if (U(x)) mask |= 1u << Int(Search(@"color\((\d+)\)", x.At).Groups[1].Value);
+-            return (src + "\n" + FsRetyped(src, m, mem, x => U(x) ? "u" : null, "_u"), mask);
++            mask = FsFoutFact(key, mask);   // #427：表里有的键以表值为准（启发式猜漏的整数输出由表补上），没有的键照旧
++            string entry = FsUintEntry(src, m, mem);
++            if (entry == null) return (null, 0);
++            return (src + "\n" + entry, mask);
++        }
++
++        // 110..117：S2A_UI0..7（100 / 101 已给 S2A_AT / S2A_MSOFF，Dsh.cs FC_DECL）
++        internal const int S2A_UINT_FC = 110;
++
++        /// <summary>按管线定类型的整数输出入口 main0_u（同 nxnative dmsh_entry.py uint_entry，MIT）：每个颜色输出两份成员
++        /// （float 与同位宽整数），由 bool 函数常量 S2A_UI&lt;n&gt; 决定哪一份在（function_constant 修饰结构体成员）；
++        /// 默认常量未定义 = 全 float，等于 main0。宿主按管线的整数目标集置位（nvn_mtl.m fs_u_fn），
++        /// 所以「哪些输出进整数画布」由管线说了算，不再从着色器代码猜（猜错会静默留下未定义的整数目标）。</summary>
++        static string FsUintEntry(string src, Match m, List<(string Ty, string Nm, string At)> mem) =>
++            FsUintEntry(src, m, mem, "main0_out_u", "main0_u", "\n// S2A_UINT_ENTRY\n");
++
++        /// <summary>同上的通用形：strct / entry 给变体结构体与入口名（main0_u；#427 组合变体 main0_ui / main0_uib），
++        /// marker 是截断标记；decls = 是否连同 S2A_UI&lt;n&gt; / S2A_UF&lt;n&gt; 的函数常量声明一起印（同一份源码里两个组合入口共用一份声明）。</summary>
++        static string FsUintEntry(string src, Match m, List<(string Ty, string Nm, string At)> mem, string strct, string entry, string marker, bool decls = true)
++        {
++            int Loc(string at) { if (string.IsNullOrEmpty(at)) return -1; var c = Search(@"color\((\d+)\)", at); return c.Success ? int.Parse(c.Groups[1].Value) : -1; }
++            var cols = new HashSet<string>(mem.Where(x => Loc(x.At) >= 0 && x.Ty.StartsWith("float", StringComparison.Ordinal)).Select(x => x.Nm));
++            if (cols.Count == 0) return null;
++            string Uty(string ty) => "u" + ty.Replace("float", "int");   // float4 → uint4、float → uint
++            var used = mem.Select(x => Loc(x.At)).Where(l => l >= 0).Distinct().OrderBy(l => l).ToList();
++            var sb = new StringBuilder();
++            sb.Append(marker);
++            if (decls)
++                foreach (var n in used)
++                    sb.Append($"constant bool S2A_UI{n} [[function_constant({S2A_UINT_FC + n})]];\nconstant bool S2A_UF{n} = !S2A_UI{n};\n");
++            sb.Append($"\nstruct {strct}\n{{\n");
++            foreach (var x in mem)
++            {
++                int l = Loc(x.At);
++                if (l >= 0 && cols.Contains(x.Nm))
++                    sb.Append($"    {x.Ty} {x.Nm} {x.At[..^2]}, function_constant(S2A_UF{l})]];\n    {Uty(x.Ty)} {x.Nm}_ui {x.At[..^2]}, function_constant(S2A_UI{l})]];\n");
++                else sb.Append($"    {x.Ty} {x.Nm} {x.At};\n");
++            }
++            sb.Append("};\n\n");
++            var conv = new StringBuilder($"    {strct} r = {{}};\n");
++            foreach (var x in mem)
++            {
++                int l = Loc(x.At);
++                if (l >= 0 && cols.Contains(x.Nm)) conv.Append($"    if (S2A_UI{l}) r.{x.Nm}_ui = as_type<{Uty(x.Ty)}>(out.{x.Nm}); else r.{x.Nm} = out.{x.Nm};\n");
++                else conv.Append($"    r.{x.Nm} = out.{x.Nm};\n");
++            }
++            conv.Append("    return r;");
++            string body = Replace(Sub(@"\bfragment\s+main0_out\s+main0\s*\(", $"fragment {strct} {entry}(", src[m.Index..], 1), "return out;", conv.ToString());
++            return sb.ToString() + body;
+         }
+ 
+         /// <summary>装整数、不是浮点位型的颜色输出（同上游参考实现（MIT）a4d7bb7b dmsh_build.py int_outputs）。逐个输出写顺着局部量往回追：整数运算算出的、或小整数常量
+@@ -2062,7 +2175,9 @@
+         /// src 是现编出的整份 .metal：先截掉已接的 main0_u（main0 是它前面最后一个函数）。→ 只含 main0 与 main0_t 的源码；认不出 main0 返回 null</summary>
+         internal static string FsTyped(string src, uint umask, uint smask)
+         {
+-            int cut = src.IndexOf("\nstruct main0_out_u\n", StringComparison.Ordinal); if (cut >= 0) src = src[..cut];
++            int cut = src.IndexOf("\n// S2A_UINT_ENTRY\n", StringComparison.Ordinal);   // main0_u 连同它的函数常量声明（FsUintEntry）
++            if (cut < 0) cut = src.IndexOf("\nstruct main0_out_u\n", StringComparison.Ordinal);
++            if (cut >= 0) src = src[..cut];
+             var m = Search(@"^.*\bfragment\s+main0_out\s+main0\s*\(", src, RegexOptions.Multiline); var st = Search(@"struct main0_out\s*\{(.*?)\};", src, RegexOptions.Singleline);
+             if (!m.Success || !st.Success) return null;
+             int Loc(string at) { var c = Search(@"color\((\d+)\)", at); return c.Success ? int.Parse(c.Groups[1].Value) : -1; }
+@@ -2079,6 +2194,128 @@
+                 else { mem.Insert(c0 + 1, (mem[c0].Ty, "s2a_src1", "[[color(0), index(1)]]")); zero = new HashSet<string> { "s2a_src1" }; }
+             }
+             return src + "\n" + FsRetyped(src, m, mem, x => pre.GetValueOrDefault(x.Nm), "_t", zero);
++        }
++
++        // ---- #427 输入侧纹理类型变体 main0_i ----
++
++        /// <summary>输入侧类型变体的文件头（宿主 dsh_miss.inc dm_shader_texin 认它，同 _se 的格式行）。2 = 同一份源码里带数值 / 位重解释两支、以及输出+输入组合入口</summary>
++        internal const string TEXIN_BEGIN = "// s2a:tex-in 2 ";
++        /// <summary>能改类型的参数块成员：采样贴图（或纹理缓冲）且元素类型正好是 float。depth… 不行（深度比较纹理没有整数类），带访问限定的图像走 img 不在 NVN_RB_TEX 里</summary>
++        static readonly Regex s_texInType = R(@"^(texture(?:1d|2d|3d|cube)(?:_array)?|texture_buffer)<float>$");
++
++        /// <summary>输入侧类型变体 main0_i（#427）：片元着色器把某些采样槽声明成 float，运行时实际绑的却是整数纹理。8 / 16 位整数格式在 Metal 里没有同位宽的
++        /// float 视图，tex_float_fit 只补 32 位；而 Metal 里 float 声明读整数纹理是未定义行为（apple9 / apple10 上读到 0：空之轨迹 the 1st 的 G-buffer 后期光照全黑）。
++        /// NVN / Maxwell 的语义是 _UINT 纹理读出来的 texel 数值转成浮点（0..255），不是归一化、也不是位保持，所以这里把 aidCsv 里那些参数块成员从
++        /// texture…&lt;float&gt; 改成 texture…&lt;uint&gt;，再把该成员的 .read( / .sample( 结果包一层 float4(...)（数值转换，等价于 float4(uint4)），入口叫 main0_i。
++        /// aidCsv = 宿主按运行时实际绑定算出来的参数块 [[id]] 列表（nvn_mtl.m fs_texin_mask）：按成员的 [[id(N)]] 对，不靠名字。
++        /// 同一份源码再出一支位重解释 main0_ib（as_type&lt;float4&gt;(v)，texel 的位原样重新解释，不做数值换算），宿主按 S2A_TEXIN_BITS 选；默认仍是 float4(v)。
++        /// flags bit 0：再出输出+输入组合入口 main0_ui / main0_uib（同一分支的输入改写 + FsUintEntry 的按管线整数输出，函数常量 S2A_UI&lt;n&gt;；
++        ///   管线同时需要整数颜色输出与整数纹理输入时用，nvn_mtl.m fs_texin_ui_fn）——不再二选一。
++        /// 源码必须是整份 .metal：先照 FsTyped 截掉已接的 main0_u（main0 是它前面最后一个函数），否则 main0_u 也会被改类型。
++        /// 认不出 / 有改不了的使用方式（贴图成员被当参数传出去、.gather / .sample_compare 之类）抛 DshError：宿主打红行、这一笔退回 main0，不静默画错。
++        /// → 变体源码（文件头 TEXIN_BEGIN + aidCsv + \n）</summary>
++        internal static string FsTexInput(string src, string aidCsv, uint flags = 0)
++        {
++            int cut = src.IndexOf("\n// S2A_UINT_ENTRY\n", StringComparison.Ordinal);   // main0_u 连同它的函数常量声明（FsUintEntry）
++            if (cut < 0) cut = src.IndexOf("\nstruct main0_out_u\n", StringComparison.Ordinal);
++            if (cut >= 0) src = src[..cut];
++            var aids = new HashSet<long>();
++            foreach (var x in (aidCsv ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries))
++                if (long.TryParse(x.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out long a)) aids.Add(a);
++            if (aids.Count == 0) throw new DshError("tex-in", "没有给参数块 id");
++            var st = Search(@"struct spvDescriptorSetBuffer0\s*\{(.*?)\};", src, RegexOptions.Singleline);
++            if (!st.Success) throw new DshError("tex-in", "源码里没有参数块结构体 spvDescriptorSetBuffer0");
++            var mem = All(@"^\s*(.+?)\s+(\w+)\s*\[\[\s*id\((\d+)\)\s*(?:,[^\]]*)?\]\];", st.Groups[1].Value, RegexOptions.Multiline)
++                .Select(m => (Ty: m.Groups[1].Value.Trim(), Nm: m.Groups[2].Value, Id: Int(m.Groups[3].Value))).ToList();
++            var want = mem.Where(x => aids.Contains(x.Id)).ToList();
++            if (want.Count != aids.Count) throw new DshError("tex-in", $"参数块里找不到这些 id：{string.Join(",", aids.Where(a => !want.Any(x => x.Id == a)))}");
++            foreach (var x in want)
++                if (!s_texInType.IsMatch(x.Ty)) throw new DshError("tex-in", $"参数 id {x.Id}（{x.Nm}）声明是 {x.Ty}，不是 float 采样贴图");
++            string body = st.Groups[1].Value;   // 先改结构体成员的类型（原位，参数块布局 / 编码长度不变）
++            foreach (var x in want)
++            {
++                var re = R(@"(?m)^(\s*)" + Esc(x.Ty) + @"(\s+)" + Esc(x.Nm) + @"(\s*\[\[\s*id\(" + x.Id + @"\)\s*(?:,[^\]]*)?\]\];)");
++                string nb = re.Replace(body, m => m.Groups[1].Value + Replace(x.Ty, "<float>", "<uint>") + m.Groups[2].Value + x.Nm + m.Groups[3].Value, 1);
++                if (nb == body) throw new DshError("tex-in", $"参数 id {x.Id}（{x.Nm}）在结构体里不是 {x.Ty}");
++                body = nb;
++            }
++            src = src[..st.Groups[1].Index] + body + src[(st.Groups[1].Index + st.Groups[1].Length)..];
++            var ent = Search(@"^.*\bfragment\s+main0_out\s+main0\s*\(", src, RegexOptions.Multiline);
++            if (!ent.Success) throw new DshError("tex-in", "源码里认不出片元入口 main0");
++            // 主入口（main0 及其函数体）与前面的结构体 / 辅助函数分开：每个变体只复制入口这一段，结构体共用一份
++            string head = src[..ent.Index], fn = src[ent.Index..];
++            var ost = Search(@"struct main0_out\s*\{(.*?)\};", src, RegexOptions.Singleline);
++            var omem = ost.Success ? FsMembers(ost) : new List<(string Ty, string Nm, string At)>();
++            bool ui = (flags & 1u) != 0 && omem.Count > 0;   // 输出+输入组合入口（管线同时要整数颜色输出与整数纹理输入）
++            var outp = new StringBuilder(head);
++            bool consts = false;   // S2A_UI / S2A_UF 的函数常量声明全文件只印一次（两个组合入口共用）
++            foreach (var (nm, wrap, uiNm, uiTy) in new[] { ("main0_i", "float4", "main0_ui", "main0_out_ui"), ("main0_ib", "as_type<float4>", "main0_uib", "main0_out_uib") })
++            {
++                string v = TexInWrap(fn, want, wrap);
++                if (ui)
++                {   // 组合入口从这一支的（已改输入类型的）函数体生成，再把它自己改名成基础入口
++                    var em = Search(@"^.*\bfragment\s+main0_out\s+main0\s*\(", v, RegexOptions.Multiline);
++                    string comb = em.Success ? FsUintEntry(v, em, omem, uiTy, uiNm, "\n// S2A_UINT_UI\n", !consts) : null;
++                    if (comb != null) { outp.Append(comb); consts = true; }
++                }
++                outp.Append(TexInRename(v, nm));
++            }
++            return TEXIN_BEGIN + aidCsv + "\n" + outp;
++        }
++
++        /// <summary>把 fn 里 want 这些参数块成员的每次 .read / .sample / .gather 结果包一层 wrap(...)：数值转换 "float4"（NVN 的 _UINT 语义）
++        /// 或位重解释 "as_type&lt;float4&gt;"（A/B，S2A_TEXIN_BITS=1）。尺寸类 get_* 与元素类型无关，不动；被当值用 / 别的方法抛 DshError</summary>
++        static string TexInWrap(string fn, List<(string Ty, string Nm, int Id)> want, string wrap)
++        {
++            string src = fn;
++            foreach (var x in want)
++            {
++                var edits = new List<(int Start, int End)>();
++                foreach (Match u in All(@"spvDescriptorSet0\." + Esc(x.Nm) + @"\b", src))
++                {
++                    int w = u.Index + u.Length;
++                    while (w < src.Length && char.IsWhiteSpace(src[w])) w++;
++                    if (w >= src.Length || src[w] != '.') throw new DshError("tex-in", $"贴图成员 {x.Nm} 被当成值用了（不是 .read / .sample），改不了");
++                    int n0 = w + 1, n1 = n0; while (n1 < src.Length && (char.IsLetterOrDigit(src[n1]) || src[n1] == '_')) n1++;
++                    string meth = src[n0..n1];
++                    if (meth.StartsWith("get_", StringComparison.Ordinal)) continue;   // get_width / get_array_size / get_num_mip_levels…：返回 uint，与元素类型无关
++                    if (meth is not ("read" or "sample" or "gather"))
++                        throw new DshError("tex-in", $"贴图成员 {x.Nm} 用了 .{meth}()（只有 read / sample / gather 有可转换的返回值）");
++                    int o = n1; while (o < src.Length && char.IsWhiteSpace(src[o])) o++;
++                    if (o >= src.Length || src[o] != '(') throw new DshError("tex-in", $"贴图成员 {x.Nm}：.{meth} 后面没有参数表");
++                    int e = CallEnd(src, o);
++                    if (e < 0) throw new DshError("tex-in", $"贴图成员 {x.Nm}：.{meth}() 括号不闭合");
++                    edits.Add((u.Index, e));
++                }
++                for (int i = edits.Count - 1; i >= 0; i--)
++                {   // 从后往前替换：前面改过不影响还没处理的起点
++                    var (a, b) = edits[i];
++                    src = src[..a] + wrap + "(" + src[a..b] + ")" + src[b..];
++                }
++            }
++            return src;
++        }
++
++        /// <summary>把 fn 里的片元入口 main0 改名成 entry（同一份源码只留这一支，单独编库；函数体原样）</summary>
++        static string TexInRename(string fn, string entry)
++        {
++            var ent = Search(@"^.*\bfragment\s+main0_out\s+main0\s*\(", fn, RegexOptions.Multiline);
++            if (!ent.Success) throw new DshError("tex-in", "源码里认不出片元入口 main0");
++            string sig = ent.Value; int k = sig.LastIndexOf("main0(", StringComparison.Ordinal);
++            if (k < 0) throw new DshError("tex-in", "main0 的签名认不出");
++            return fn[..ent.Index] + sig[..k] + entry + "(" + fn[(ent.Index + ent.Length)..];
++        }
++        /// <summary>open（'(' 的下标）起配对的 ')' 之后（圆括号 / 方括号一起数）；不闭合返回 -1</summary>
++        static int CallEnd(string s, int open)
++        {
++            int d = 0;
++            for (int i = open; i < s.Length; i++)
++            {
++                char c = s[i];
++                if (c == '(' || c == '[') d++;
++                else if (c == ')' || c == ']') { d--; if (d == 0) return i + 1; }
++            }
++            return -1;
+         }
+ 
+         // ---- dmsh_geometry.capture ----
+--- a/graphics/tools/direct/dsh/DshCApi.cs
++++ b/graphics/tools/direct/dsh/DshCApi.cs
+@@ -5,6 +5,8 @@
+ //   int s2a_dsh_fout_variant(const char *metal_in, uint32_t umask, uint32_t smask, const char *metal_out)：片元输出逐位置定类型的入口 main0_t（见下）。
+ //   int s2a_dsh_vs_pad(const char *metal_in, uint32_t mask, const char *metal_out)：顶点着色器补齐变体（见下，运行期配对的 user(locn) 补齐）
+ //   int s2a_dsh_samp_emu(const char *metal_in, const char *metal_out)：采样器归约变体 <键>_se.metal（见下，#800）。
++//   int s2a_dsh_tex_input(const char *metal_in, const char *aid_csv, uint32_t flags, const char *metal_out)：输入侧纹理类型变体入口 main0_i / main0_ib，
++//       flags bit 0 再出输出+输入组合入口 main0_ui / main0_uib（见下，#427）。
+ //   const char *s2a_dsh_xfp(void)：翻译器指纹（16 位十六进制），现编结果 _b.json 的 "xfp" 字段同值；宿主不等就不复用兜底目录里的旧结果。
+ //   答案表 / 配对表 / 映射表从 $S2A_GAME_DATA/shaders/direct/ 读（libc getenv：iOS 上它由原生层在运行时起来之后才设，.NET 的环境副本看不到）。
+ //
+@@ -66,6 +68,28 @@
+             }
+             catch (DshError e) { Red(Path.GetFileName(i), "ps", $"输出类型变体 u={umask:x} s={smask:x}：" + e.Status + "：" + e.Detail); return 1; }
+             catch (Exception e) { Red(Path.GetFileName(i), "ps", $"输出类型变体 u={umask:x} s={smask:x}：异常 " + e.GetType().Name + "：" + e.Message); return 2; }
++        }
++
++        /// <summary>int s2a_dsh_tex_input(const char *metal_in, const char *aid_csv, uint32_t flags, const char *metal_out)：输入侧纹理类型变体
++        /// （DshCompiler.FsTexInput；#427：片元着色器把某些采样槽声明成 float、运行时实际绑整数纹理，8 / 16 位没有同位宽 float 视图。宿主 nvn_mtl.m fs_texin_fn 按
++        /// 运行时绑定类别用）。aid_csv = 参数块 [[id]] 列表（逗号分隔），这些成员改成 texture…&lt;uint&gt;、.read / .sample 结果包 float4(...)（数值转换，入口 main0_i）
++        /// 或 as_type&lt;float4&gt;(...)（位重解释，入口 main0_ib）；flags bit 0 = 再出输出+输入组合入口 main0_ui / main0_uib。
++        /// 成功 0，失败非 0 并往 stderr 打一行【红】</summary>
++        [UnmanagedCallersOnly(EntryPoint = "s2a_dsh_tex_input")]
++        public static int TexInput(byte* metalIn, byte* aidCsv, uint flags, byte* metalOut)
++        {
++            string i = "?", a = "?";
++            try
++            {
++                if (metalIn == null || aidCsv == null || metalOut == null) throw new DshError("bad argument", "空指针参数");
++                i = Marshal.PtrToStringUTF8((IntPtr)metalIn); a = Marshal.PtrToStringUTF8((IntPtr)aidCsv);
++                string v = DshCompiler.FsTexInput(File.ReadAllText(i), a, flags);
++                string o = Marshal.PtrToStringUTF8((IntPtr)metalOut), t = o + ".tmp";
++                File.WriteAllText(t, v); File.Move(t, o, true);   // 先写临时文件再改名：别的线程 / 下一局只会看到完整的
++                return 0;
++            }
++            catch (DshError e) { Red(Path.GetFileName(i), "ps", $"输入类型变体 {a}：flags {flags}：" + e.Status + "：" + e.Detail); return 1; }
++            catch (Exception e) { Red(Path.GetFileName(i), "ps", $"输入类型变体 {a}：flags {flags}：异常 " + e.GetType().Name + "：" + e.Message); return 2; }
+         }
+ 
+         /// <summary>int s2a_dsh_samp_emu(const char *metal_in, const char *metal_out)：采样器归约变体（DshCompiler.FsRd，#800；离线库没有这支的变体、本机 GPU 缺原生归约的、
+--- a/graphics/nvn/host/dm.h
++++ b/graphics/nvn/host/dm.h
+@@ -60,6 +60,7 @@
+ // S2Arm：ProgramSetShaders 时库里没有的键登记进待编表，提交线程第一次用到时 dm_shader_miss_late 现编（graphics/nvn/host/dsh_miss.inc，§12.3 s2a_dsh_compile）
+ void dm_shader_miss(const uint8_t key[8], uint64_t code, const void *control); int dm_shader_miss_late(const char *k16, uint64_t code, const void *control); int dm_shader_reuse(const char *k16);   // control：在用控制段（Switch 2 NVN2 键在这里登记，dsh_miss.inc）
+ int dm_shader_fout(const uint8_t key[8], uint64_t code, const void *control, uint32_t umask, uint32_t smask, char *path, size_t n);
++int dm_shader_texin(const uint8_t key[8], uint64_t code, const void *control, const char *aid_csv, uint32_t flags, char *path, size_t n);   // S2Arm #427 输入侧纹理类型变体 main0_i / main0_ib（flags bit 0：再出输出+输入组合入口 main0_ui / main0_uib；dsh_miss.inc，S2A.Dsh FsTexInput）
+ int dm_shader_fout_fresh(const char *key16, uint32_t umask, uint32_t smask);   // S2Arm：兜底目录里这个变体能不能直接用（同翻译链、不比源码旧）   // S2Arm：片元输出逐位置定类型的变体源码（graphics/nvn/host/dsh_miss.inc）
+ // S2Arm（#800）：采样器归约变体源码 <键>_se.metal（graphics/nvn/host/dsh_miss.inc，S2A.Dsh FsRd）：成功 0、没有能改的采样 3、做不了 1；_fresh = 兜底目录里那份能直接用；
+ //   _snap = 提交线程上把控制段 + 代码区整份拷下给后台用（*code / *control 指进返回的那块，调用方 free；NULL = 认不出）
+--- a/graphics/nvn/host/dsh_miss.inc
++++ b/graphics/nvn/host/dsh_miss.inc
+@@ -312,6 +312,35 @@
+     return 0;
+ }
+ 
++// 输入侧纹理类型变体（#427；nvn_mtl.m fs_texin_prepare）：片元着色器把某些采样槽声明成 float、运行时绑的却是 8 / 16 位整数纹理。Metal 里没有同位宽的 float 视图
++//   （tex_float_fit 只补 32 位），float 声明读整数纹理是未定义行为，iOS 上读到 0（空之轨迹 the 1st 的 G-buffer 后期光照全黑）。兜底目录里先要有这个键的
++//   <键>_b.metal（库里的着色器此时才现编一份源码，同 dm_shader_fout），再出 <键>_i<aid_csv 里的逗号换下划线>.metal（S2A.Dsh FsTexInput：那些参数块成员改成
++//   texture…<uint>、.read / .sample 的结果包 float4(...) 或 as_type<float4>(...)（S2A_TEXIN_BITS 的 A/B），入口 main0_i / main0_ib；flags bit 0 再出输出+输入组合
++//   入口 main0_ui / main0_uib）。aid_csv 同时写进文件头校验：同一个键在不同绘制里整数槽可能不同（不同集合是不同变体）。
++//   成功 0、path = 变体源码；做不了 1
++int dm_shader_texin(const uint8_t key[8], uint64_t code, const void *control, const char *aid_csv, uint32_t flags, char *path, size_t n) {
++    char k[17]; for (int i = 0; i < 8; i++) snprintf(k + 2 * i, 3, "%02x", key[i]);
++    static int (*fv)(const char *, const char *, uint32_t, const char *); static dispatch_once_t once;
++    dispatch_once(&once, ^{ fv = (int (*)(const char *, const char *, uint32_t, const char *))dlsym(RTLD_DEFAULT, "s2a_dsh_tex_input"); });
++    dsh_comp_fn comp = dsh_comp(); const char *out = getenv("DM_MSL_FALLBACK"); uint32_t ncode = 0, nctl = 0;
++    int st = control && code ? dsh_stage((const uint8_t *)(uintptr_t)code, control, &ncode, &nctl) : -1;
++    if (!comp || !fv || !out || !*out || st != 1 || !aid_csv || !*aid_csv) { LOG("【红】直连：片元 %s 要输入类型变体 %s，做不了（%s）", k, aid_csv && *aid_csv ? aid_csv : "-", !comp || !fv ? "S2A.Aot 没链进来" : !out || !*out ? "没设 DM_MSL_FALLBACK" : "不是片元或长度不对"); return 1; }
++    mkdir(out, 0755);
++    char base[1200]; snprintf(base, sizeof base, "%s/%s_b.metal", out, k);
++    char tag[200]; size_t tn = 0; for (const char *s = aid_csv; *s && tn < sizeof tag - 1; s++) tag[tn++] = *s == ',' ? '_' : *s; tag[tn] = 0;
++    char want[260]; snprintf(want, sizeof want, "// s2a:tex-in 2 %s\n", aid_csv);   // = S2A.Dsh TEXIN_BEGIN（2：数值 / 位重解释两支 + 输出输入组合入口）
++    snprintf(path, n, "%s/%s_i%s.metal", out, k, tag);
++    int fresh = !dsh_have(out, k);
++    if (fresh && dsh_comp_src_locked(comp, k, st, (const void *)(uintptr_t)code, ncode, control, nctl, out)) { atomic_fetch_add_explicit(&g_dsh_failed, 1, memory_order_relaxed); LOG("【红】直连：片元 %s 现编源码失败，出不了输入类型变体", k); return 1; }
++    if (!fresh && dsh_variant_newer(path, base)) {   // 兜底目录里现成的：文件头必须是同一个 aid 集合
++        FILE *f = fopen(path, "r"); char l[300] = ""; int ok = f && fgets(l, sizeof l, f); if (f) fclose(f);
++        if (ok && !strcmp(l, want)) return 0;
++    }
++    if (fv(base, aid_csv, flags, path)) { atomic_fetch_add_explicit(&g_dsh_failed, 1, memory_order_relaxed); return 1; }
++    LOG("直连片元输入类型变体：%s aid=%s flags=%#x", k, aid_csv, flags);
++    return 0;
++}
++
+ // 采样器归约变体（#800；nvn_mtl.m se_kick / se_build）：本机 GPU 缺原生归约（非 Apple10）、绘制又真绑了 min / max 采样器时要它（偏置不出变体：主体 main0 自己加，lb_fill）。
+ //   离线库不带（10-29 夜：动森 / 马车8 真绑的 0 支，静态全集却让动森库 +75%），首遇时在设备上出、缺省在后台线程（code / control 是 dm_shader_snap 的拷贝）：
+ //   兜底目录里先要有这个键的 <键>_b.metal（库里的着色器此时才现编一份源码，同 dm_shader_fout），再出 <键>_se.metal（S2A.Dsh FsRd；比源码旧就重出）。
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -4810,6 +4810,7 @@
+ static uint32_t g_noload_mask; static uint64_t g_noload_n, g_noload_bytes;
+ enum { SD_MAX = 8 + 2 };   // Entries per pass: up to 8 colour attachments (the recording loop's bound) + depth + stencil (a combined format records both planes)
+ static sd_att g_sd[SD_MAX]; static int g_nsd;
++static uint8_t g_sd_store[SD_MAX];   // S2Arm #427 G-buffer diagnostic: the store action sd_finish finally chose, per entry (0 = DontCare)
+ // S2Arm 11-07：免加载附件（lskip）第一次被记写的现场（g_nlw[i] 对 g_sd[i]），「lookahead wrong」红行带出来定因——满屏线 t0100670014482000（没有几何绘制、开满屏）也出这行，
+ //   几何连段之外还有判错路径。prec：1 绘制的精确记写（udc_note_draw）0 非精确编码整遍记写（udc_encode）2 清除画成三角（clr_note）。前 8 条都打，之后按 2 的幂报计数（g_noload_wrong）
+ typedef struct { uint64_t pass, draw; uint8_t wwhy, prec, geo, run; int wd, wdm; char vs[24], fs[24], gs[24]; } nl_wit;
+@@ -4928,13 +4929,145 @@
+ static int g_el_w, g_el_h, g_el_draws; static char g_el_key[12];
+ static int enc_label_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_ENC_LABEL"); v = e && atoi(e); } return v; }
+ static int g_nbcrt; static void bcrt_flush(void);   // shadows of block-compressed render targets used by the open pass (see bcrt_attach)
++// ---------- S2Arm #427 壳内置诊断：G-buffer 整数颜色目标（默认开；S2A_GBUF_DEBUG=0 关） ----------
++// 要回答的问题：几何遍把三张整数颜色目标（ser=236/279/280，NVN 格式 0x27 RGBA8UI / 0x14 RG16UI）画完，帧末读回却是全 0，
++//   光照遍 567fcd0c97a29418_b 读到 0、输出全黑。从外面看，「写了但没 store」与「根本没写」是同一种表象。
++// 做法：这种遍一结束，立刻在同一提交流里把整数附件拷进私有快照（后面的遍再清 / 再画也改不到它）；等这次提交在 GPU 上完成，
++//   下一帧开遍前在 CPU 上读回快照，算 nonzero / mean / max，写成 <docs>/padrec/gb_f<帧>_s<serial>.png，并打一行日志。
++//   每帧只做前 3 个这样的遍（一帧的 G-buffer 只占一个）；另有 512 MB / 2048 张的总预算，超了只打统计不再写 PNG，免得玩家的盘被写满。
++//   日志字段：store = sd_finish 最终选的写回（0 = DontCare）；wrote / wwhy = 本遍有没有一笔绘制写它、第一笔写的来由
++//   （1 image 2 color mask 3 fragment output 4 depth 5 stencil 6 imprecise encode）。wrote=0 是「根本没写」；
++//   wrote=1 且 store=0 是「写了但没 store」；wrote=1、store=1 而 nonzero=0 则是「写进去的就是 0」。
++enum { GB_MAX = 48, GB_PASS_MAX = 8, GB_PASSES_PER_FRAME = 3, GB_FILE_BUDGET = 2048 };
++#define GB_BYTE_BUDGET (512ull << 20)
++#include "nvn_pfkind.h"   // pf_int_kind：附件按 Metal 像素格式判整数输出类（和在用的管线判据同一张表）
++typedef struct { int ei, idx; uint64_t ser, lv, sl; uint32_t nvn_fmt, mtl_fmt; int load, wrote, wwhy, store; } gb_cap_t;
++typedef struct {
++    __strong id<MTLTexture> snap;   // 这一遍刚结束时该附件的私有拷贝
++    uint64_t ser, frame, pass, fence;   // fence：编码它的那次提交的栅栏（rp_end 时是 g_fence + 1，段切不推进 g_fence）
++    uint32_t nvn_fmt, mtl_fmt;
++    int slot, store, load, wrote, wwhy;
++    char key[24];   // 本遍第一笔的片元着色器 key（draw 里拷）
++} gb_ent;
++static gb_ent g_gb[GB_MAX]; static int g_gb_n;
++static gb_cap_t g_gb_cap[GB_PASS_MAX]; static int g_gb_cap_n;
++static uint64_t g_gb_frame = ~0ull; static int g_gb_pass_n;   // 本帧已经 dump 了几个这样的遍
++static uint64_t g_gb_files, g_gb_bytes; static int g_gb_budget_logged;
++static int g_gb_on = -1;
++static char g_gb_key[24];
++static int gbuf_on(void) { if (g_gb_on < 0) { const char *e = getenv("S2A_GBUF_DEBUG"); g_gb_on = !(e && !strcmp(e, "0")); if (!g_gb_on) MLOG("S2A_GBUF_DEBUG=0: G-buffer diagnostic off"); } return g_gb_on; }
++// 遍结束、sd_finish 之前：挑出这一遍的整数颜色附件（这时 store 还没定）
++static void gb_cap(void) {
++    g_gb_cap_n = 0;
++    if (!gbuf_on() || !g_nsd) return;
++    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
++    if (f != g_gb_frame) { g_gb_frame = f; g_gb_pass_n = 0; }
++    if (g_gb_pass_n >= GB_PASSES_PER_FRAME) return;
++    int any = 0;
++    for (int i = 0; i < g_nsd && g_gb_cap_n < GB_PASS_MAX; i++) {
++        sd_att *t = &g_sd[i];
++        if (t->depth || t->idx < 0 || t->idx >= 8 || t->idx >= R.rt.n || !R.rt.color[t->idx]) continue;
++        if (!pf_int_kind((MTLPixelFormat)g_pass.cfmt[t->idx])) continue;
++        gb_cap_t *c = &g_gb_cap[g_gb_cap_n++];
++        c->ei = i; c->idx = t->idx; c->ser = t->ser; c->lv = t->lv; c->sl = t->sl;
++        c->nvn_fmt = R.rt.color[t->idx]->serial == t->ser ? R.rt.color[t->idx]->d.format : 0;
++        c->mtl_fmt = g_pass.cfmt[t->idx];
++        c->load = t->load; c->wrote = t->wrote; c->wwhy = t->wwhy;
++        any = 1;
++    }
++    if (any) g_gb_pass_n++;
++}
++// sd_finish 之后：把最终写回选的是不是 Store 记到候选上
++static void gb_store(void) { for (int i = 0; i < g_gb_cap_n; i++) g_gb_cap[i].store = g_sd_store[g_gb_cap[i].ei]; }
++// 遍编码器刚结束：在同一提交流里拷快照（blit()，ts_after 的拷贝同一处），这里不等 GPU
++static void gb_take(void) {
++    for (int i = 0; i < g_gb_cap_n && g_gb_n < GB_MAX; i++) {
++        gb_cap_t *c = &g_gb_cap[i];
++        const tex_t *tt = c->idx < R.rt.n ? R.rt.color[c->idx] : NULL;
++        id<MTLTexture> t = tt && tt->serial == c->ser ? tex_mtl(tt) : nil;
++        if (!t || t.sampleCount != 1 || (t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray)) continue;
++        NSUInteger lv = (NSUInteger)c->lv, sl = (NSUInteger)c->sl, w = MAX(t.width >> lv, (NSUInteger)1), h = MAX(t.height >> lv, (NSUInteger)1);
++        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:t.pixelFormat width:w height:h mipmapped:NO];   // 快照用底图的格式：拷贝的两端像素格式必须一致（视图格式只在管线那头）
++        d.usage = MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
++        id<MTLTexture> s = [g_dev newTextureWithDescriptor:d];
++        if (!s) { MLOG("【红】 [gbufdbg] frame %llu ser=%llu: 建不出 %lux%lu 的快照", (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)c->ser, (unsigned long)w, (unsigned long)h); continue; }
++        res_add(s);
++        enc_b_copy_texture(blit(), t, sl, lv, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, 1), s, 0, 0, MTLOriginMake(0, 0, 0));
++        gb_ent *e = &g_gb[g_gb_n++];
++        e->snap = s; e->ser = c->ser; e->frame = atomic_load(&g_cur_frame); e->pass = g_stat_pass;
++        e->fence = g_fence + 1; e->nvn_fmt = c->nvn_fmt; e->mtl_fmt = c->mtl_fmt;
++        e->slot = c->idx; e->store = c->store; e->load = c->load; e->wrote = c->wrote; e->wwhy = c->wwhy;
++        snprintf(e->key, sizeof e->key, "%s", g_gb_key);
++    }
++    g_gb_cap_n = 0;
++}
++// 和 fit_shot_png 同一条 CoreGraphics 落盘路径；路径自己给，按帧 / 序列号命名
++static int gb_png(const char *path, const uint8_t *p, size_t w, size_t h, size_t row) {
++    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
++    CGContextRef ctx = CGBitmapContextCreate((void *)p, w, h, 8, row, cs, kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
++    CGImageRef img = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
++    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), false);
++    CGImageDestinationRef dst = url ? CGImageDestinationCreateWithURL(url, (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL) : NULL;
++    int ok = 0; if (ctx && img && dst) { CGImageDestinationAddImage(dst, img, NULL); ok = CGImageDestinationFinalize(dst); }
++    if (dst) CFRelease(dst); if (url) CFRelease(url); CGImageRelease(img); CGContextRelease(ctx); CGColorSpaceRelease(cs);
++    return ok;
++}
++// 下一帧、开遍前：这次提交已在 GPU 上完成，就把快照读回 CPU 出图（一次命令缓冲拷完所有快照）
++static void gbuf_drain(void) {
++    if (!g_gb_n) return;
++    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
++    for (int i = 0; i < g_gb_n; i++) if (g_gb[i].frame >= f || g_done < g_gb[i].fence) return;
++    rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
++    mtl_finish_gpu();
++    int n = g_gb_n; size_t rows[GB_MAX], bpp[GB_MAX]; id<MTLBuffer> bufs[GB_MAX];
++    id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
++    for (int i = 0; i < n; i++) {
++        id<MTLTexture> t = g_gb[i].snap; NSUInteger w = t.width, h = t.height;
++        bpp[i] = mtl_pf_bytes(t.pixelFormat); if (!bpp[i]) bpp[i] = 4;
++        rows[i] = (size_t)w * bpp[i];
++        bufs[i] = [g_dev newBufferWithLength:rows[i] * h options:MTLResourceStorageModeShared];
++        if (bufs[i]) [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toBuffer:bufs[i] destinationOffset:0 destinationBytesPerRow:rows[i] destinationBytesPerImage:rows[i] * h];
++    }
++    [b endEncoding];
++    int ran = cb_run(cb);
++    char dir[1200]; s2a_docs_path(dir, sizeof dir, "padrec"); mkdir(dir, 0755);
++    for (int i = 0; i < n; i++) {
++        gb_ent *e = &g_gb[i]; id<MTLTexture> t = e->snap; NSUInteger w = t.width, h = t.height;
++        const uint8_t *p = bufs[i] ? (const uint8_t *)bufs[i].contents : NULL;
++        size_t nb = (size_t)w * h * bpp[i];
++        uint64_t nz = 0, sum = 0, mx = 0;
++        if (ran && p) for (size_t k = 0; k < nb; k++) { uint8_t v = p[k]; nz += v != 0; sum += v; if (v > mx) mx = v; }
++        double mean = ran && p ? (double)sum / (double)nb : 0.0;
++        if (!ran || !p) { MLOG("【红】 [gbufdbg] frame %llu ser=%llu: 快照读回失败（nonzero 行不可信）", (unsigned long long)e->frame, (unsigned long long)e->ser); }
++        else if (g_gb_files < GB_FILE_BUDGET && g_gb_bytes < GB_BYTE_BUDGET) {
++            // 原始字节按 BGRA 摆（0x27 的 R / B 会互换：这张图只看「全 0 / 分布」，不做色度判读）
++            uint8_t *img = malloc((size_t)w * h * 4);
++            if (img) {
++                for (size_t y = 0; y < h; y++) for (size_t x = 0; x < w; x++) {
++                    const uint8_t *s = p + y * rows[i] + x * bpp[i]; uint8_t *q = img + ((size_t)y * w + x) * 4;
++                    q[0] = bpp[i] > 0 ? s[0] : 0; q[1] = bpp[i] > 1 ? s[1] : 0; q[2] = bpp[i] > 2 ? s[2] : 0; q[3] = 255;
++                }
++                char path[1400]; snprintf(path, sizeof path, "%s/gb_f%llu_s%llu.png", dir, (unsigned long long)e->frame, (unsigned long long)e->ser);
++                if (gb_png(path, img, w, h, (size_t)w * 4)) { g_gb_files++; g_gb_bytes += (uint64_t)w * h * 4; }
++                else MLOG("【红】 [gbufdbg] 写 PNG 失败：%s", path);
++                free(img);
++            }
++        } else if (!g_gb_budget_logged) { g_gb_budget_logged = 1;
++            MLOG("[gbufdbg] PNG 预算到顶（%llu 张 / %.0f MB）：之后只打统计行，不再写图（S2A_GBUF_DEBUG=0 可整条诊断关掉）", (unsigned long long)g_gb_files, g_gb_bytes / 1048576.0); }
++        MLOG("[gbufdbg] frame %llu pass %llu key=%s c%d ser=%llu fmt=%#x store=%d load=%d wrote=%d wwhy=%d nonzero=%llu mean=%.1f max=%llu",
++             (unsigned long long)e->frame, (unsigned long long)e->pass, e->key[0] ? e->key : "-", e->slot, (unsigned long long)e->ser, (unsigned)e->nvn_fmt,
++             e->store, e->load, e->wrote, e->wwhy, (unsigned long long)(ran && p ? nz : 0), mean, (unsigned long long)(ran && p ? mx : 0));
++        res_remove(t); e->snap = nil;
++    }
++    g_gb_n = 0;
++}
+ static void rp_end(void) { if (!g_rlane) geo_run_flush(); if (g_enc) { AP_B;
+     if (enc_label_on()) { static uint64_t lf = ~0ull, base; uint64_t f = atomic_load(&g_cur_frame); if (f != lf) { lf = f; base = g_stat_pass - 1; }   // Intra-frame serial: the same pass has the same name every frame, so the table can aggregate by name
+         [(id)g_enc setLabel:[NSString stringWithFormat:@"p%02llu %dx%d %s d%d", (unsigned long long)(g_stat_pass - base), g_el_w, g_el_h, g_el_key[0] ? g_el_key : "-", g_el_draws]]; }
+ #ifdef NVN_RT_RANGE_TEST
+     int ranged=g_rt_range_active && !g_rt_range_pending;
+ #endif
+-    sd_finish(); enc_r_end_pass(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
++    gb_cap(); sd_finish(); gb_store(); enc_r_end_pass(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; ts_after(); gb_take(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
+     if (g_nubd && g_nubd >= ubd_lazy()) ubd_flush();   // the inline updates deferred in this pass, in order (see mtl_sub_update); across passes they wait for the next copy or dispatch (blit_raw)
+     if (g_nbcrt) bcrt_flush();   // blocks drawn into shadows go back into their compressed textures
+ #ifdef NVN_RT_RANGE_TEST
+@@ -5259,6 +5392,7 @@
+ }
+ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
+     if (g_enc) return g_enc;
++    if (gbuf_on()) g_gb_key[0] = 0;   // S2Arm #427: 这一遍的 dump 行用它的第一笔片元着色器 key（draw 里拷进来）
+     // Clears still waiting (lc_push) land before any pass opens: they are older than whatever this pass writes. Only a draw used to collect them (lc_take), so a pass opened
+     //   by a triangle clear (clear_color_tri / clear_ds_tri) or another writer left them waiting until the submission's end, where they wiped what the pass had drawn
+     //   (11-06 The Legend of Zelda: Skyward Sword HD: full clear to 0 → SetRenderTargets → scissored clear → video quad, the whole screen black). lc_land sets g_nlc to 0 first
+@@ -5289,6 +5423,7 @@
+     if (rt_range_on()) { reg0 = g_reg_gen; ser0 = g_ser_gen; }
+     if (rt_range_on()) dirty0=nvn_dirty_now();
+     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
++    gbuf_drain();   // S2Arm #427: 上一帧 G-buffer 的私有快照已随提交完成，回读出图（扩不出新遍，这里的等待只在有快照时）
+     MTL4RenderPassDescriptor *pd = pass_desc();
+     int any = 0;
+     for (int i = 0; i < R.rt.n; i++) {
+@@ -5590,6 +5725,8 @@
+     id<MTLLibrary> at_lib; NSString *at_main, *at_u; NSMutableDictionary<NSNumber *, id<MTLFunction>> *at_fns; uint8_t has_atms;   // gap families 34 / 37: a fragment main0 declaring S2A_AT / S2A_MSOFF (Dsh.cs FsAlphaMs): its library and entry names, specialized per (u, at, msoff) on demand (fs_atms_fn)
+     int load_depth_zero;   // captured with the identity, also used by its layer variant
+     uint8_t u_mask;   // S2Arm gap 2 A: the colour outputs fn_u returns as uint, bit n = color(n) (json u_mask; dmsh_build.py fs_uint turns only the integer-bit writers)
++    id<MTLLibrary> u_lib; NSString *u_entry_n; NSMutableDictionary<NSNumber *, id> *u_fns;   // S2Arm #427: main0_u's library and entry name, and its specializations by the pipeline's integer-output mask (fs_u_fn, Dsh.cs FsUintEntry); NSNull = a set that failed to build
++    id<MTLLibrary> ti_lib; uint32_t ti_mask[64]; uint8_t ti_n, ti_ui; NSMutableDictionary<NSNumber *, id> *ti_fns, *ti_ui_fns;   // S2Arm #427 input side: main0_i's library (made on the submit thread from the guest code, dm_shader_texin) and its entries by the texture-input set index kept in pso_key.fc bits 2-7 (fs_texin_fn / fs_texin_prepare); ti_mask[i] = bit n: the n-th float texture binding (fs_texin_slot order) is an 8 / 16-bit integer texture in this draw; ti_ui = the library also has the output+input combined entry main0_ui (fs_texin_ui_fn); NSNull = a set that failed
+     uint16_t tf_stride[4]; uint32_t cb_ext[16], sb_ro; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, afr, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
+     uint32_t geo_vertices, geo_invocations, geo_output, geo_stride, geo_index_stride;
+     // NVN2 task / mesh shader (json msl_entry_kind object / mesh, at stage 3 / 4; nvn_geometry.inc mesh_tasks_draw): mesh_kind 1 object 2 mesh (0 = neither); its workgroup's threads,
+@@ -6084,7 +6221,7 @@
+         o->ts[o->nts++] = (typeof(o->ts[0])){(uint8_t)idx, (uint8_t)img, (uint8_t)reg};
+     }
+     if (stage == 5 && j[@"spill"]) { o->spill = [j[@"spill"] unsignedIntValue]; o->spill_slot = [j[@"spill_slot"] unsignedIntValue]; }   // shared-memory spill (dispatch)
+-    if (stage == 1 && j[@"entry_u"]) { o->u_mask = (uint8_t)[j[@"u_mask"] unsignedIntValue]; o->fn_u = [lib newFunctionWithName:fnn(o, j[@"entry_u"])]; if (!o->fn_u) MLOG("【红】 shader %s: no integer-output entry point %s in its library", pc.UTF8String, [j[@"entry_u"] UTF8String]); }
++    if (stage == 1 && j[@"entry_u"]) { o->u_mask = (uint8_t)[j[@"u_mask"] unsignedIntValue]; o->fn_u = [lib newFunctionWithName:fnn(o, j[@"entry_u"])]; if (!o->fn_u) MLOG("【红】 shader %s: no integer-output entry point %s in its library", pc.UTF8String, [j[@"entry_u"] UTF8String]); else { o->u_lib = lib; o->u_entry_n = fnn(o, j[@"entry_u"]); } }   // S2Arm #427: main0_u is specialized per pipeline (fs_u_fn)
+     // Stages 3 / 4 are the tessellation control / evaluation shaders on Switch 1 and task / mesh on NVN2. A tessellation shader's json carries tess (handled below) and its
+     //   msl_entry_kind is vertex / kernel, which is right for it: the task / mesh contract (object / mesh functions, workgroup limits) is not its contract. Applied to it, the
+     //   kind check printed a false red line and the workgroup check found no threads, called the shader not usable and skipped its draws (#418: 19 red lines on a Switch 1 game)
+@@ -6997,6 +7134,12 @@
+     }
+     return NVN_DPF_FLOAT;
+ }
++// The integer formats tex_float_fit (below) turns into a bit-preserving float view: R32 / RG32 / RGBA32 Uint / Sint. The 8 / 16-bit integer formats have no such view, and a float
++// declaration reading them is undefined in Metal, so the host makes the shader's input-side entry main0_i for them instead (fs_texin_mask / fs_texin_prepare, Dsh.cs FsTexInput)
++static int tex32_float_view(MTLPixelFormat pf) {
++    switch ((int)pf) { case 53: case 54: case 103: case 104: case 123: case 124: return 1; }
++    return 0;
++}
+ // An image slot the shader declares as uint / int holding a texture of another class: on the Switch the shader's image format decides how the texel's bits are read. FINAL FANTASY TACTICS -
+ // The Ivalice Chronicles' UI composite blends into the RGBA8 window texture in software, loading it as r32ui and unpacking the four bytes (uirender.tec, fragment 4cf1975ed1e36590); bound as
+ // it was, an RGBA8Unorm texture in a texture2d<uint> argument read undefined values and translucent UI came out yellow and white. The slot gets a view of the same texel size in the
+@@ -7010,6 +7153,14 @@
+         if (b && !(b.usage & MTLTextureUsagePixelFormatView)) tex_upgrade_pfv(&g_treg[tid].t, b, MTLPixelFormatR32Uint); }
+     g_imfit_npend = 0;
+     pthread_mutex_unlock(&g_rmu);
++}
++// S2Arm: a cube / cube-array texture bound to an image the shader declares texture2d_array (a compute kernel that writes a cubemap through its six faces). The host binds a face-array
++//   view of it (tex_fit below: six layers per cube, the level / slice range of the bound view); a texture made without the format-view usage cannot make that view, so its writes would go
++//   to the dummy image. Such a texture is queued here and upgraded before the next draw pass or dispatch opens (img_fit_upgrade), as img_fit does for a class view. Caller holds g_rmu
++static void img_pfv_note(int tid) {
++    if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok) return;
++    for (int i = 0; i < g_imfit_npend; i++) if (g_imfit_pend[i] == tid) return;
++    if (g_imfit_npend < 16) g_imfit_pend[g_imfit_npend++] = tid;
+ }
+ // A texture bound to an image slot that was made without the shader-write usage: the NVN object lacks NVN_TEXTURE_FLAGS_IMAGE, which the Switch's hardware does not check (Ryujinx gives
+ // every storage-capable format the storage usage). The Witcher 3 makes its 1x1 R32F eye-adaptation values with COMPRESSIBLE only and has a compute kernel write them as images: bound as
+@@ -7911,6 +8062,100 @@
+ // S2Arm: the fragment shader's typed-output entry point for this need mask: cached, else loaded from the fallback directory's <key>_t<u>_<s>.metal that an earlier pso_fout_variant wrote (this run or
+ // an earlier one: the background prewarm of a recorded pipeline has no guest program to translate from, but the variant is on disk). nil when there is none. Pipelines are built on several threads
+ static pthread_mutex_t g_fnt_mu = PTHREAD_MUTEX_INITIALIZER;
++// S2Arm #427: main0_u whose colour outputs are chosen by the pipeline's integer targets (Dsh.cs FsUintEntry: one float and one
++//   unsigned member per colour, each present by a bool function constant S2A_UI<n>). Before this, main0_u was used only when the
++//   pipeline's integer set equalled the mask the build guessed from the shader's code; any other set fell back to main0 (float
++//   output against an integer attachment), which Metal 4 accepts when the pipeline is specialised from a base: the integer target
++//   then holds undefined values with no red line (Trails in the Sky 1st: the G-buffer is float at colour 0 and RGBA8Uint at 1-3,
++//   and the lighting pass read zeros = a black 3D picture). Built once per set, kept; nil when the shader has no main0_u or the
++//   set does not build. Called on the submit thread only (like fs_typed_fn).
++// S2Arm #427 诊断：main0_u 的每个颜色有两份成员（float / uint），由 bool 函数常量 S2A_UI<n> 决定哪一份进结构体。
++//   本行要回答的是「特化时到底设了什么、名字 / 索引对不对得上」：名字对不上时 Metal 不报错，片元就静默走 float 成员
++//   写进整数附件 → 设备上恒 0（正是本机 9 支整数片元 nonzero 全 0 的表象）。ui= / uf= 是设进去的 S2A_UI0..7 / S2A_UF0..7
++//   补值；consts= 是编译产物里实际声明的常量（名字@索引，带 ? 表示非必填），两边一对照就知道名字是否匹配。
++//   S2A_UI_SET_UF=1 额外把 S2A_UF<n> 也显式设成 !S2A_UI<n>，用来验证「default 初始化的 S2A_UF 是否随 S2A_UI 生效」这条假设。
++static int ui_set_uf(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_UI_SET_UF"); v = e && *e && strcmp(e, "0") != 0; } return v; }
++
++static void gbuf_ui_dump(NvShader *fs, uint32_t umask, id<MTLFunction> f, const char *how) {
++    char uib[10], ufb[10], decl[240];
++    for (int n = 0; n < 8; n++) { uib[n] = (umask >> n) & 1 ? '1' : '0'; ufb[n] = (umask >> n) & 1 ? '0' : '1'; }
++    uib[8] = ufb[8] = 0; decl[0] = 0;
++    size_t k = 0; NSDictionary *d = f ? f.functionConstantsDictionary : nil;
++    for (NSString *nm in [[d allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
++        MTLFunctionConstant *c = d[nm];
++        int w = snprintf(decl + k, sizeof decl - k, "%s%s@%lu%s", k ? "," : "", nm.UTF8String, (unsigned long)c.index, c.required ? "" : "?");
++        if (w < 0 || (size_t)w >= sizeof decl - k) { strcpy(decl + sizeof decl - 6, ",..."); break; }
++        k += (size_t)w;
++    }
++    MLOG("[gbufdbg] pso key=%s how=%s intmask=%#x u_mask=%#x ui=%s uf=%s set_uf=%d entry=%s nconst=%lu consts=[%s]",
++         fs->key, how, umask, fs->u_mask, uib, ufb, ui_set_uf(), fs->u_entry_n ? fs->u_entry_n.UTF8String : "-",
++         (unsigned long)d.count, decl);
++}
++
++static id<MTLFunction> fs_u_fn(NvShader *fs, uint32_t umask) {
++    if (!fs || !fs->u_lib || !fs->u_entry_n || !(umask & 0xff)) {   // S2Arm #427 诊断：先把「为什么直接放弃」说出来（库 / 入口名在不在）
++        if (gbuf_on() && fs && (umask & 0xff) && !(fs->logged & 0x2000)) { fs->logged |= 0x2000;
++            MLOG("[gbufdbg] pso key=%s how=fs_u_fn-bail intmask=%#x u_lib=%d entry=%s", fs->key, umask, fs->u_lib != nil, fs->u_entry_n ? fs->u_entry_n.UTF8String : "-"); }
++        return nil;
++    }
++    if (!fs->u_fns) { pthread_mutex_lock(&g_fnt_mu); if (!fs->u_fns) fs->u_fns = [NSMutableDictionary dictionary]; pthread_mutex_unlock(&g_fnt_mu); }
++    id c = fs->u_fns[@(umask)]; if (c) return c == NSNull.null ? nil : c;
++    MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
++    for (int n = 0; n < 8; n++) { bool u = (umask >> n) & 1; [cv setConstantValue:&u type:MTLDataTypeBool withName:[NSString stringWithFormat:@"S2A_UI%d", n]]; }
++    if (ui_set_uf()) for (int n = 0; n < 8; n++) { bool v = !((umask >> n) & 1); [cv setConstantValue:&v type:MTLDataTypeBool withName:[NSString stringWithFormat:@"S2A_UF%d", n]]; }
++    NSError *e = nil; id<MTLFunction> f = [fs->u_lib newFunctionWithName:fs->u_entry_n constantValues:cv error:&e];
++    if (!f) { static int nlog; if (nlog++ < 8) MLOG("【红】 fragment shader %s: main0_u specialized for integer outputs %#x failed to build: %s", fs->key, umask, e.localizedDescription.UTF8String); f = NSNull.null; }
++    else if (gbuf_on()) MLOG("[gbufdbg] entry=main0_u intmask=%#x key=%s", umask, fs->key);   // S2Arm #427: the integer-output variant is what this pass's pipeline selected
++    if (f && f != NSNull.null && gbuf_on()) gbuf_ui_dump(fs, umask, f, "main0_u");   // S2Arm #427 诊断：设进去的 S2A_UI/UF 与产物里声明的常量
++    fs->u_fns[@(umask)] = f;
++    return f == NSNull.null ? nil : f;
++}
++// S2Arm #427 input side A/B: S2A_TEXIN_BITS=1 reads the integer-class float-declared slots through as_type<float4>(v) (the texel's bits reinterpreted as
++//   floats) instead of float4(v) (the values converted, NVN's _UINT semantics). The variant library carries both entries (Dsh.cs FsTexInput): main0_i / main0_ib,
++//   and with the output+input combined entry main0_ui / main0_uib. Read once; the host picks the entry by this.
++static int texin_bits(void) {
++    static int v; static dispatch_once_t once;
++    dispatch_once(&once, ^{ const char *e = getenv("S2A_TEXIN_BITS"); v = e && !strcmp(e, "1");
++        MLOG("S2A_TEXIN_BITS=%s: 整数纹理输入变体读整数纹理用 %s", v ? "1" : "0（默认）", v ? "as_type<float4>（位重解释）" : "float4（数值转换，NVN 的 _UINT 语义）"); });
++    return v;
++}
++static NSString *texin_entry(int ui) { return texin_bits() ? (ui ? @"main0_uib" : @"main0_ib") : (ui ? @"main0_ui" : @"main0_i"); }
++// One line per entry kind, at its first use: the log says which A/B branch a run took (and whether the output+input combined entry was needed)
++static void texin_hit_log(NvShader *fs, int ui) {
++    static _Atomic uint8_t once[4]; int k = (ui ? 2 : 0) | (texin_bits() ? 1 : 0);
++    if (atomic_fetch_add(&once[k], 1)) return;
++    MLOG("fragment shader %s: texture-input entry %s first used (%s)%s", fs->key, texin_entry(ui).UTF8String,
++         texin_bits() ? "bit reinterpretation as_type<float4>(v), S2A_TEXIN_BITS=1" : "numeric conversion float4(v)",
++         ui ? ", combined with the pipeline's integer colour outputs" : "");
++}
++// S2Arm #427 input side: the fragment shader's main0_i / main0_ib for texture-input set idx (pso_key.fc bits 2-7): a variant of main0 whose texture2d…<float>
++//   members for the integer-class slots of that set are texture…<uint> and whose .read / .sample results convert numerically (Dsh.cs FsTexInput: the NVN
++//   semantics of a _UINT texture, 0..255 as floats) or, in main0_ib (S2A_TEXIN_BITS=1), reinterpret the texel's bits (as_type<float4>). Made by
++//   fs_texin_prepare on the submit thread before the key is first used, kept per set; nil when there is none (NSNull = it failed, not tried again).
++static id<MTLFunction> fs_texin_fn(NvShader *fs, uint32_t idx) {
++    if (!fs || idx == 0 || idx >= 64) return nil;
++    pthread_mutex_lock(&g_fnt_mu); id f = fs->ti_fns ? fs->ti_fns[@(idx)] : nil; pthread_mutex_unlock(&g_fnt_mu);
++    if (f && f != NSNull.null) texin_hit_log(fs, 0);
++    return f == NSNull.null ? nil : f;
++}
++// S2Arm #427 input side: the combined entry main0_ui / main0_uib — the same retyped texture inputs as main0_i / main0_ib AND main0_u's per-pipeline integer
++//   colour outputs (function constants S2A_UI<n>, exactly fs_u_fn's). Before this, a pipeline that needed integer colour outputs and integer texture inputs at
++//   once could only take one of the two variants (the output variant won, so the integer textures were read as float: Trails in the Sky 1st's post-deferred
++//   outline pass, need 0x2 + texture inputs 13,17, read zeros). Built from fs->ti_lib per (set, integer-output mask) and kept; nil when the library has no such
++//   entry (no float colour output) or the specialisation fails.
++static id<MTLFunction> fs_texin_ui_fn(NvShader *fs, uint32_t idx, uint32_t umask) {
++    if (!fs || !fs->ti_lib || !fs->ti_ui || idx == 0 || idx >= 64 || !(umask & 0xff)) return nil;
++    NSNumber *key = @(((uint64_t)umask << 8) | idx);
++    pthread_mutex_lock(&g_fnt_mu); id c = fs->ti_ui_fns ? fs->ti_ui_fns[key] : nil; pthread_mutex_unlock(&g_fnt_mu);
++    if (c) { if (c != NSNull.null) texin_hit_log(fs, 1); return c == NSNull.null ? nil : c; }
++    MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
++    for (int n = 0; n < 8; n++) { bool u = (umask >> n) & 1; [cv setConstantValue:&u type:MTLDataTypeBool withName:[NSString stringWithFormat:@"S2A_UI%d", n]]; }
++    NSError *e = nil; id<MTLFunction> f = [fs->ti_lib newFunctionWithName:texin_entry(1) constantValues:cv error:&e];
++    if (!f) { static int nlog; if (nlog++ < 8) MLOG("【红】 fragment shader %s: main0_ui specialized for integer outputs %#x / texture inputs %u failed to build: %s", fs->key, umask, idx, e.localizedDescription.UTF8String); f = NSNull.null; }
++    pthread_mutex_lock(&g_fnt_mu); if (!fs->ti_ui_fns) fs->ti_ui_fns = [NSMutableDictionary dictionary]; fs->ti_ui_fns[key] = f; pthread_mutex_unlock(&g_fnt_mu);
++    if (f != NSNull.null) texin_hit_log(fs, 1);
++    return f == NSNull.null ? nil : f;
++}
+ static id<MTLFunction> fs_typed_fn(NvShader *fs, uint32_t need) {
+     pthread_mutex_lock(&g_fnt_mu);
+     id f = fs->fn_t[@(need)];
+@@ -8124,9 +8369,43 @@
+             if (hl) d.fragmentFunction = [hl newFunctionWithName:[NSString stringWithFormat:@"hl%d", i]];
+             break; } }
+     uint32_t need = fs && !fsfn && d.fragmentFunction == fs->fn ? pso_fout_need(k, fs, merged) : 0;
+-    if (need && fs->fn_u && need == fs->u_mask) d.fragmentFunction = fs->fn_u;   // the integer attachments are exactly the outputs main0_u turns (dmsh_build.py fs_uint u_mask)
+-    else if (need) { id<MTLFunction> t = fs_typed_fn(fs, need); if (t) d.fragmentFunction = t; }   // S2Arm: mixed float / integer targets, dual-source blending (pso_fout_variant)
+-    else if (k->fc && fs && d.fragmentFunction == fs->fn) {   // S2Arm #800: the sampler-emulation variant (se_want: never with integer outputs)
++    uint32_t ti = fs && !fsfn && d.fragmentFunction == fs->fn ? ((uint32_t)k->fc >> 2) & 0x3f : 0;   // S2Arm #427 input side: this draw's integer-class float texture set (fs_texin_prepare made main0_i for it before the key)
++    id<MTLFunction> ti_ui_fn = nil;   // S2Arm #427: the combined output+input entry this pipeline picked, if any (the red line below tells the fallback apart from success)
++    if (need) {   // S2Arm #427: the pipeline's integer targets pick main0_u's outputs (fs_u_fn, function constants); the on-device typed variant stays for dual-source blending and for shaders without main0_u
++        id<MTLFunction> t = nil; int used_typed = 0;
++        if (gbuf_on() && !(fs->logged & 0x4000)) { fs->logged |= 0x4000;   // S2Arm #427 诊断：管线要的整数位 vs 片元库自报的 u_mask（不一致时老路 fn_u 不会命中）
++            MLOG("[gbufdbg] pso key=%s how=need need=%#x u_mask=%#x at=%d msoff=%d fsfn=%d merged=%d", fs->key, need, fs->u_mask, k->at, k->msoff, fsfn != 0, merged); }
++        if (!(need & ~0xffu) && !k->at && !k->msoff) {
++            if (ti) t = ti_ui_fn = fs_texin_ui_fn(fs, ti, need);   // S2Arm #427: integer outputs AND integer texture inputs at once: one combined entry (main0_ui / main0_uib), not either / or
++            if (!t) t = fs_u_fn(fs, need);
++        }
++        if (!t && fs->fn_u && need == fs->u_mask) { t = fs->fn_u;   // the old route still serves the alpha-test / sample-mask paths that specialise fn_u (fs_atms_fn)
++            if (gbuf_on() && !(fs->logged & 0x8000)) { fs->logged |= 0x8000;   // S2Arm #427 诊断：这条老路的 fn_u 建库时没设 S2A_UI<n>（全 false = 全 float 成员）→ 整数附件会恒 0
++                MLOG("[gbufdbg] pso key=%s how=fn_u-legacy intmask=%#x u_mask=%#x constants_unset=1", fs->key, need, fs->u_mask); }
++            if (gbuf_on() && !(fs->logged & 0x1000)) { fs->logged |= 0x1000; MLOG("[gbufdbg] entry=main0_u intmask=%#x key=%s", need, fs->key); } }
++        if (!t) { t = fs_typed_fn(fs, need); if (t) { used_typed = 1;   // S2Arm: mixed float / integer targets, dual-source blending (pso_fout_variant)
++            if (gbuf_on() && !(fs->logged & 0x10000)) { fs->logged |= 0x10000; MLOG("[gbufdbg] pso key=%s how=main0_t intmask=%#x", fs->key, need); } } }
++        if (gbuf_on() && !(fs->logged & 0x20000)) { fs->logged |= 0x20000;   // S2Arm #427 诊断：这条管线最终挑了哪个入口
++            MLOG("[gbufdbg] pso key=%s how=final pick=%s intmask=%#x u_mask=%#x", fs->key,
++                 t ? (t == fs->fn_u ? "fn_u" : ti_ui_fn ? "main0_ui" : used_typed ? "main0_t" : "main0_u") : "main0(fit=none)", need, fs->u_mask); }
++        if (t) d.fragmentFunction = t;
++        else if (!(fs->logged & 0x200)) {   // nothing fit: this draw keeps main0 (float outputs) against an integer target, which Metal 4 may accept silently (the target then holds undefined values)
++            fs->logged |= 0x200;
++            MLOG("【红】 fragment shader %s: its pipeline has integer colour targets %#x and no integer entry point fits (main0_u covers %#x): the draw keeps main0, those targets may hold undefined values", fs->key, need, fs->u_mask);
++        } }
++    if (ti) {   // S2Arm #427 input side: 8 / 16-bit integer textures bound to float-declared slots take main0_i (numeric) or main0_ib (S2A_TEXIN_BITS=1, bit reinterpretation)
++        if (d.fragmentFunction == fs->fn) {
++            id<MTLFunction> t = fs_texin_fn(fs, ti);
++            if (t) d.fragmentFunction = t;
++            else if (!(fs->logged & 0x400)) { fs->logged |= 0x400; MLOG("【红】 fragment shader %s: the draw binds 8 / 16-bit integer textures to slots it declares float (set %u) and its input-type entry is not there: the draw keeps main0 and reads undefined values from those slots", fs->key, ti); }
++        }
++        else if (d.fragmentFunction != ti_ui_fn && !(fs->logged & 0x800)) {
++            // The combined entry was not picked (no float colour output, alpha test / sample mask, dual-source blending, or its specialisation failed): the one fallback that reads those textures as float
++            fs->logged |= 0x800;
++            MLOG("【红】 fragment shader %s: its pipeline needs integer colour outputs (%#x) and integer texture inputs (set %u) together, but the combined entry main0_ui was not used: the output variant is used and the integer textures are read as float", fs->key, need, ti);
++        }
++    }
++    else if ((k->fc & 2u) && fs && d.fragmentFunction == fs->fn) {   // S2Arm #800: the sampler-emulation variant (se_want: never with integer outputs or integer texture inputs)
+         id<MTLFunction> f = se_fn(fs, k->fc); if (f) d.fragmentFunction = f; else MLOG("【红】 fragment shader %s: pipeline keyed for its sampler-emulation variant (bits %d), which is not there: main0", fs->key, k->fc); }
+     if (fs && (k->at || k->msoff) && (d.fragmentFunction == fs->fn || (fs->fn_u && d.fragmentFunction == fs->fn_u))) {   // gap families 34 / 37: main0 / main0_u with the alpha test / full sample mask
+         id<MTLFunction> f = fs_atms_fn(fs, d.fragmentFunction == fs->fn_u, k->at, k->msoff); if (f) d.fragmentFunction = f; }
+@@ -8208,6 +8487,42 @@
+         k->blend[i].target = 0;   // pso_desc reads only the factors and equations
+     }
+ }
++// S2Arm #427 input side: the texture bindings of a fragment shader that main0_i may retype: declared float, a sampled texture of a type the translator writes as texture…<float>
++//   (2D / 2D array / 3D / cube / 1D and their arrays; not multisample, not a buffer texture, not the 1D-in-2D-rows form). Their order numbers the bits of fs_texin_mask, so the
++//   host and Dsh.cs FsTexInput agree on which argument buffer id each bit is without passing names (the ids go to the translator).
++static int fs_texin_slot(const nvn_rbind *b) {
++    return b && b->kind == NVN_RB_TEX && b->dpf == NVN_DPF_FLOAT && !b->f1d &&
++           (b->dtt <= (uint8_t)MTLTextureType2DArray || b->dtt == (uint8_t)MTLTextureTypeCube || b->dtt == (uint8_t)MTLTextureTypeCubeArray || b->dtt == (uint8_t)MTLTextureType3D);
++}
++// Which of those are bound, in this draw, to an integer texture whose format has no float view (tex_float_fit covers the 32-bit ones): those slots read undefined values through main0
++//   on iOS (the integer G-buffer of Trails in the Sky 1st). Bit n = the n-th fs_texin_slot binding of the reflection. A slot without a materialised view, or whose bound texture type
++//   does not match the declaration (encode_args fits another view / the dummy), is left out: that draw keeps main0. Submit thread only (pso_key_fill).
++static uint32_t fs_texin_mask(NvShader *fs) {
++    if (!fs || !fs->rf.nb) return 0;
++    uint32_t m = 0, bit = 0;
++    pthread_mutex_lock(&g_rmu);
++    for (int i = 0; i < fs->rf.nb && bit < 32; i++) {
++        const nvn_rbind *b = &fs->rf.b[i];
++        if (!fs_texin_slot(b)) continue;
++        int n = (int)bit++;
++        int tid = (int)(tex_slot_h(S.tex[1], S.img[1], b->reg) & 0xfffff);
++        if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok || !g_treg[tid].view) continue;   // not materialised yet: this draw keeps main0 (the next one sees the view)
++        MTLPixelFormat pf = (MTLPixelFormat)g_treg[tid].view_pf;
++        if (g_treg[tid].view_tt == b->dtt && mtl_pf_dpf(pf) != NVN_DPF_FLOAT && !tex32_float_view(pf)) m |= 1u << n;
++    }
++    pthread_mutex_unlock(&g_rmu);
++    return m;
++}
++// The per-shader index of a texture-input set (1..63), kept in pso_key.fc bits 2-7: distinct sets are distinct pipelines, an fc of 0 / 2 is byte for byte the key recorded before.
++//   64 sets is far more than any shader needs (this game's five shaders have one each); past that the draw keeps main0.
++static uint32_t fs_texin_index(NvShader *fs, uint32_t mask) {
++    if (!fs || !mask) return 0;
++    for (int i = 1; i < fs->ti_n; i++) if (fs->ti_mask[i] == mask) return (uint32_t)i;
++    if (fs->ti_n >= 64) return 0;
++    int i = fs->ti_n++;
++    fs->ti_mask[i] = mask;
++    return (uint32_t)i;
++}
+ // Pipeline key: current state S + pass formats (normal pass; a merged pass additionally carries lmap / specialized function, filled in by pso_get)
+ static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t cfmt[8], uint32_t dfmt, uint32_t sfmt, uint32_t samples, int lmap) {
+     memset(k, 0, sizeof *k);
+@@ -8221,6 +8536,7 @@
+     for (int i = 0; i < 8; i++) if (k->cfmt[i] || lmap) { k->blend[i] = S.blend[i]; k->blend[i].adv_mode = k->blend[i].adv_overlap = k->blend[i].adv_premul = k->blend[i].adv_normdst = 0; }
+     const nvn_refl *rf = &vs->rf;
+     for (int v = 0; v < rf->nv; v++) { int a = rf->v[v].nvn; if (a < 16 && a < S.nattr) { k->attr[a] = S.attr[a]; int st = S.attr[a].stream; if (st < 16) k->stream[st] = S.stream[st]; } }
++    if (fs && !lmap) k->fc = (uint8_t)(fs_texin_index(fs, fs_texin_mask(fs)) << 2);   // S2Arm #427 input side: this draw's integer-class float texture set (fs_texin_prepare makes main0_i before the key is used)
+     pso_key_norm(k, vs, fs, lmap);
+ }
+ // ---- Parallel precompile: pipelines met for the first time used to be compiled synchronously one by one on the submit thread; 9 misses in a row in one frame = 284 ms (heavy scene on a real device).
+@@ -8247,6 +8563,7 @@
+ static int pso_pend_find(const pso_key *k) { for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && !memcmp(&g_pp[i].k, k, sizeof *k)) return i; return -1; }
+ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // Called by the submit thread: kick only if it is neither in the cache nor in the table
+     if (hm_get_id(&g_pso, k) || !pso_pair_ok(vs, fs, 0)) return;
++    if ((k->fc & 0xfcu) && !fs_texin_fn(fs, ((uint32_t)k->fc >> 2) & 0x3f)) return;   // S2Arm #427 input side: its main0_i is not there yet, so building this key now would cache a main0 pipeline under it (the draw builds it with pso_desc instead)
+     pthread_mutex_lock(&g_pp_mu);
+     int at = pso_pend_find(k), slot = -1;
+     if (at < 0) for (int i = 0; i < PSO_PEND_MAX; i++) if (!g_pp[i].used) { slot = i; break; }
+@@ -8367,6 +8684,51 @@
+     MLOG("fragment shader %s: typed-output variant %#x built in %.1f ms (%s)", fs->key, need, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6, path);
+     return 1;
+ }
++// S2Arm #427 input side: make the fragment shader's main0_i for texture-input set idx (pso_key.fc bits 2-7) before its pipeline key is used: the argument buffer ids of that set's
++//   integer-class float texture bindings go to the device translator (dm_shader_texin -> S2A.Dsh s2a_dsh_tex_input, Dsh.cs FsTexInput), which writes the variant source; it is compiled here
++//   and checked to take the same argument buffer as the library's main0. Called on the submit thread, once per set (a failed set is remembered). 1 = main0_i is there (or nothing to do),
++//   0 = it could not be made: the caller clears the set from the key, so those draws keep main0 and the red line says what was read wrongly.
++static int fs_texin_prepare(NvProg *pr, NvShader *fs, pso_key *k) {
++    uint32_t idx = ((uint32_t)k->fc >> 2) & 0x3f;
++    if (!idx) return 1;
++    pthread_mutex_lock(&g_fnt_mu); id have = fs && fs->ti_fns ? fs->ti_fns[@(idx)] : nil; pthread_mutex_unlock(&g_fnt_mu);
++    if (have) return have == NSNull.null ? 0 : 1;
++    int ok = 0; char csv[512] = ""; int o = 0; uint32_t mask = fs && idx < 64 ? fs->ti_mask[idx] : 0;
++    {   // the bit numbering is fs_texin_mask's: the n-th fs_texin_slot binding
++        int bit = 0;
++        for (int i = 0; fs && i < fs->rf.nb && o < (int)sizeof csv - 8; i++) {
++            const nvn_rbind *b = &fs->rf.b[i];
++            if (!fs_texin_slot(b)) continue;
++            if (mask >> bit & 1) o += snprintf(csv + o, sizeof csv - o, "%s%d", o ? "," : "", (int)b->aid);
++            bit++;
++        }
++    }
++    uint8_t md[8]; int at = fs && pr && pr->gp && mask ? prog_stage_of(pr->gp, fs->key, md) : -1;
++    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    char path[1200] = ""; const char *why = NULL; id<MTLFunction> f = nil;
++    if (!fs || !pr || !pr->gp || !mask) why = "no guest program for the variant";
++    else if (!o) why = "the set names no argument buffer id";
++    else if (at < 0) why = "the game no longer holds its control section to translate it";
++    else if (dm_shader_texin(md, pr->gp->sd[at].data, pr->gp->sd[at].control, csv, 1u, path, sizeof path)) why = "the device could not make the variant source";
++    else {
++        NSError *e = nil; NSString *src = [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:nil];
++        id<MTLLibrary> lib = src ? [g_dev newLibraryWithSource:src options:dm_msl_opts() error:&e] : nil;
++        f = lib ? lib_entry(lib, texin_entry(0)) : nil;   // the numeric (or, with S2A_TEXIN_BITS=1, the bit-reinterpretation) base entry
++        id fu = lib ? lib_entry(lib, texin_entry(1)) : nil;   // the output+input combined entry (Dsh.cs FsTexInput flags bit 0); nil when the shader has no float colour output
++        NSUInteger al = f && fs->rf.nb ? [f newArgumentEncoderWithBufferIndex:fs->rf.abi].encodedLength : fs->arg_len;
++        if (!lib) why = "failed to build";
++        else if (!f) why = "it has no main0_i";
++        else if (al != fs->arg_len) { why = "it takes another argument buffer than the library's main0"; f = nil; }
++        else { pthread_mutex_lock(&g_fnt_mu); if (!fs->ti_fns) fs->ti_fns = [NSMutableDictionary dictionary]; fs->ti_lib = lib; fs->ti_ui = fu != nil; fs->ti_fns[@(idx)] = f; pthread_mutex_unlock(&g_fnt_mu); ok = 1; }
++        if (ok) MLOG("fragment shader %s: input-type variant %s%s for texture inputs %s built in %.1f ms (%s)", fs->key, texin_entry(0).UTF8String,
++                     fs->ti_ui ? (texin_bits() ? " + combined main0_uib" : " + combined main0_ui") : "", csv, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6, path);
++    }
++    if (!ok) {
++        pthread_mutex_lock(&g_fnt_mu); if (fs) { if (!fs->ti_fns) fs->ti_fns = [NSMutableDictionary dictionary]; fs->ti_fns[@(idx)] = NSNull.null; } pthread_mutex_unlock(&g_fnt_mu);
++        MLOG("【红】 fragment shader %s: the draw binds 8 / 16-bit integer textures to texture slots it declares float (%s) and its input-type entry for set %u could not be made: %s; these draws keep main0 and read undefined values from those slots", fs ? fs->key : "-", csv, idx, why ? why : "unknown");
++    }
++    return ok;
++}
+ static int g_first_skipped;   // pso_get_ returned nil to skip this draw (the draw counts it instead of logging a failure)
+ static uint64_t g_fsk_draws, g_fsk_frames, g_fsk_run, g_fsk_run_max, g_fsk_last_f, g_fsk_occl;   // g_fsk_occl: skipped while an occlusion query counted (its sample count reads low that frame)
+ static int shader_writes(NvShader *s) { if (!s) return 0; for (int i = 0; i < s->rf.nb; i++) if (s->rf.b[i].rw) return 1; return 0; }
+@@ -8434,12 +8796,13 @@
+     g_pso_color_round = 0;
+     if (!vs) { RED_ONCE(13, "program has no vertex shader (or it is not mapped)"); PSO_WHY("no vertex stage"); return nil; }
+     pso_key k; pso_key_fill(&k, vs, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, g_pso_lmap != NULL);
++    if ((k.fc & 0xfcu) && !fs_texin_prepare(pr, fs, &k)) k.fc &= 0x3u;   // S2Arm #427 input side: main0_i is made here, before the key is cached / handed to the background compile (a failure keeps main0)
+     if (g_pso_lmap) { memcpy(k.lmap, g_pso_lmap, 8); k.fsfn = (__bridge void *)g_pso_fsfn; }
+     // S2Arm #800: the reduction variant is another fragment function of the same shader, its pipelines keyed apart from main0's (pso_desc picks it from k.fc). Picked by the caller
+     //   (se_want reads the bound samplers) and not in pso_key_fill: that one also runs in the parallel precompile's lookahead. The variant rewrites main0 only: a pipeline that needs integer
+     //   outputs (main0_u / main0_t) keeps them, averaged (the LOD bias they have: it is in every entry point), reported once
+     if (g_pso_fc && !g_pso_lmap && !g_pso_fsfn && fs) {
+-        if (!pso_fout_need(&k, fs, 0)) k.fc = (uint8_t)g_pso_fc;
++        if (!pso_fout_need(&k, fs, 0)) k.fc = (uint8_t)(g_pso_fc | (k.fc & 0xfcu));   // S2Arm #427 input side: keep the texture-input set index (bits 2-7)
+         else { static int once; if (!once++) MLOG("【红】 fragment shader %s: a min / max sampler the GPU cannot reduce natively, bound with integer outputs or dual-source blending, which the reduction variant does not have: averaged (first case)", fs->key); }
+     }
+     id<MTLFunction> ms_fn = ms_fs_override(fs); if (ms_fn) k.fsfn = (__bridge void *)ms_fn;   // DM_NVN_MAGSCAN phases 2 / 3
+@@ -9036,6 +9399,26 @@
+     if (pf != MTLPixelFormatDepth32Float && !ms) { uint8_t z[64] = {0}; NSUInteger faces = tt == MTLTextureTypeCube || tt == MTLTextureTypeCubeArray ? 6 : 1;
+         for (NSUInteger f = 0; f < faces; f++) [t replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:f withBytes:z bytesPerRow:16 bytesPerImage:16]; }
+     cache[dtt & 15][dpf & 3] = t; g_dummy_tex_rid[dtt & 15][dpf & 3] = t.gpuResourceID._impl; res_add(t);
++    return t;
++}
++// S2Arm #427 diagnostic S2A_CONST1X1=<value> (unset = off): a texture bound as 1x1x1 with a single mip level -- the exposure / scale constant a post pass
++//   multiplies by, which the game renders into a 1x1 target -- reads <value> in every channel instead of its own texel. With 1.0 the constant stops being the
++//   variable: a picture that comes back at 1.0 but not at its own value says "this constant is 0", not "the pass that reads it is broken". Only 2D and 3D
++//   textures are replaced: a cube / array 1x1 is not a scalar constant. The value is read once (env.txt is not re-read), the texture made on first use.
++static int g_const1x1_on = -1; static float g_const1x1_val = 1.0f;
++static int const1x1_on(void) {
++    if (g_const1x1_on < 0) { const char *e = getenv("S2A_CONST1X1"); g_const1x1_on = e && *e; if (g_const1x1_on) g_const1x1_val = (float)atof(e); }
++    return g_const1x1_on;
++}
++static id<MTLTexture> const1x1_tex(MTLTextureType tt) {
++    static __strong id<MTLTexture> cache[2]; unsigned k = tt == MTLTextureType3D;
++    if (cache[k]) return cache[k];
++    MTLTextureDescriptor *d = [MTLTextureDescriptor new];
++    d.textureType = tt; d.pixelFormat = MTLPixelFormatRGBA32Float; d.width = d.height = d.depth = 1; d.storageMode = MTLStorageModeShared; d.usage = MTLTextureUsageShaderRead;
++    id<MTLTexture> t = [g_dev newTextureWithDescriptor:d];
++    if (t) { float px[4] = {g_const1x1_val, g_const1x1_val, g_const1x1_val, g_const1x1_val};
++        [t replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:0 withBytes:px bytesPerRow:16 bytesPerImage:16];
++        cache[k] = t; res_add(t); }
+     return t;
+ }
+ // Write sink for unbound image slots: kept separate from the dummy textures that read 0 (writes must not pollute them); one is shared per same type and same pixel class
+@@ -10085,6 +10468,14 @@
+                 else { tex_mis_note(sh, nvn_stage, b->kind == NVN_RB_TEX ? reg : -1, tid, t, (MTLTextureType)b->dtt, "the slot reads 0 (the zero texture of the declared type, as Ryujinx leaves it unbound)"); t = nil; } }
+             if (t && b->dpf == NVN_DPF_FLOAT && mtl_pf_dpf(t.pixelFormat) != NVN_DPF_FLOAT) { uint64_t r2 = 0; id<MTLTexture> v = tex_float_fit(tid, t, &r2); if (v) { t = v; trid = r2; } }   // see tex_float_fit
+             if (t && nvn_stage == 1 && afr_want(sh)) { uint64_t r2 = 0; id<MTLTexture> v = tex_alpha_red(tid, t, &r2); if (v) { t = v; trid = r2; } }   // see tex_alpha_red
++            // S2Arm #427 diagnostic S2A_CONST1X1=<value> (see const1x1_tex): a 1x1x1 single-mip texture reads <value> in every channel; unset = bound as is
++            if (t && const1x1_on() && t.width == 1 && t.height == 1 && t.depth == 1 && t.mipmapLevelCount == 1 &&
++                (t.textureType == MTLTextureType2D || t.textureType == MTLTextureType3D)) {
++                id<MTLTexture> ct = const1x1_tex(t.textureType);
++                if (ct) { static int once; if (!once++) MLOG("S2A_CONST1X1=%g: texture %d (shader %s stage %d slot %d) is 1x1x1 format %lu: every channel reads %g (first case)",
++                    (double)g_const1x1_val, tid, sh->key, nvn_stage, reg, (unsigned long)t.pixelFormat, (double)g_const1x1_val);
++                    t = ct; trid = ct.gpuResourceID._impl; }
++            }
+             size_abi_texture(sh, nvn_stage, b, tid, size_view, t);
+             rs_bind_check(t, sh, nvn_stage, 0);   // S2Arm internal resolution: read where scaling is not supported → back to 1 at the next safe point
+             if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 15][b->dpf & 3]; }
+@@ -10103,6 +10494,15 @@
+                 if (mtl_fmt_depth(t.pixelFormat) || fmt_compressed(g_treg[tid].t.d.format)) RED_ONCE(32, "texture bound to an image slot is a depth / stencil or compressed format, which takes no shader writes (texture ID %d)", tid);
+                 else { img_wr_note(tid); static int n; if (!n++) MLOG("image slot texture without shader writes (texture ID %d): upgraded before the next pass", tid); }
+                 t = nil; }
++            // S2Arm: an image declared texture2d_array on a cube / cube-array texture: the writes go through a face-array view (tex_fit below). That view needs the format-view usage,
++            //   which a texture made as a render target can lack; queue the upgrade (img_fit_upgrade, before the next pass / dispatch opens) and write into the dummy until then, as an
++            //   image without the shader-write usage does. nxnative 0a7d6643: Trails in the Sky 1st's cubemap copy / blend compute kernels (glass and armour reflections)
++            if (t && b->dtt == (uint8_t)MTLTextureType2DArray && (t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray) &&
++                !((t.parentTexture ? t.parentTexture : t).usage & MTLTextureUsagePixelFormatView)) {
++                img_pfv_note(tid);
++                { static int once; if (!once++) MLOG("image output declared texture2d_array bound to a cube / cube array (texture ID %d): its face-array view waits for the format-view usage upgrade", tid); }
++                t = nil;
++            }
+             // A class the image needs that no view gives (or not yet: upgraded before the next pass, img_fit): the dummy image, never the texture as is (Metal reads / writes undefined)
+             if (t && (swz_only || (b->dpf != NVN_DPF_FLOAT && mtl_pf_dpf(t.pixelFormat) != b->dpf))) { uint64_t r2 = 0; id<MTLTexture> v = img_fit(tid, t, b->dpf, &r2); if (v) { t = v; trid = r2; } else t = nil; }   // see img_fit
+             // An image of another texture type than the shader declares: Ryujinx binds only the same dimensions (Texture.GetTargetTexture); the rest is the dummy image of the declared type
+@@ -10537,6 +10937,7 @@
+     if (!g_nsd) return;
+     if (!tbdr_on()) {   // TBDR set off: write back everything except an attachment loaded and not written in this pass (udc_on, needs no reader inference)
+         for (int i = 0; i < g_nsd; i++) { sd_att *t = &g_sd[i]; int dead = (udc_on() && t->load && !t->wrote) || (t->lskip && !t->wrote); MTLStoreAction sa = dead ? MTLStoreActionDontCare : MTLStoreActionStore;
++            g_sd_store[i] = sa == MTLStoreActionStore;
+             // not loaded (g_noload_mask) and still unwritten: nothing to write back, memory is the content. Written after all = the lookahead's proof was wrong (red; written back so the draws stay)
+             if (t->lskip && t->wrote) { const nl_wit *w = &g_nlw[i]; g_noload_wrong++;   // the first 8 with where the first write came from (g_nlw), then counts at powers of two
+                 if (g_noload_wrong <= 8) MLOG("【红】 color attachment ser=%llu was not loaded (proven unwritten to the pass end) but a draw wrote it: lookahead wrong (pass %llu, #%llu); first write: wwhy=%d (1 image 2 color mask 4 depth 5 stencil 6 imprecise encode) precise=%d (1 draw 0 encode 2 clear) pass %llu draw %llu vs=%s fs=%s gs=%s geo_program=%d geo_run=%d widen=%d wmode=%d; geometry draws in this pass %u",
+@@ -10561,6 +10962,7 @@
+         int xvdead = xvcand && xv_trial_get(xtag, 0) >= XV_TRIAL;   // Only after the trial period is the write-back really skipped
+         if (xvcand && !xvdead) xv_set(t->ser, t->lv, t->sl, XV_PROBE, xtag);   // Trial period: write back as usual, only track the next touch
+         int dead = t->state == 2 || udc_dead || xvdead; MTLStoreAction sa = dead ? MTLStoreActionDontCare : MTLStoreActionStore;
++        g_sd_store[i] = sa == MTLStoreActionStore;
+         if (xvdead) { xv_set(t->ser, t->lv, t->sl, XV_INVALID, xtag); g_xv_dc++; }
+         if (t->depth == 1) [g_enc setDepthStoreAction:sa]; else if (t->depth == 2) [g_enc setStencilStoreAction:sa]; else [g_enc setColorStoreAction:sa atIndex:(NSUInteger)t->idx];
+         g_sd_n_all++; if (dead) { g_sd_n_dead++; g_sd_dead_bytes += t->bytes; g_bw_store -= t->bytes; if (udc_dead) g_udc_saved_bytes += t->bytes; }
+@@ -10858,6 +11260,7 @@
+                 if (v && dv[v] == dv[0] && sv[v] == sv[0]) continue;
+                 if (v == 2 && !sfull) continue; if (v == 3 && (!dfull || !sfull)) continue;
+                 pso_key k; pso_key_fill(&k, vs, fs, cf, dv[v], sv[v], samples, 0);
++                if ((k.fc & 0xfcu) && !fs_texin_prepare(pr, fs, &k)) k.fc &= 0x3u;   // S2Arm #427 input side: made now, so the background compile below builds main0_i (pso_pend_kick refuses a set without one)
+                 if (hm_get_id(&g_pso, &k)) continue;
+                 int dup = 0; for (int i = 0; i < na && !dup; i++) dup = !memcmp(&qa[i].k, &k, sizeof k);
+                 if (dup) continue;
+@@ -13110,6 +13513,12 @@
+     id<MTLBuffer> b; size_t o = arena_alloc(sizeof S.alpha_ref, &b); memcpy((uint8_t *)b.contents + o, &S.alpha_ref, sizeof S.alpha_ref);
+     enc_r_args(en, MTLRenderStageFragment, b.gpuAddress + o, 30);
+ }
++// S2Arm #427 diagnostic S2A_VIEWPORT_FIT=1 (unset = off): a one-colour pass without depth / stencil whose viewport -- or scissor -- the game left smaller than
++//   the colour attachment, drawn from the top-left corner, gets the whole attachment instead. Trails in the Sky 1st's screen pass sets 1280x720 on a 1920x1080
++//   target, which leaves the right and bottom columns black on device. Not applied when one of our own transforms maps the game's coordinates on purpose (S2Arm
++//   widen, internal resolution) or the pass swizzles its viewport: a smaller viewport is then correct. draw_tex holds it off: its viewport IS the destination.
++static int g_vfit_hold;
++static int vfit_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_VIEWPORT_FIT"); v = e && *e && strcmp(e, "0"); } return v; }
+ static int draw_pass_state(id en, NvShader *fs) {   // en: the render encoder (typed id: enc_r_dss and friends take the Metal 4 type; naming it here would add an unguarded Metal 4 symbol, tools/avail_count.sh)
+     static id<MTLDepthStencilState> cur_ds; static uint64_t cur_ds_pass;
+     // Diagnostic DM_NVN_DEPTHOVR=fragment shader key prefix,...: those draws compare depth with ALWAYS, which tells "the depth test rejects every fragment" from "nothing rasterizes" (with DM_NVN_HILITE); unset = unchanged
+@@ -13124,7 +13533,19 @@
+         enc_r_stencil_ref(en, S.st_ref[0], S.st_ref[1]); g_ed.sref[0] = S.st_ref[0]; g_ed.sref[1] = S.st_ref[1]; g_ed.ok |= ED_SREF; }
+     // Viewport / scissor (clamped within the target size)
+     NSUInteger tw = g_pass.tw, th = g_pass.th;
+-    { MTLViewport v = S.has_vp ? (MTLViewport){S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3], S.dr[0], S.dr[1]} : (MTLViewport){0, 0, tw / g_pass.rs, th / g_pass.rs, 0, 1};   // no viewport: the whole target, in canvas units (internal resolution)
++    // S2Arm #427: S2A_VIEWPORT_FIT=1 -- a small viewport / scissor on a one-colour pass means the game is drawing into a corner of a larger screen (see vfit_on)
++    int vfit = 0;
++    if (vfit_on() && !g_vfit_hold && S.has_vp && !g_pass.layered && g_pass.hd == 0 && g_pass.hs == 0 && g_pass.rs == 1.0 && g_wd == 0 && R.has_rt && R.rt.n == 1 &&
++        !S.vp_sw[0][0] && !S.vp_sw[0][1] && !S.vp_sw[0][2] && !S.vp_sw[0][3]) {
++        float vx = S.vp[0][0], vy = S.vp[0][1], vw = S.vp[0][2], vh = S.vp[0][3];
++        int small = vw < (float)tw - 0.5f || vh < (float)th - 0.5f || (R.has_sc && (R.sc.w < (long)tw || R.sc.h < (long)th));
++        if (small && vx > -0.5f && vy > -0.5f && vx < (float)tw - 0.5f && vy < (float)th - 0.5f) {
++            vfit = 1;
++            static int once; if (!once++) MLOG("S2A_VIEWPORT_FIT=1: pass %llu colour target %lux%lu, viewport %.0f,%.0f %.0fx%.0f, scissor %s: the whole target instead (first case)",
++                (unsigned long long)g_stat_pass, (unsigned long)tw, (unsigned long)th, (double)vx, (double)vy, (double)vw, (double)vh, R.has_sc ? "set" : "none");
++        }
++    }
++    { MTLViewport v = vfit ? (MTLViewport){0, 0, (double)tw, (double)th, 0, 1} : S.has_vp ? (MTLViewport){S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3], S.dr[0], S.dr[1]} : (MTLViewport){0, 0, tw / g_pass.rs, th / g_pass.rs, 0, 1};   // no viewport: the whole target, in canvas units (internal resolution)
+       if (g_wd > 0) { float x = (float)v.originX, w = (float)v.width, r0 = x + w; s2a_widen_map_viewport(g_wd_mode, &x, &w); v.originX = x; v.width = w;
+         { float y = (float)v.originY, h = (float)v.height; s2a_widen_map_viewport_y(g_wd_mode, &y, &h); v.originY = y; v.height = h; }   // narrower screen: more picture above and below (s2a_widen_ky > 1)
+         if (x + w > (float)(tw / g_pass.rs) + 1.0f && x + w > r0 + 0.5f) RED_ONCE(113, "widen: viewport %.0f+%.0f past the target's storage width %lu (ser=%llu, storage not widened): the right part is clipped (first case)", x, w, (unsigned long)tw,
+@@ -13138,7 +13559,7 @@
+         else if (sw) RED_ONCE(108, "viewport swizzle %d,%d,%d,%d not implemented (drawn unswizzled)", S.vp_sw[0][0], S.vp_sw[0][1] ^ 2, S.vp_sw[0][2] ^ 4, S.vp_sw[0][3] ^ 6); }
+       if (!(g_ed.ok & ED_VP) || memcmp(&g_ed.vp, &v, sizeof v)) { enc_r_viewport(en, v); g_ed.vp = v; g_ed.ok |= ED_VP; } }
+     MTLScissorRect sc = {0, 0, tw, th};
+-    if (R.has_sc) {
++    if (R.has_sc && !vfit) {   // a fitted pass (S2A_VIEWPORT_FIT) draws over the whole attachment
+         p_scissor rs = R.sc; if (g_wd > 0) { s2a_widen_map_scissor(g_wd_mode, &rs.x, &rs.w); s2a_widen_map_scissor_y(g_wd_mode, &rs.y, &rs.h); }   // S2Arm widen
+         if (g_wd > 0 && wd_tr_on()) MLOG("S2Arm widen trace: frame %llu scissor %d,%d %dx%d -> %d,%d %dx%d mode %d", (unsigned long long)g_wd_frame, R.sc.x, R.sc.y, R.sc.w, R.sc.h, rs.x, rs.y, rs.w, rs.h, g_wd_mode);   // 11-02 怪猎对话框正文被切：剪刀原值 / 换算后对照（追踪行只打视口）
+         long sx = rs.x, sy = rs.y, sw = rs.w, sh = rs.h; rs_rect(g_pass.rs, &sx, &sy, &sw, &sh);   // S2Arm internal resolution: canvas → storage
+@@ -13477,7 +13898,7 @@
+     S.ds.dt = S.ds.dw = S.ds.st = 0; S.poly.cull = NVN_FACE_NONE; S.has_vp = 1;
+     S.vp[0][0] = MIN(x0, x1); S.vp[0][1] = MIN(y0, y1); S.vp[0][2] = fabsf(x1 - x0); S.vp[0][3] = fabsf(y1 - y0); S.dr[0] = 0; S.dr[1] = 1; memset(S.vp_sw[0], 0, sizeof sw0);
+     g_dss_dirty = 1;
+-    int drawn = draw_pass_state(en, nil);
++    g_vfit_hold = 1; int drawn = draw_pass_state(en, nil); g_vfit_hold = 0;   // S2A_VIEWPORT_FIT: this viewport is the destination rectangle, not the screen
+     S.ds = ds0; S.poly = po0; S.has_vp = hv0; memcpy(S.vp[0], vp0, sizeof vp0); memcpy(S.dr, dr0, sizeof dr0); memcpy(S.vp_sw[0], sw0, sizeof sw0);
+     g_dss_dirty = 1;
+     if (!drawn) return;   // empty scissor
+@@ -13549,11 +13970,16 @@
+     // Draws that cannot draw anything (both faces culled, empty scissor) return before the render pass is opened: otherwise the render pass is already open and on TBDR the whole attachment is loaded and stored for nothing
+     // (Mac character select page: 3 render passes are opened only because of such draws, all loaded, zero draws)
+     // Diagnostic switch for measuring an upper bound DM_NVN_SKIP_FS=<fragment key>[,<fragment key>...] (none by default): drops all draws of these fragment shaders (the picture will be wrong; only used in real-device ABA to measure "how much GPU time this class of draws is worth in total")
++    // S2Arm #427: the same whole-draw skip under its own name S2A_DRAW_SKIP=<fragment key prefix>[,<prefix>...] (none by default): the draw is not encoded at all, so
++    //   the pass keeps whatever it loaded. Dropping a full-screen post pass answers "is the picture still there without it" in one frame (the first pass that wipes it
++    //   is then the one to look at). A prefix of the key matches, e.g. f9791dd31edcfaa1 or f9791dd31edcfaa1_b. Both names fill one table; the newer one wins.
+     { static char sk[16][20]; static int nsk = -1;
+-      if (nsk < 0) { nsk = 0; for (const char *q = getenv("DM_NVN_SKIP_FS"); q && *q && nsk < 16; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 16) n = 16; memcpy(sk[nsk], q, n); sk[nsk++][n] = 0; }
+-                     if (nsk) MLOG("DM_NVN_SKIP_FS: dropping the draws of %d fragment shaders (diagnostic; the picture is wrong)", nsk); }
++      if (nsk < 0) { const char *es = getenv("S2A_DRAW_SKIP"); int own = es && *es; const char *e = own ? es : getenv("DM_NVN_SKIP_FS");   // read once, cached
++                     nsk = 0; for (const char *q = e; q && *q && nsk < 16; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 19) n = 19; memcpy(sk[nsk], q, n); sk[nsk++][n] = 0; }
++                     if (nsk) MLOG("%s: dropping the draws of %d fragment shaders (diagnostic; the picture is wrong)", own ? "S2A_DRAW_SKIP" : "DM_NVN_SKIP_FS", nsk); }
+       if (g_ub_n > 0 && pr->sh[1] && !g_defer_replaying && ub_skip(pr->sh[1]->key)) return;   // In-process alternating measurement: this phase drops this class
+-      if (nsk && pr->sh[1] && !g_defer_replaying) for (int i = 0; i < nsk; i++) if (!strncmp(pr->sh[1]->key, sk[i], strlen(sk[i]))) return;
++      if (nsk && pr->sh[1] && !g_defer_replaying) for (int i = 0; i < nsk; i++) if (!strncmp(pr->sh[1]->key, sk[i], strlen(sk[i]))) {
++          static int once; if (!once++) MLOG("S2A_DRAW_SKIP: first draw skipped: pass %llu fragment %s (not encoded; the attachment keeps what it loaded)", (unsigned long long)g_stat_pass, pr->sh[1]->key); return; }
+       if (ms_draw(pr)) return; }
+     // Diagnostic DM_NVN_DRAW_MAX=<n> (frame replay, graphics/nvn/docs/frame_replay.md): draws past the n-th of a frame are dropped, and the n-th logs its program, blend state and targets
+     //   (DM_NVN_DRAWLOG=1: every draw up to the n-th logs it; DM_NVN_DRAW_SKIP=a-b drops the a-th to b-th draws of a frame) --
+@@ -13628,7 +14054,7 @@
+     if (defer_q_draw) defer_replay();
+     if (skip_d) { g_stat_ds_omit++; if (mode == 3) g_stat_s_only++; else if (mode == 4) g_stat_d_only++; }
+     // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
+-    static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass; static int cur_ps_fc; static uint8_t cur_ps_round;
++    static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass; static int cur_ps_fc; static uint8_t cur_ps_round; static uint32_t cur_ps_tim;
+     if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }
+     else if (g_fbt.on && g_enc && !g_defer_replaying) {   // ⑤ 遍内自采样片上读取：本笔用可读瓦片版（输出不搬位置）
+         g_pso_lmap = g_fbt.lmap; g_pso_fsfn = g_fbt.fn; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_fz.kind = 1; g_pso_fz.fbmask = g_fbt.fbmask;
+@@ -13638,10 +14064,11 @@
+     //   GPU has no native reduction (0 at once on Apple10)
+     g_fold_sh[1] = NULL;   // reset here too: the readable-tile paths below skip se_want
+     int fc = g_pso_lmap || g_pso_fsfn ? 0 : se_want(pr->gp, pr->sh[1], 1);
++    uint32_t cur_tim = !g_pso_lmap && !g_pso_fsfn && pr->sh[1] ? fs_texin_mask(pr->sh[1]) : 0;   // S2Arm #427 input side: a different integer-class texture set is a different fragment entry (main0_i), so the program + pass fast path below must notice it
+     if (g_mtk.on) {   // a task / mesh draw (mesh_tasks_draw): its own pipeline kind; the next draw fetches its own again (cur_pr nil)
+         g_pso_fc = fc; cur_ps = mtk_pso(pr); cur_ps_round = g_pso_color_round; g_pso_fc = 0; cur_pr = nil;
+         if (!cur_ps) { g_mtk.miss = 1; if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; } return; } }
+-    else if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || fc != cur_ps_fc) { g_pso_fc = fc; cur_ps = pso_get(pr, nil); cur_ps_round = g_pso_color_round; g_pso_fc = 0; cur_pr = pr; cur_ps_pass = g_pass.serial; cur_ps_fc = fc; g_pso_dirty = !cur_ps; }
++    else if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || fc != cur_ps_fc || cur_tim != cur_ps_tim) { g_pso_fc = fc; cur_ps = pso_get(pr, nil); cur_ps_round = g_pso_color_round; g_pso_fc = 0; cur_pr = pr; cur_ps_pass = g_pass.serial; cur_ps_fc = fc; cur_ps_tim = cur_tim; g_pso_dirty = !cur_ps; }
+     g_udc_lmap = g_pso_lmap; g_udc_fsfn = g_pso_fsfn != nil;   // udc_note_draw (below) judges this draw's writes by the map its pipeline used
+     if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // The next draw fetches again according to its own situation
+     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
+@@ -13696,6 +14123,7 @@
+         }
+     }
+     g_stat_draw++;
++    if (!g_gb_key[0] && pr->sh[1] && gbuf_on()) snprintf(g_gb_key, sizeof g_gb_key, "%s", pr->sh[1]->key);   // S2Arm #427: 这一遍 dump 行里的片元 key（取第一笔）
+     if (enc_label_on() && !g_el_draws++ && pr->sh[1]) { memcpy(g_el_key, pr->sh[1]->key, 8); g_el_key[8] = 0; }
+     if (passdump()) {   // Characteristics of a render pass's first draw (to judge whether the load can be omitted: full screen, no blending, writes all channels, does not depend on depth); with DM_NVN_PASSDUMP_ALL every draw is recorded
+         static uint64_t last_pass = ~0ull; static int all = -1; if (all < 0) all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
+@@ -13949,7 +14377,8 @@
+         if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok) continue;
+         nvn_be_pool_gpu_written(g_treg[tid].t.pool);   // before it resolves: a shader image is a GPU write into its pool (tex_cpu_content)
+         id<MTLTexture> t = tex_mtl(&g_treg[tid].t); if (t.parentTexture) t = t.parentTexture;
+-        if (t && !(t.usage & MTLTextureUsageShaderWrite) && !mtl_fmt_depth(t.pixelFormat)) img_wr_note(tid); }
++        if (t && !(t.usage & MTLTextureUsageShaderWrite) && !mtl_fmt_depth(t.pixelFormat)) img_wr_note(tid);
++        else if (t && b->dtt == (uint8_t)MTLTextureType2DArray && (t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray) && !(t.usage & MTLTextureUsagePixelFormatView)) img_pfv_note(tid); }   // S2Arm: the face-array view of a cube the shader writes through texture2d_array (img_pfv_note)
+     pthread_mutex_unlock(&g_rmu);
+ }
+ static void tensor_standin(NvShader *cs);   // nvn_tensor.inc
+@@ -14011,7 +14440,7 @@
+     }
+     if (g_nubd && ubd_conflict_cs(cs, dp->ind)) { g_ubd_conflicts++; ubd_land(); }   // see ubd_conflict_cs
+     if (!img_atomic_prepare(cs, 5)) return;
+-    img_wr_prescan(cs, 5); if (g_imwr_npend) img_wr_upgrade();   // image textures made without shader writes: upgraded before this dispatch's encoder opens (img_wr_note)
++    img_wr_prescan(cs, 5); if (g_imwr_npend) img_wr_upgrade(); if (g_imfit_npend) img_fit_upgrade();   // image textures made without shader writes: upgraded before this dispatch's encoder opens (img_wr_note); a cube bound to a texture2d_array image: its face-array view's format-view usage too (img_pfv_note)
+     rp_flush();   // a full clear with no draw after it waits for the next pass on its targets, but it comes before this dispatch, which may read or write them as images: land it first, as copy_t2t does (upstream reference implementation, MIT)
+     rs_pre_compute(cs);   // S2Arm internal resolution: scaled textures this dispatch reads / writes go back to 1 first (nvn_rscale_ops.inc)
+     tba_prepare(cs, nil, nil, nil, nil, 1);   // #309: as for draws (see tba_ent)
