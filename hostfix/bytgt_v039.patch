@@ -1557,7 +1557,7 @@
          arena_seg_done(sf);
          if (sc) { if (k < SEG_CLK_N) { atomic_store(&sc->t[k][0], gpu_s_guest_ns(cb.GPUStartTime)); atomic_store(&sc->t[k][1], gpu_s_guest_ns(cb.GPUEndTime)); } seg_clk_put(sc); }
          if (cb.error) { atomic_store(&g_last_commit_error, 1); atomic_fetch_add(&g_commit_error_n, 1); if (mtl_gpu_halted()) mtl_gpu_cb_error(cb.error, "segment", f); else { static int k; if (![cb.error.description containsString:@"InnocentVictim"]) quar_fault(qsus, cb.error); if (k++ < 8) MLOG("【红】 segment command buffer execution error: %s", cb.error.description.UTF8String); mtl_gpu_cb_error(cb.error, "segment", f); s2a_direct_gpu_error(cb.error.localizedDescription.UTF8String); } }
-@@ -15547,6 +16218,1713 @@
+@@ -15547,6 +16218,1739 @@
          if (++shots == 2) { g_udc_ab_on = 1; MLOG("DM_NVN_UDC_AB: second screenshot written; DM_NVN_UNWRITTEN_DC on"); }
      }
  }
@@ -3052,8 +3052,13 @@
 +//   [intsweep] 里后期链的中间目标常是 1600x900、fmt 0x46（RGBA16Float），例如 278 / 279 / 273。
 +//   这一版不再猜序号 / key，也不跟上屏纹理：每一遍开遍时枚举它的**全部**颜色附件，只留下
 +//     (a) 画布尺寸 = 当前 3D 渲染分辨率（默认 1600x900，S2A_BYTGT_SIZE=WxH 可改；S2A_RES_SCALE 时按画布比，不按缩小后的存储）
-+//     (b) 附件像素格式是 16 位浮点颜色（Metal RGBA16Float = 0x46：mtl_pf_dpf 为 float 类且每像素 8 字节）
++//     (b) 颜色附件是 float 类（mtl_pf_dpf == NVN_DPF_FLOAT，排除 Uint / Sint 的 G-buffer；可再收窄，见下）
 +//   的目标，按 serial 去重，记下「最后写它的 pass 号」和「那一遍第一笔片元的 key」（和 [writer600] 同一套补 key 的时机）。
++//   格式口径（重要）：[intsweep] 的 out= / [litback] 的 fmt= 打的是 Metal 像素格式，本引擎的对照表（nv n_fmt_mtl.c）里
++//   0x46 = RGBA8Unorm、0x5c = RG11B10Float、0x41 = RG16Float、0x73 = RGBA16Float。所以「1600x900、fmt 0x46」其实是
++//   RGBA8Unorm 的后期目标，真正的 RGBA16Float 是 0x73；只认 0x73 一帧都筛不到。默认按 float 类收（0x46 / 0x5c / 0x41 / 0x73
++//   都在内，正好是 [intsweep] 里 278 / 279 / 273 那条链），每行打真实 fmt；S2A_BYTGT_FMT=0x46 / 0x5c / 0x73 只留一种，
++//   =any 连整数目标也要。
 +//   帧末（和 [writer600] / [w600x] / [intsweep] 同一个点）取最后被写的 BYT_SHOW(3) 个，走 [litdbg] 那条安全读回
 +//   （pass 都结束、GPU 已做完 → rp_end → mtl_finish_gpu → q_cb 一次 blit 到共享缓冲 → CPU 统计 RGB），每个打一行：
 +//     [bytgt] frame <f> ser=<s> fmt=0x.. <w>x<h> writer_pass=<n> writer_key=<k> nonzero=<n> mean=<v> max=<v> rgb_only=1
@@ -3075,6 +3080,7 @@
 +static int g_byt_n;
 +static uint64_t g_byt_seen[BYT_SEEN]; static int g_byt_nseen;
 +static int g_byt_on = -1, g_byt_halt_logged, g_byt_submit_fail, g_byt_tw, g_byt_th;
++static int g_byt_fmt = -2;   // -2 未初始化；-1 = float 类（默认）；-3 = 任意（含整数）；≥0 = 只认这个 Metal 像素格式
 +static int bytgt_on(void) {
 +    if (g_byt_on < 0) {
 +        const char *e = getenv("S2A_BYTGT_DEBUG");
@@ -3083,13 +3089,33 @@
 +    }
 +    return g_byt_on;
 +}
++static int bytgt_fmt_ok(uint32_t pf) {   // 格式口径（见块首）：默认 float 类；S2A_BYTGT_FMT=<0x..> 只留一种，=any 含整数
++    if (g_byt_fmt == -2) {
++        const char *e = getenv("S2A_BYTGT_FMT");
++        g_byt_fmt = -1;
++        if (e && *e) {
++            if (!strcmp(e, "any")) g_byt_fmt = -3;
++            else { char *end = NULL; unsigned long v = strtoul(e, &end, 0);
++                   if (end && *end == 0 && v > 0 && v <= 0xffff) g_byt_fmt = (int)v; }
++        }
++        if (g_byt_fmt == -1)
++            MLOG("[bytgt] 格式 = float 类（mtl_pf_dpf == NVN_DPF_FLOAT，排除 Uint / Sint 的 G-buffer）；每行打真实 fmt"
++                 "（本引擎 0x46 = RGBA8Unorm、0x5c = RG11B10Float、0x41 = RG16Float、0x73 = RGBA16Float；"
++                 "S2A_BYTGT_FMT=0x46/0x5c/0x73 只留一种，=any 含整数）");
++        else if (g_byt_fmt == -3) MLOG("[bytgt] 格式 = any（含整数颜色目标；S2A_BYTGT_FMT=any）");
++        else MLOG("[bytgt] 格式 = 只留 Metal 像素格式 %#x（S2A_BYTGT_FMT）", (unsigned)g_byt_fmt);
++    }
++    if (g_byt_fmt == -3) return 1;
++    if (g_byt_fmt >= 0) return (int)pf == g_byt_fmt;
++    return mtl_pf_dpf((MTLPixelFormat)pf) == NVN_DPF_FLOAT;
++}
 +static void bytgt_size(NSUInteger *w, NSUInteger *h) {
 +    if (!g_byt_tw) {
 +        int a = 1600, b = 900;
 +        const char *e = getenv("S2A_BYTGT_SIZE");
 +        if (e && *e) { int x = 0, y = 0; if (sscanf(e, "%dx%d", &x, &y) == 2 && x > 0 && y > 0) { a = x; b = y; } }
 +        g_byt_tw = a; g_byt_th = b;
-+        MLOG("[bytgt] 目标尺寸 %dx%d（%s；只统计 16 位浮点颜色附件，RGBA16Float = 0x46）", a, b,
++        MLOG("[bytgt] 目标尺寸 %dx%d（%s；格式过滤见下一行）", a, b,
 +             e && *e ? "S2A_BYTGT_SIZE" : "默认 = 本作 3D 渲染分辨率，S2A_RES_SCALE 时按画布比");
 +    }
 +    *w = (NSUInteger)g_byt_tw; *h = (NSUInteger)g_byt_th;
@@ -3105,7 +3131,7 @@
 +        const tex_t *tt = i < (NSUInteger)R.rt.n ? R.rt.color[i] : NULL;
 +        if (!tt || !tt->serial) continue;
 +        uint32_t pf = (uint32_t)mt.pixelFormat;
-+        if (!(mtl_pf_dpf((MTLPixelFormat)pf) == NVN_DPF_FLOAT && mtl_pf_bytes((MTLPixelFormat)pf) == 8)) continue;   // 16 位浮点颜色（RGBA16Float = 0x46）
++        if (!bytgt_fmt_ok(pf)) continue;   // 默认 float 类（0x46 / 0x5c / 0x41 / 0x73…）；S2A_BYTGT_FMT 可收窄
 +        NSUInteger cw, ch; rs_canvas(mt, 0, &cw, &ch);   // S2A_RES_SCALE：按画布比，不按缩小后的存储
 +        if (cw != tw || ch != th) continue;
 +        int k = -1;
@@ -3271,7 +3297,7 @@
  // ---------- DM_NVN_TEXDUMP=frame[,frame...]:path (%d remains "serial*100+layer*10+mip level"): save each selected guest frame's color targets ----------
  // Diagnostic: before the first render pass of the next frame is opened, wait for the GPU to finish, then draw each one (the mip level used by that frame) by full-screen sampling into RGBA8 and save as PNG (float formats are clamped to [0,1])
  static long g_td_frame = -2; static const char *g_td_path; static NSMutableArray *g_td_list; static int g_td_done;
-@@ -15569,6 +17947,7 @@
+@@ -15569,6 +17973,7 @@
  // DM_NVN_TEXDUMP=size=WxH:path instead picks the frame by content: the first frame that opens a render pass whose first color attachment level is WxH (for one-off work whose frame differs between runs)
  static unsigned g_td_w, g_td_h;
  void td_note(MTL4RenderPassDescriptor *pd, NSUInteger nc) {
@@ -3279,7 +3305,7 @@
      if (g_td_frame == -2) { const char *e = getenv("DM_NVN_TEXDUMP"), *c = e ? strchr(e, ':') : NULL; g_td_frame = c ? atol(e) : -1; g_td_path = c ? c + 1 : NULL; g_td_list = [NSMutableArray array];
          if (c && !strncmp(e, "size=", 5) && sscanf(e + 5, "%ux%u", &g_td_w, &g_td_h) == 2) g_td_frame = LONG_MAX;
          else if (c && memchr(e, ',', (size_t)(c - e))) {
-@@ -15911,6 +18290,7 @@
+@@ -15911,6 +18316,7 @@
  static void present_note(id<CAMetalDrawable> dr, uint64_t pn) {   // pn: the game's present sequence number (ticket number)
      [dr addPresentedHandler:^(id<MTLDrawable> d) {   // Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
          CFTimeInterval tt = d.presentedTime;
@@ -3287,7 +3313,7 @@
          g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};
      }];
  }
-@@ -15951,6 +18331,8 @@
+@@ -15951,6 +18357,8 @@
               g_up_total_ns / 1e6, g_bp_first_present / 1e9);
      }
      PD("X ser=%llu", t->serial);
@@ -3296,7 +3322,7 @@
      id<MTLTexture> src = tex_mtl(t);
      if (!src) { RED_ONCE(8, "present texture could not get an MTLTexture"); return 0; }
      // S2Arm: a crop reaching past the source (10-28 Splatoon 3 direct full screen: the game sets a 2346x1080 crop for a few frames while the swap chain texture is still
-@@ -16035,7 +18417,9 @@
+@@ -16035,7 +18443,9 @@
      uint64_t dt0 = now_ns();
      id<CAMetalDrawable> dr = supplied ? supplied : [layer nextDrawable];
      if (!supplied) g_drawable_ns += now_ns() - dt0;
@@ -3307,7 +3333,7 @@
      int alloc_i = (int)(ticket % 3);
      present_options();
      if (g_present_aa || g_present_fx) {
-@@ -16074,7 +18458,8 @@
+@@ -16074,7 +18484,8 @@
      NvPresentAA *aa = g_present_aa ? g_present_aa_slots[alloc_i] : nil;
      NvPresentFX *fxs = g_present_fx ? g_present_fx_slots[alloc_i] : nil;   // 这一帧没用 MetalFX 时也标：槽里的图只要在途就不能被下一次重建换掉
      fb_add(o, ^(id<MTL4CommitFeedback> f) {
