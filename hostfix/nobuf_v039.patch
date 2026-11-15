@@ -1514,7 +1514,7 @@
          arena_seg_done(sf);
          if (sc) { if (k < SEG_CLK_N) { atomic_store(&sc->t[k][0], gpu_s_guest_ns(cb.GPUStartTime)); atomic_store(&sc->t[k][1], gpu_s_guest_ns(cb.GPUEndTime)); } seg_clk_put(sc); }
          if (cb.error) { atomic_store(&g_last_commit_error, 1); atomic_fetch_add(&g_commit_error_n, 1); if (mtl_gpu_halted()) mtl_gpu_cb_error(cb.error, "segment", f); else { static int k; if (![cb.error.description containsString:@"InnocentVictim"]) quar_fault(qsus, cb.error); if (k++ < 8) MLOG("【红】 segment command buffer execution error: %s", cb.error.description.UTF8String); mtl_gpu_cb_error(cb.error, "segment", f); s2a_direct_gpu_error(cb.error.localizedDescription.UTF8String); } }
-@@ -15547,6 +16205,1283 @@
+@@ -15547,6 +16205,1285 @@
          if (++shots == 2) { g_udc_ab_on = 1; MLOG("DM_NVN_UDC_AB: second screenshot written; DM_NVN_UNWRITTEN_DC on"); }
      }
  }
@@ -2660,33 +2660,35 @@
 +    if (!nobuf_on() || !sh) return;
 +    int any = 0;
 +    for (int i = 0; i < sh->rf.nb; i++) if (sh->rf.b[i].kind == NVN_RB_CBUF) { any = 1; break; }
-+    if (!any) return;   // 便宜路径：这个着色器不读常量缓冲
++    if (!any) return;   // 便宜路径：这个着色器不读常量缓冲（每笔都只扫一遍 rf，不做去重查表）
 +    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
 +    int disp = stage == 5;
 +    if (f != g_nobuf_frame) { g_nobuf_frame = f; g_nobuf_lines = 0; g_nobuf_capped = 0; g_nobuf_disp_n = 0; }
 +    if (disp) g_nobuf_disp_n++;
-+    uint64_t id = disp ? (uint64_t)(size_t)sh : g_stat_pass;   // 同一遍里同一着色器只报一次（id2 = 着色器，免得同 pass 两个片元着色器同槽互相盖掉）；compute 按着色器去重
-+    uint64_t id2 = disp ? 0 : (uint64_t)(size_t)sh;
++    uint64_t shp = (uint64_t)(size_t)sh;
++    uint64_t id = disp ? 0 : g_stat_pass;   // pass 条目按 (pass, 着色器, 槽) 去重；compute 按 (着色器, 槽) 每帧一次
 +    const char *k = sh->key[0] ? sh->key : "?";
 +    for (int i = 0; i < sh->rf.nb; i++) {
 +        const nvn_rbind *b = &sh->rf.b[i];
 +        if (b->kind != NVN_RB_CBUF || b->reg >= 16) continue;
-+        if (nobuf_seen_q(f, id, id2, disp, (int)b->reg)) continue;
 +        const p_bind_buf *u = &S.ubo[stage][b->reg];
 +        int want = sh->cb_ext[b->reg] ? (int)sh->cb_ext[b->reg] : -1;
++        int missing = !u->addr || !u->size;
++        int shortb = !missing && want > 0 && u->size < (uint64_t)want;
++        if (!missing && !shortb) continue;   // 正常绑定：每笔直接走开，不查去重表
++        if (nobuf_seen_q(f, id, shp, disp, (int)b->reg)) continue;
 +        if (g_nobuf_lines >= NOBUF_LINES) {
 +            if (!g_nobuf_capped) { g_nobuf_capped = 1;
 +                MLOG("[nobuf] frame %llu: 本帧已打 %d 行，之后的只计数（S2A_NOBUF_DEBUG=0 关）", (unsigned long long)f, NOBUF_LINES); }
 +            continue;
 +        }
-+        if (!u->addr || !u->size) {
-+            g_nobuf_lines++;
++        g_nobuf_lines++;
++        if (missing) {
 +            if (disp) MLOG("[nobuf] frame %llu dispatch %d key=%s want_cbuf reg=%d size=%d got=none",
 +                           (unsigned long long)f, g_nobuf_disp_n, k, (int)b->reg, want);
 +            else MLOG("[nobuf] frame %llu pass %llu key=%s want_cbuf reg=%d size=%d got=none",
 +                      (unsigned long long)f, (unsigned long long)g_stat_pass, k, (int)b->reg, want);
-+        } else if (want > 0 && u->size < (uint64_t)want) {
-+            g_nobuf_lines++;
++        } else {
 +            if (disp) MLOG("[nobuf] frame %llu dispatch %d key=%s want_cbuf reg=%d size=%d got=len<%llu> want=%d",
 +                           (unsigned long long)f, g_nobuf_disp_n, k, (int)b->reg, want, (unsigned long long)u->size, want);
 +            else MLOG("[nobuf] frame %llu pass %llu key=%s want_cbuf reg=%d size=%d got=len<%llu> want=%d",
@@ -2798,7 +2800,7 @@
  // ---------- DM_NVN_TEXDUMP=frame[,frame...]:path (%d remains "serial*100+layer*10+mip level"): save each selected guest frame's color targets ----------
  // Diagnostic: before the first render pass of the next frame is opened, wait for the GPU to finish, then draw each one (the mip level used by that frame) by full-screen sampling into RGBA8 and save as PNG (float formats are clamped to [0,1])
  static long g_td_frame = -2; static const char *g_td_path; static NSMutableArray *g_td_list; static int g_td_done;
-@@ -15569,6 +17504,7 @@
+@@ -15569,6 +17506,7 @@
  // DM_NVN_TEXDUMP=size=WxH:path instead picks the frame by content: the first frame that opens a render pass whose first color attachment level is WxH (for one-off work whose frame differs between runs)
  static unsigned g_td_w, g_td_h;
  void td_note(MTL4RenderPassDescriptor *pd, NSUInteger nc) {
@@ -2806,7 +2808,7 @@
      if (g_td_frame == -2) { const char *e = getenv("DM_NVN_TEXDUMP"), *c = e ? strchr(e, ':') : NULL; g_td_frame = c ? atol(e) : -1; g_td_path = c ? c + 1 : NULL; g_td_list = [NSMutableArray array];
          if (c && !strncmp(e, "size=", 5) && sscanf(e + 5, "%ux%u", &g_td_w, &g_td_h) == 2) g_td_frame = LONG_MAX;
          else if (c && memchr(e, ',', (size_t)(c - e))) {
-@@ -15911,6 +17847,7 @@
+@@ -15911,6 +17849,7 @@
  static void present_note(id<CAMetalDrawable> dr, uint64_t pn) {   // pn: the game's present sequence number (ticket number)
      [dr addPresentedHandler:^(id<MTLDrawable> d) {   // Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
          CFTimeInterval tt = d.presentedTime;
@@ -2814,7 +2816,7 @@
          g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};
      }];
  }
-@@ -15951,6 +17888,7 @@
+@@ -15951,6 +17890,7 @@
               g_up_total_ns / 1e6, g_bp_first_present / 1e9);
      }
      PD("X ser=%llu", t->serial);
@@ -2822,7 +2824,7 @@
      id<MTLTexture> src = tex_mtl(t);
      if (!src) { RED_ONCE(8, "present texture could not get an MTLTexture"); return 0; }
      // S2Arm: a crop reaching past the source (10-28 Splatoon 3 direct full screen: the game sets a 2346x1080 crop for a few frames while the swap chain texture is still
-@@ -16035,7 +17973,9 @@
+@@ -16035,7 +17975,9 @@
      uint64_t dt0 = now_ns();
      id<CAMetalDrawable> dr = supplied ? supplied : [layer nextDrawable];
      if (!supplied) g_drawable_ns += now_ns() - dt0;
@@ -2833,7 +2835,7 @@
      int alloc_i = (int)(ticket % 3);
      present_options();
      if (g_present_aa || g_present_fx) {
-@@ -16074,7 +18014,8 @@
+@@ -16074,7 +18016,8 @@
      NvPresentAA *aa = g_present_aa ? g_present_aa_slots[alloc_i] : nil;
      NvPresentFX *fxs = g_present_fx ? g_present_fx_slots[alloc_i] : nil;   // 这一帧没用 MetalFX 时也标：槽里的图只要在途就不能被下一次重建换掉
      fb_add(o, ^(id<MTL4CommitFeedback> f) {
