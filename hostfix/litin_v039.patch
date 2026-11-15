@@ -1827,7 +1827,7 @@
 +        MLOG("【红】[litin] cube ser=%llu: 帧末已不在登记表里（同帧释放）/ 类型不是 cube，这一帧不读回", (unsigned long long)g_litin_cube_ser); }
 +    if (g_litin_shadow_tid >= 0 && !shd && !g_litin_shd_fail) { g_litin_shd_fail = 1;
 +        MLOG("【红】[litin] shadow ser=%llu: 帧末已不在登记表里（同帧释放）/ 类型不是 array，这一帧不读回", (unsigned long long)g_litin_shadow_ser); }
-+    int cube_faces = cube ? 6 : 0;
++    int cube_faces = cube ? (int)MIN((NSUInteger)6, cube.arrayLength) : 0;   // cube = 6 面；面数组视图按它的层数，绝不超过它
 +    int shd_layers = shd ? (int)MIN((NSUInteger)LITIN_SHADOW_MAXL, shd.arrayLength) : 0;
 +    int have_ubo = g_litin_ubo_reg >= 0 && g_litin_ubo_addr && g_litin_ubo_len >= 4;
 +    size_t cube_bpp = cube ? mtl_pf_bytes(cube.pixelFormat) : 0;
