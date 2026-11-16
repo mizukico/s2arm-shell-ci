@@ -4022,8 +4022,8 @@
 +    int ncol;                          // 管线颜色槽（g_pass.cfmt 非 0 的那些）
 +    struct { uint8_t slot; uint32_t cfmt, wmask; uint8_t blend; } col[8];
 +    int disc, dsrc;                    // 1 有 / 0 没有 / -1 不知道；dsrc：1 json 2 .metal 源文 0 不知道
-+} pres_ent;
-+static pres_ent g_pres_ent, g_pres_mid, g_pres_wr[PRES_WR];
++} pdbg_ent;
++static pdbg_ent g_pres_ent, g_pres_mid, g_pres_wr[PRES_WR];
 +static __strong id<MTLTexture> g_pres_out, g_pres_mid_out, g_pres_wr_mt[PRES_WR];
 +static int g_pres_have, g_pres_mid_have, g_pres_wr_n;
 +static uint64_t g_pres_wr_frame = ~0ull;
@@ -4052,9 +4052,9 @@
 +    return g_pres_on;
 +}
 +static const char *pres_load(int a) { return a == (int)MTLLoadActionClear ? "clear" : a == (int)MTLLoadActionLoad ? "load" : "dontcare"; }
-+static const char *pres_dsrc(const pres_ent *e) { return e->dsrc == 1 ? "json" : e->dsrc == 2 ? "metal" : "none"; }
++static const char *pres_dsrc(const pdbg_ent *e) { return e->dsrc == 1 ? "json" : e->dsrc == 2 ? "metal" : "none"; }
 +// draw 里（这一遍第一笔画）：把 key / 输入 / UBO / 管线状态填进条目。只读绑定状态与 S，不建纹理、不拷贝、不进命令缓冲。
-+static void pres_fill(pres_ent *e, NvShader *fs) {
++static void pres_fill(pdbg_ent *e, NvShader *fs) {
 +    e->has_draw = 1; e->ntex = 0; e->ntex_total = 0; e->ncol = 0; e->ubo_reg = -1; e->ubo_addr = e->ubo_len = 0;
 +    snprintf(e->key, sizeof e->key, "%s", fs && fs->key[0] ? fs->key : "-");
 +    int total = 0;
@@ -4129,7 +4129,7 @@
 +        int w = -1;   // 写者表按 serial：同一帧同一个 serial 只留最后一个写它的遍
 +        for (int j = 0; j < g_pres_wr_n; j++) if (g_pres_wr[j].frame == f && g_pres_wr[j].ser == tt->serial) { w = j; break; }
 +        if (w < 0) { if (g_pres_wr_n >= PRES_WR) { g_pres_wdrop++; continue; } w = g_pres_wr_n++; }
-+        pres_ent *e = &g_pres_wr[w];
++        pdbg_ent *e = &g_pres_wr[w];
 +        memset(e, 0, sizeof *e);
 +        e->frame = f; e->pass = g_stat_pass + 1; e->ser = tt->serial; e->slot = (uint8_t)i;
 +        e->pf = (uint32_t)mt.pixelFormat; e->w = mt.width; e->h = mt.height;
@@ -4149,7 +4149,7 @@
 +    g_pres_pass = pass;
 +    uint64_t frame = atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
 +    for (int i = 0; i < g_pres_wr_n; i++) {   // 1) 这一遍是本帧某个 serial 的最后写者：补状态（中间目标的候选）
-+        pres_ent *w = &g_pres_wr[i];
++        pdbg_ent *w = &g_pres_wr[i];
 +        if (w->frame != frame || w->pass != pass || w->has_draw) continue;
 +        pres_fill(w, fs);
 +    }
@@ -4167,7 +4167,7 @@
 +    if (!why) return;
 +    if (g_pres_have && why < g_pres_ent.match) return;   // 已经有一个更可靠的命中：不换
 +    if (g_pres_have) g_pres_multi++;
-+    pres_ent tmp; memset(&tmp, 0, sizeof tmp);
++    pdbg_ent tmp; memset(&tmp, 0, sizeof tmp);
 +    tmp.frame = frame; tmp.pass = pass; tmp.match = why; tmp.ubo_reg = -1; tmp.disc = -1;
 +    id<MTLTexture> otm = nil;
 +    int pick = -1;   // 输出附件：优先 drawable 本身（serial 1 / present 那张），否则第一个带序号的槽
@@ -4194,7 +4194,7 @@
 +        for (int a = 0; a < g_pres_att_n; a++) if (g_pres_att[a].ser == s) isatt = 1;
 +        if (isatt) continue;   // 上屏遍自己的另一个附件：不是中间目标
 +        for (int i = 0; i < g_pres_wr_n; i++) {
-+            const pres_ent *w = &g_pres_wr[i];
++            const pdbg_ent *w = &g_pres_wr[i];
 +            if (w->frame != frame || w->ser != s || w->pass >= pass) continue;
 +            uint64_t area = (uint64_t)w->w * (uint64_t)w->h;
 +            if (best < 0 || area > bestarea) { best = i; bestarea = area; }
@@ -4233,7 +4233,7 @@
 +    pthread_mutex_lock(&g_rmu);
 +    for (int a = 0; a < 2; a++) {
 +        if (!have[a]) continue;
-+        const pres_ent *e = a ? &g_pres_mid : &g_pres_ent;
++        const pdbg_ent *e = a ? &g_pres_mid : &g_pres_ent;
 +        for (int k = 0; k < e->ntex && nrq < PRES_RD_N; k++) {
 +            int tid = e->tex[k].tid;
 +            if (tid <= 0 || tid >= g_ntreg || !g_treg[tid].ok) continue;
@@ -4252,7 +4252,7 @@
 +        if (t.sampleCount != 1) continue;
 +        size_t bpp = mtl_pf_bytes(t.pixelFormat); if (!bpp) continue;
 +        int a = rq[i].role >= 2 ? 1 : 0;
-+        const pres_ent *e = a ? &g_pres_mid : &g_pres_ent;
++        const pdbg_ent *e = a ? &g_pres_mid : &g_pres_ent;
 +        NSUInteger lv = e->lv > 0 ? (NSUInteger)e->lv : 0, sl = e->sl > 0 ? (NSUInteger)e->sl : 0;
 +        if (lv > 16) continue;
 +        NSUInteger w = MAX(t.width >> lv, (NSUInteger)1), h = MAX(t.height >> lv, (NSUInteger)1);
@@ -4276,7 +4276,7 @@
 +    id<MTLBuffer> ub[2] = {nil, nil}, us[2] = {nil, nil}; NSUInteger uo[2] = {0, 0}, ul[2] = {0, 0};
 +    for (int a = 0; a < 2; a++) {   // UBO：每个条目 ≤ 256 B
 +        if (!have[a]) continue;
-+        const pres_ent *e = a ? &g_pres_mid : &g_pres_ent;
++        const pdbg_ent *e = a ? &g_pres_mid : &g_pres_ent;
 +        if (e->ubo_reg < 0 || !e->ubo_addr || e->ubo_len < 4) continue;
 +        void *mb = NULL; uint64_t mo = 0;
 +        if (!nvn_be_addr(e->ubo_addr, 4, &mb, &mo) || !mb || (mo & 3)) continue;
@@ -4310,7 +4310,7 @@
 +    }
 +    for (int a = 0; a < 2; a++) {   // 打行：pass 行（role=mid 一组）+ 每张输入一行 + 输出统计一行
 +        if (!have[a]) continue;
-+        const pres_ent *e = a ? &g_pres_mid : &g_pres_ent;
++        const pdbg_ent *e = a ? &g_pres_mid : &g_pres_ent;
 +        char vb[200]; size_t vo = 0; vb[0] = 0;
 +        if (ran && ub[a] && ul[a]) {
 +            NSUInteger nf = ul[a] / 4; if (nf > 8) nf = 8;
