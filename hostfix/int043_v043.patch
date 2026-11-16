@@ -1,0 +1,259 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 0a2a86e..59553ea 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -6297,6 +6297,7 @@ static void shmap_load_once(void) {
+ @interface NvShader : NSObject { @public id<MTLLibrary> ft_lib; uint8_t ft_tried; id<MTLLibrary> bf_lib; uint8_t bf_tried;   // bf_lib: the readable-tile version <key>_bf, looked up once by name (bf_fn)
+     __weak id<MTLLibrary> plib;   // the library fn came from (#1001 two-level build probe, spec_probe: Metal 4 names a function by library + name)
+     id<MTLFunction> fn, tf_fn, fn_u, geo_fn;   // fn_u: the integer-output entry point (dmsh_build.py fs_uint), for pipelines whose unsigned integer attachments are exactly u_mask (pso_desc)
++    id<MTLLibrary> u_lib; NSString *u_entry_n; NSMutableDictionary<NSNumber *, id> *u_fns;   // S2Arm #427: main0_u's library and entry name, and its specializations by the pipeline's integer-output mask (fs_u_fn; one float + one uint member per colour, S2A_UMASK at index 110); NSNull = a set that failed to build
+     uint8_t s_rec, warm_claimed;   // submit-thread first-use / prewarm handoff counters
+     uint8_t gmem_use;   // 0 未判 / 1 不绑原始内存池表 / 2 绑（gmem_uses：动态占比计数用）
+     uint8_t tensor, tensor_log;   // HMMA: 1 = spatial stand-in, 2 = none, 3 = native SIMD-group matrix ABI 1; 0 = not checked
+@@ -6837,7 +6838,7 @@ static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero
+         o->ts[o->nts++] = (typeof(o->ts[0])){(uint8_t)idx, (uint8_t)img, (uint8_t)reg};
+     }
+     if (stage == 5 && j[@"spill"]) { o->spill = [j[@"spill"] unsignedIntValue]; o->spill_slot = [j[@"spill_slot"] unsignedIntValue]; }   // shared-memory spill (dispatch)
+-    if (stage == 1 && j[@"entry_u"]) { o->u_mask = (uint8_t)[j[@"u_mask"] unsignedIntValue]; o->fn_u = [lib newFunctionWithName:fnn(o, j[@"entry_u"])]; if (!o->fn_u) MLOG("【红】 shader %s: no integer-output entry point %s in its library", pc.UTF8String, [j[@"entry_u"] UTF8String]); }
++    if (stage == 1 && j[@"entry_u"]) { o->u_mask = (uint8_t)[j[@"u_mask"] unsignedIntValue]; o->u_lib = lib; o->u_entry_n = fnn(o, j[@"entry_u"]); o->fn_u = [lib newFunctionWithName:o->u_entry_n]; if (!o->fn_u) MLOG("【红】 shader %s: no integer-output entry point %s in its library", pc.UTF8String, [j[@"entry_u"] UTF8String]); }   // S2Arm #427: main0_u is specialized per pipeline (fs_u_fn, S2A_UMASK at index 110)
+     // Stages 3 / 4 are the tessellation control / evaluation shaders on Switch 1 and task / mesh on NVN2. A tessellation shader's json carries tess (handled below) and its
+     //   msl_entry_kind is vertex / kernel, which is right for it: the task / mesh contract (object / mesh functions, workgroup limits) is not its contract. Applied to it, the
+     //   kind check printed a false red line and the workgroup check found no threads, called the shader not usable and skipped its draws (#418: 19 red lines on a Switch 1 game)
+@@ -8671,6 +8672,30 @@ static uint8_t pso_color_round_mask(const pso_key *k, NvShader *fs, int merged)
+ // S2Arm: the fragment shader's typed-output entry point for this need mask: cached, else loaded from the fallback directory's <key>_t<u>_<s>.metal that an earlier pso_fout_variant wrote (this run or
+ // an earlier one: the background prewarm of a recorded pipeline has no guest program to translate from, but the variant is on disk). nil when there is none. Pipelines are built on several threads
+ static pthread_mutex_t g_fnt_mu = PTHREAD_MUTEX_INITIALIZER;
++// S2Arm #427: index of the uint32 function constant that picks main0_u's per-colour float / uint members (Dsh.cs S2A_UMASK_FC).
++//   Set BY INDEX: iPhone Metal puts a library's function constants in its own namespace (the metallib names it <hash>::S2A_UMASK), so
++//   setConstantValue:…withName: is silently ignored — the members then all stay float and an integer target gets undefined values.
++#define S2A_UMASK_FC 110
++// S2Arm #427: main0_u specialized for THIS pipeline's integer colour targets (Dsh.cs FsUintEntry: one float and one uint member per
++//   colour, the uint one present when its bit is set in one uint32 function constant, S2A_UMASK). Before this, main0_u was used only when
++//   the pipeline's integer set equalled the mask the build guessed from the shader's code; any other set fell back to main0 (float4 against
++//   an RGBA8Uint attachment), which is what Trails in the Sky 1st's G-buffer hit (float colour 0, RGBA8Uint 1..3; the lighting pass read
++//   zeros = a black 3D picture). Cached per mask, NSNull = that set failed to build. Called on the submit thread and by the prewarm.
++static id<MTLFunction> fs_u_fn(NvShader *fs, uint32_t umask) {
++    uint32_t mask = umask & 0xffu;
++    if (!fs || !fs->u_lib || !fs->u_entry_n || !mask) return nil;
++    pthread_mutex_lock(&g_fnt_mu);
++    id c = fs->u_fns[@(umask)];
++    if (c) { pthread_mutex_unlock(&g_fnt_mu); return c == NSNull.null ? nil : c; }
++    MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
++    [cv setConstantValue:&mask type:MTLDataTypeUInt atIndex:S2A_UMASK_FC];   // by index, not by name (see above)
++    NSError *e = nil; id<MTLFunction> f = [fs->u_lib newFunctionWithName:fs->u_entry_n constantValues:cv error:&e];
++    if (!f) { static int nlog; if (nlog++ < 8) MLOG("【红】 fragment shader %s: main0_u specialized for integer outputs %#x failed to build: %s", fs->key, mask, e.localizedDescription.UTF8String); f = NSNull.null; }
++    if (!fs->u_fns) fs->u_fns = [NSMutableDictionary dictionary];
++    fs->u_fns[@(umask)] = f;
++    pthread_mutex_unlock(&g_fnt_mu);
++    return f == NSNull.null ? nil : f;
++}
+ static id<MTLFunction> fs_typed_fn(NvShader *fs, uint32_t need) {
+     pthread_mutex_lock(&g_fnt_mu);
+     id f = fs->fn_t[@(need)];
+@@ -8937,8 +8962,10 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
+             if (hl) d.fragmentFunction = [hl newFunctionWithName:[NSString stringWithFormat:@"hl%d", i]];
+             break; } }
+     uint32_t need = fs && !fsfn && d.fragmentFunction == fs->fn ? pso_fout_need(k, fs, merged) : 0;
+-    if (need && fs->fn_u && need == fs->u_mask) d.fragmentFunction = fs->fn_u;   // the integer attachments are exactly the outputs main0_u turns (dmsh_build.py fs_uint u_mask)
+-    else if (need) { id<MTLFunction> t = fs_typed_fn(fs, need); if (t) d.fragmentFunction = t; }   // S2Arm: mixed float / integer targets, dual-source blending (pso_fout_variant)
++    if (need) {   // S2Arm #427: the library's main0_u picks each colour's float / uint member by S2A_UMASK at index 110 (fs_u_fn), so ANY unsigned set fits — no longer only the mask the build guessed
++        id<MTLFunction> t = (need & 0xff) && !(need & 0xffff00) ? fs_u_fn(fs, need) : nil;   // unsigned only (signed / dual-source sets keep the typed variant)
++        if (!t) t = fs_typed_fn(fs, need);   // S2Arm: mixed float / integer targets, dual-source blending (pso_fout_variant)
++        if (t) d.fragmentFunction = t; }
+     else if (k->fc && fs && d.fragmentFunction == fs->fn) {   // S2Arm #800: the sampler-emulation variant (se_want: never with integer outputs)
+         id<MTLFunction> f = se_fn(fs, k->fc); if (f) d.fragmentFunction = f; else MLOG("【红】 fragment shader %s: pipeline keyed for its sampler-emulation variant (bits %d), which is not there: main0", fs->key, k->fc); }
+     if (fs && (k->at || k->msoff) && (d.fragmentFunction == fs->fn || (fs->fn_u && d.fragmentFunction == fs->fn_u))) {   // gap families 34 / 37: main0 / main0_u with the alpha test / full sample mask
+diff --git a/graphics/tools/direct/dsh/Dsh.cs b/graphics/tools/direct/dsh/Dsh.cs
+index 7e9a62a..d6ff091 100644
+--- a/graphics/tools/direct/dsh/Dsh.cs
++++ b/graphics/tools/direct/dsh/Dsh.cs
+@@ -436,7 +436,7 @@ namespace S2A.Dsh
+                 // 片元：Alpha 测试与多重采样关的可选函数常量（FsAlphaMs，族 34 / 37）进库里的主入口；src 不带它（反射、可读瓦片 _bf、输出类型 _ft 照旧读 src）
+                 string srcx = stage == "ps" ? FsAlphaMs(src) : src;
+                 if (stage == "ps") full = srcx;
+-                var (fu, uMask) = stage == "ps" ? FsUint(srcx, colorAnalysis) : (null, 0u);
++                var (fu, uMask) = stage == "ps" ? FsUint(srcx, colorAnalysis, Key) : (null, 0u);
+                 if (fu != null) { plain = srcx; full = fu; }
+                 var res = JsonNode.Parse(XIo.ReadAllText(Path.Combine(W, Key + ".res.json"))).AsObject();
+                 full = DshFlat.GiantFix(full).Item1;   // 巨型着色器的尾部阶梯压平（同 dmsh_build.py giant_fix）
+@@ -1989,7 +1989,7 @@ namespace S2A.Dsh
+ 
+         /// <summary>整数输出入口 main0_u（同 dmsh_build.fs_uint，缺口 2 A 段）：只把按整数位写的颜色输出改 uint，其余照旧浮点；只写常量的（清屏）全部改 uint。
+         /// → (接上 main0_u 的源码, u_mask：位 n = 改成 uint 的 color(n))；不像整数写的返回 (null, 0)</summary>
+-        internal static (string Src, uint UMask) FsUint(string src, string analysis = null)
++        internal static (string Src, uint UMask) FsUint(string src, string analysis = null, string key = null)
+         {
+             var m = Search(@"^.*\bfragment\s+main0_out\s+main0\s*\(", src, RegexOptions.Multiline); var st = Search(@"struct main0_out\s*\{(.*?)\};", src, RegexOptions.Singleline);
+             if (!m.Success || !st.Success) return (null, 0);
+@@ -2003,11 +2003,146 @@ namespace S2A.Dsh
+             var pm = Search(@"^.*\bfragment\s+main0_out\s+main0\s*\(", probe, RegexOptions.Multiline);
+             string body = pm.Success ? probe[pm.Index..] : ""; int ret = body.IndexOf("return out;", StringComparison.Ordinal); if (ret >= 0) body = body[..(ret + 1)];
+             var ints = IntOutputs(body, cols.Keys);
+-            if (fromInt.Count == 0 && ints.Count == 0 && !(writes.Count > 0 && writes.All(w => Full(@"-?[0-9.]+f?|float\d\([-0-9., ]*\)", w.Trim()).Success))) return (null, 0);
++            bool fact = !string.IsNullOrEmpty(key) && FsFoutFacts.ContainsKey(key);   // #427 手工真值表：猜不出也要留 main0_u（管线按 S2A_UMASK 的位挑输出）
++            if (!fact && fromInt.Count == 0 && ints.Count == 0 && !(writes.Count > 0 && writes.All(w => Full(@"-?[0-9.]+f?|float\d\([-0-9., ]*\)", w.Trim()).Success))) return (null, 0);
+             if (ints.Count == 0) ints = fromInt;   // 一个都说不清：照旧，按整数位写出的都算
+             bool U((string Ty, string Nm, string At) x) => cols.ContainsKey(x.Nm) && (ints.Count == 0 || ints.Contains(x.Nm));
+             uint mask = 0; foreach (var x in mem) if (U(x)) mask |= 1u << Int(Search(@"color\((\d+)\)", x.At).Groups[1].Value);
+-            return (src + "\n" + FsRetyped(src, m, mem, x => U(x) ? "u" : null, "_u"), mask);
++            mask = FsFoutFact(key, mask);   // #427：表里有的键以表值为准（启发式猜漏的整数输出由表补上），没有的键照旧
++            string entry = FsUintEntry(src, m, mem);
++            if (entry == null) return (null, 0);
++            return (src + "\n" + entry, mask);
++        }
++
++        // ---- 片元整数输出的手工真值表（#427；nxnative PR #176 dm/games/01001E9023920000/shader_facts_manual.tsv @ f02463b1）----
++
++        /// <summary>片元键 → 整数颜色输出掩码（位 n = color(n) 画进整数目标；真值表 fout 里 "uint" 的位或起来）。
++        /// 为什么要有这张表：空之轨迹 the 1st 没有 PC 版，翻译器手上没有片元输出类型，只能从 MSL 猜「哪些输出装的是整数」；
++        /// 猜漏一位不会报错——Metal 把浮点输出接整数画布当合法（建管线成功），那个整数目标于是留着未定义值。这支游戏的
++        /// MSAA / 延迟 G-buffer 是 0 号浮点 + 1..3 号 RGBA8Uint / R32Uint / RGBA16Uint，后期光照读到零就是 3D 全黑。
++        /// 34 条键全部来自上游 nxnative PR #176 的手工真值表（人工在设备上按宿主的红线逐条核对过），所以表里有的键以表值为准，
++        /// 启发式只当兜底；表里没有的键（别的游戏 / 后续新增的片元）照旧按 IntOutputs 猜。</summary>
++        static readonly Dictionary<string, uint> FsFoutFacts = new(StringComparer.Ordinal)
++        {
++            // 标题 / UI 面：只有输出 1 是整数颜色目标（宿主的红线点名过这一行）
++            ["567fcd0c97a29418"] = 0x2,
++            // MSAA / 延迟 G-buffer 的片元：输出 1、2、3 全是整数目标（翻译器原先只认出两位，掩码 0xa / 0x6）
++            ["0028f62efe9e4e36"] = 0xe,
++            ["0827f9bcdc47c4b3"] = 0xe,
++            ["0c2181e7efb978e8"] = 0xe,
++            ["499567cfa6cce741"] = 0xe,
++            ["4dbc3a68a99a5e05"] = 0xe,
++            ["4ef57d405f87ea31"] = 0xe,
++            ["4ff75b6ec9231a3e"] = 0xe,
++            ["58cd5da94d831adc"] = 0xe,
++            ["590313d32e5a20c4"] = 0xe,
++            ["6ce42fb660d4733b"] = 0xe,
++            ["73feb86ef1c79f13"] = 0xe,
++            ["7d509f2fd2352e54"] = 0xe,
++            ["884774b074760f26"] = 0xe,
++            ["89581d9a1de10f6f"] = 0xe,
++            ["8b0849fd77d1d8d8"] = 0xe,
++            ["90a5e9dfeb72849a"] = 0xe,
++            ["9bea711aa494d844"] = 0xe,
++            ["a36ebdc4ae57913b"] = 0xe,
++            ["b22a7d33e67711ec"] = 0xe,
++            ["b394cadb60a724fa"] = 0xe,
++            ["b503751171dcdeff"] = 0xe,
++            ["bb46743e79171f4a"] = 0xe,
++            ["c08a291e9fc7cd53"] = 0xe,
++            ["d165704b67d086ec"] = 0xe,
++            ["e988f8655baebbee"] = 0xe,
++            ["eb53756b67128246"] = 0xe,
++            ["ece606b51bd40ec6"] = 0xe,
++            ["ee5756ef1989d719"] = 0xe,
++            ["f180f4609df4f801"] = 0xe,
++            ["f26d46909a5e0f4c"] = 0xe,
++            ["f2e6f8b3abe2214f"] = 0xe,
++            ["fbebc5fe19b041df"] = 0xe,
++            ["fbfb9669177a514d"] = 0xe,
++        };
++        static bool s_foutFactLogged;
++
++        /// <summary>表值优先（#427）：键在手工真值表里就直接给表值（猜出来的只当兜底），否则原样返回 guess。
++        /// 全进程第一次命中时往 stderr 记一行，方便看出这次翻译确实按表走（出包几万支片元只记这一行）。</summary>
++        static uint FsFoutFact(string key, uint guess)
++        {
++            if (string.IsNullOrEmpty(key) || !FsFoutFacts.TryGetValue(key, out uint t)) return guess;
++            if (!s_foutFactLogged)
++            {
++                s_foutFactLogged = true;
++                Console.Error.WriteLine($"[FOUT-FACT] {key}: 整数输出掩码 {guess:x} → {t:x}（按 nxnative PR #176 的手工真值表取 {FsFoutFacts.Count} 条之一，启发式只当兜底）");
++            }
++            return t;
++        }
++
++        // 110：S2A_UMASK（uint32 掩码，位 n = color(n) 进整数画布）。100 / 101 已给 S2A_AT / S2A_MSOFF（Dsh.cs FC_DECL）。
++        //   110..117 原是按槽的 bool S2A_UI0..7 / S2A_UF0..7；改成**一个** uint32 掩码后只占 110 —— 关键收益：宿主按**索引**设
++        //   （nvn_mtl.m fs_u_fn），不再按名字。iOS 的 metal 把片元里的函数常量放进库命名空间（实测 metallib 里是
++        //   nc9605adbda7b0087::S2A_UI0），宿主按名字 setConstantValue:…withName: 会被静默忽略 → 全 false → 写 float 成员进整数附件 → 恒 0。
++        internal const int S2A_UMASK_FC = 110;
++
++        /// <summary>按管线定类型的整数输出入口 main0_u（同 nxnative dmsh_entry.py uint_entry，MIT）：main0_out 里出现的每一个颜色槽都出两份成员
++        /// （float 与同位宽整数），由 uint32 函数常量 S2A_UMASK 的第 n 位决定哪一份在（结构体成员的 function_constant 用由它派生的
++        /// 布尔常量 S2A_MSK&lt;n&gt; / S2A_MSKN&lt;n&gt;，仍是编译期常量）；默认常量未定义 = 全 float，等于 main0。
++        /// 宿主按管线的整数目标集把掩码设在索引 110（nvn_mtl.m fs_u_fn），所以「哪些输出进整数画布」由管线说了算，
++        /// 不再从着色器代码猜（猜错会静默留下未定义的整数目标）。</summary>
++        static string FsUintEntry(string src, Match m, List<(string Ty, string Nm, string At)> mem) =>
++            FsUintEntry(src, m, mem, "main0_out_u", "main0_u", "\n// S2A_UMASK_ENTRY\n");
++
++        /// <summary>同上的通用形：strct / entry 给变体结构体与入口名，marker 是截断标记；decls = 是否连同 S2A_UMASK 及其派生布尔的函数常量声明一起印。</summary>
++        static string FsUintEntry(string src, Match m, List<(string Ty, string Nm, string At)> mem, string strct, string entry, string marker, bool decls = true)
++        {
++            int Loc(string at) { if (string.IsNullOrEmpty(at)) return -1; var c = Search(@"color\((\d+)\)", at); return c.Success ? int.Parse(c.Groups[1].Value) : -1; }
++            // #427 空之轨迹 the 1st：main0_out 里出现的**每一个**颜色槽都出两份成员（float 侧 + 同位宽整数侧），由管线掩码选。
++            //   以前只给「声明成 float」的槽出对：声明成整数的槽（颜色 3 = RG16Uint，MSL 里可能是 uint2 / int2 / ushort2）只原样复制，
++            //   结构体里既没有 float 那份、也没有 _ui；位 n 置真时颜色 3 整个从结构体里消失，Metal 对没写过的整数附件保持
++            //   未定义（设备上恒 0）→ 延迟光照读到零 → 3D 全黑。floatN ↔ uintN、halfN ↔ ushortN；已经是整数的原样保留。
++            (string F, string U) Pair(string ty)
++            {
++                var pm = Search(@"^(uint|int|ushort|short|float|half)(\d?)$", ty);
++                if (!pm.Success) return (null, null);   // 认不出的类型（矩阵等）照旧原样复制
++                int n = pm.Groups[2].Value.Length == 0 ? 1 : int.Parse(pm.Groups[2].Value, CultureInfo.InvariantCulture);
++                string sfx = n == 1 ? "" : n.ToString(CultureInfo.InvariantCulture);
++                string b = pm.Groups[1].Value;
++                if (b == "float" || b == "half") return (ty, (b == "float" ? "uint" : "ushort") + sfx);
++                return (b == "ushort" || b == "short" ? "half" + sfx : "float" + sfx, ty);
++            }
++            var cols = new Dictionary<string, (string F, string U)>(StringComparer.Ordinal);
++            foreach (var x in mem) { if (Loc(x.At) < 0) continue; var p = Pair(x.Ty); if (p.F != null) cols[x.Nm] = p; }
++            if (cols.Count == 0) return null;
++            var used = mem.Select(x => Loc(x.At)).Where(l => l >= 0).Distinct().OrderBy(l => l).ToList();
++            var sb = new StringBuilder();
++            sb.Append(marker);
++            if (decls)
++            {   // 一个 uint 掩码 + 由它派生的按槽布尔（结构体成员的存在性只能用编译期常量）
++                sb.Append($"constant uint S2A_UMASK [[function_constant({S2A_UMASK_FC})]];\n");
++                foreach (var n in used)
++                    sb.Append($"constant bool S2A_MSK{n} = (S2A_UMASK & (1u << {n})) != 0;\nconstant bool S2A_MSKN{n} = !S2A_MSK{n};\n");
++            }
++            sb.Append($"\nstruct {strct}\n{{\n");
++            foreach (var x in mem)
++            {
++                int l = Loc(x.At);
++                if (l >= 0 && cols.TryGetValue(x.Nm, out var p))
++                    sb.Append($"    {p.F} {x.Nm} {x.At[..^2]}, function_constant(S2A_MSKN{l})]];\n    {p.U} {x.Nm}_ui {x.At[..^2]}, function_constant(S2A_MSK{l})]];\n");
++                else sb.Append($"    {x.Ty} {x.Nm} {x.At};\n");
++            }
++            sb.Append("};\n\n");
++            var conv = new StringBuilder($"    {strct} r = {{}};\n");
++            foreach (var x in mem)
++            {
++                int l = Loc(x.At);
++                if (l >= 0 && cols.TryGetValue(x.Nm, out var p))
++                {
++                    string f = p.F == x.Ty ? $"out.{x.Nm}" : $"as_type<{p.F}>(out.{x.Nm})";   // float 成员照旧直接赋（位拷贝 as_type 只在 _ui 侧，保持不变）
++                    conv.Append($"    if (S2A_UMASK & (1u << {l})) r.{x.Nm}_ui = as_type<{p.U}>(out.{x.Nm}); else r.{x.Nm} = {f};\n");
++                }
++                else conv.Append($"    r.{x.Nm} = out.{x.Nm};\n");
++            }
++            conv.Append("    return r;");
++            string body = Replace(Sub(@"\bfragment\s+main0_out\s+main0\s*\(", $"fragment {strct} {entry}(", src[m.Index..], 1), "return out;", conv.ToString());
++            return sb.ToString() + body;
+         }
+ 
+         /// <summary>装整数、不是浮点位型的颜色输出（同上游参考实现（MIT）a4d7bb7b dmsh_build.py int_outputs）。逐个输出写顺着局部量往回追：整数运算算出的、或小整数常量
+@@ -2095,7 +2230,7 @@ namespace S2A.Dsh
+         /// src 是现编出的整份 .metal：先截掉已接的 main0_u（main0 是它前面最后一个函数）。→ 只含 main0 与 main0_t 的源码；认不出 main0 返回 null</summary>
+         internal static string FsTyped(string src, uint umask, uint smask)
+         {
+-            int cut = src.IndexOf("\nstruct main0_out_u\n", StringComparison.Ordinal); if (cut >= 0) src = src[..cut];
++            int cut = src.IndexOf("\n// S2A_UMASK_ENTRY\n", StringComparison.Ordinal); if (cut < 0) cut = src.IndexOf("\nstruct main0_out_u\n", StringComparison.Ordinal); if (cut >= 0) src = src[..cut];
+             var m = Search(@"^.*\bfragment\s+main0_out\s+main0\s*\(", src, RegexOptions.Multiline); var st = Search(@"struct main0_out\s*\{(.*?)\};", src, RegexOptions.Singleline);
+             if (!m.Success || !st.Success) return null;
+             int Loc(string at) { var c = Search(@"color\((\d+)\)", at); return c.Success ? int.Parse(c.Groups[1].Value) : -1; }
+diff --git a/graphics/tools/direct/dsh/Ft.cs b/graphics/tools/direct/dsh/Ft.cs
+index 8ec87f3..0fd30a2 100644
+--- a/graphics/tools/direct/dsh/Ft.cs
++++ b/graphics/tools/direct/dsh/Ft.cs
+@@ -33,7 +33,8 @@ namespace S2A.Dsh
+         /// 任一掩码认不出 main0 → null</summary>
+         public static string Msl(string src, IEnumerable<(long U, long S)> want)
+         {
+-            int i = src.IndexOf("\nstruct main0_out_u\n", StringComparison.Ordinal);
++            int i = src.IndexOf("\n// S2A_UMASK_ENTRY\n", StringComparison.Ordinal);
++            if (i < 0) i = src.IndexOf("\nstruct main0_out_u\n", StringComparison.Ordinal);
+             string cut = i >= 0 ? src[..i] : src, msl = cut;
+             foreach (var (u, s) in want)
+             {
