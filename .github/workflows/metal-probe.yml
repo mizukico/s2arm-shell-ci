@@ -1,0 +1,35 @@
+name: metal-probe
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: xcode-27
+    steps:
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+      - name: Compile the rop972 MSL snippet
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/rop972_probe.metal" <<'EOF'
+          #include <metal_stdlib>
+          using namespace metal;
+          constant bool S2A_RND0 [[function_constant(272)]];
+          constant bool S2A_RND0_ON = is_function_constant_defined(S2A_RND0) ? S2A_RND0 : false;
+          constant float S2A_RSC0 [[function_constant(288)]];
+          constant float S2A_RSC0_V = is_function_constant_defined(S2A_RSC0) ? S2A_RSC0 : 255.0f;
+          struct O { float4 m_color0 [[color(0)]]; float2 m_color1 [[color(1)]]; };
+          fragment O fs_main(O out) {
+              float4 _r0 = out.m_color0;
+              _r0.rgb = S2A_RND0_ON ? float3(rint(precise::clamp(_r0.rgb, 0.0f, 1.0f) * S2A_RSC0_V) / S2A_RSC0_V) : _r0.rgb;
+              _r0.a = S2A_RND0_ON ? rint(precise::clamp(_r0.a, 0.0f, 1.0f) * S2A_RSC0_V) / S2A_RSC0_V : _r0.a;
+              out.m_color0 = _r0;
+              float2 _r1 = out.m_color1;
+              _r1.rg = S2A_RND0_ON ? float2(rint(precise::clamp(_r1.rg, 0.0f, 1.0f) * S2A_RSC0_V) / S2A_RSC0_V) : _r1.rg;
+              out.m_color1 = _r1;
+              return out;
+          }
+          EOF
+          xcrun -sdk iphoneos metal -std=metal3.0 -c "$RUNNER_TEMP/rop972_probe.metal" -o "$RUNNER_TEMP/rop972_probe.air"
+          echo "PROBE OK: precise::clamp + rint + optional function constants compile"
