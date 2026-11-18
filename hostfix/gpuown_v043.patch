@@ -1,0 +1,2604 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 0a2a86e..c45ab0f 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -650,8 +650,98 @@ static int present_link_from_env(void) {
+     { const char *fi = getenv("DM_PRESENT_FI"); if (fi && !strcmp(fi, "1") && v != 2 && !g_m3) v = 0; }
+     return v;
+ }
++// S2Arm 壳标记（2026-11-18-litzero = present1 的全部内容 + 延迟光照那一遍的输入 / 输出探针）：
++//   ① arch：每支 ps 的 main0_u + 宿主按每个 target 的 Metal 格式逐输出设 bool 函数常量（按索引 208+n / 224+n）；
++//   ② uintread：MSL 声明 texture…<uint|int> 的槽原样绑整数纹理（不建 float 视图）；
++//   ③ uifit：反过来，MSL 声明整数、实际绑浮点 → 建同字节宽整数视图再绑；**映射改为表驱动**（fmt_int_view）：
++//      Unorm→Uint、Snorm→Sint、sRGB→Uint、Float→Uint（取位），每一对编译期 _Static_assert 同字节宽。
++//      真机日志 `fmt 0xa → 0xe` 的根因（R8Unorm 被按 MSL 声明挑成 R8Sint，≥128 的像素读成负数）不会再出现。
++//   ④ present：viewport 按层形状（nxnative），crop 只用于 UV 子矩形。
++//   ⑤ A1（2026-11-18）：选类判据改成「main0 声明类 != 附件类」也换 main0_u（nxnative pso_cls 的 need），cls==0 也允许用它。
++//   ⑥ present1（2026-11-18）：present 出图前打 [pres] 一行（帧号 / 源序列号 / 格式 / 尺寸 / 视口 / fi,aa,fx），首帧 + 每 300 帧
++//      对呈现源做一次 8×8 中心区 GPU→CPU 读回（mean/max）；S2A_PRESENT_PLAIN=1 走 nxnative 的最简路径（只一次全屏 blit）。
++//   ⑧ present3（2026-11-18）：present 按 nxnative 的权威实现做结构性对齐 ——
++//      独立 render pass（只挂 colorAttachments[0]，显式 depthAttachment/stencilAttachment = nil）、
++//      独立 pipeline（只设 colorAttachments[0].pixelFormat，无 depth/stencil 附件，rasterSampleCount=1，
++//      blend=off、写掩码全开；cull/winding 用新编码器的默认 none/clockwise），源是 sRGB 时换同存储非 sRGB 视图；
++//      [blit] 状态行（blend/dt/dw/cmp/vp/sc/wm/tgt/fmt + depthAttachment=none）与 before/after 8×8 均值。
++//      S2A_PRESENT_NODEPTH 默认开 = 走这条独立 present pass；=0 回退旧 present 路径（A/B）。
++//   ⑦ litzero（2026-11-18）：延迟光照这一遍的输入 / 输出摊开（只读诊断）——draw 里认「颜色附件是 1600x900 场景 target、
++//      片元槽里绑着本帧先画过的 G-buffer 目标」的那一遍，打 [lit] 头行 + 片元常量缓冲 + 片元缓冲槽表；遍末把 G-buffer 输入
++//      1×1、颜色附件 8×8 中心拷进 shared 缓冲，下次开遍前 CPU 读回打 in / out。
++//      v2（2026-11-18-litzero2）：探针的大缓冲全搬到静态 / GPU 缓冲（栈上不留 >256 字节的数组，避开 ___chkstk_darwin 大栈帧），
++//      单次读回 ≤ 8×8×4B，读回每 300 帧一次，[chain] 每帧 ≤ 8 行、[lit]/[cs]/[dim] 每类每帧 ≤ 4 行，总 ≤ 20000 行；
++//      任何一步失败（建缓冲 / blit / 读回）立刻 `[probe] disabled after <原因>` 并关掉全部探针。遍末的 blit 必须等
++//      g_enc = nil 之后再做（否则 blit_raw → rp_end → lz_post_end 无限递归，真机 SIGBUS / ___chkstk_darwin）。
++//      见 draw 之前 [lit] 那一段与报告里的判读表；S2A_LITZERO=0 关，S2A_LITZERO_KEY=<片元 key 前缀> 手动指定。
++//   ⑨ presidx（2026-11-18）：present 索引 / 交换链 serial 对齐日志 ——
++//      hle QueuePresent 入口的 idx、宿主 blit 到 drawable 之前的呈现源 serial、交换链条目的 idx→ser 映射、每 60 帧的写者集合汇总。
++//   ⑩ gpuown（2026-11-18）：**修复** —— GPU 写过的贴图（渲染目标 / 图像存储）一律 GPU-owned：display（窗口 / 交换链）纹理创建时带 RenderTarget、
++//      其余可渲染目标首次 attach 成 RT 时 tex_upgrade 补 usage、tex_mtl 解析时 GPU 写账本命中或 usage 含 RenderTarget|ShaderWrite 的贴图不再从 guest 内存上传 / 重传。
++//      判据全部是 Metal usage / GPU 写账本 / 绑定关系，不写死 serial；S2A_TEXKEEP=0 回退旧行为（A/B）。确认日志 [presidx] writer / blit / POINTER_SAME /
++//      window tex / re-upload skipped。
++//   编译期写死的壳编号，nvn 初始化的第一行必打；之后打 [fmtfix] 两行 + 一行 [clean] + 一行 [litzero] + 一行 [present3] + 一行 [presidx] + 一行 [gpuown]。
++//   实验 / 诊断开关与 final2 / final3 全删（见 2026-11-17-clean 报告）。除 S2A_SB_RO / S2A_PRESIDX / S2A_TEXKEEP 这几个 A/B 外不跟任何开关走。
++static const char S2A_SHELL_TAG[] = "2026-11-18-gpuown";
++// 格式映射表的运行期校验（定义在 uifit 那一段；mtl_init 先声明后调用，启动时打 [fmtfix] 一行）。
++static void s2a_fmt_view_validate(void);
++// 2026-11-18 presidx（整个模块定义在 xv 段之后）：只读日志，mtl_init 只回显一行开关状态。
++static int px_on(void);
++// 2026-11-18 gpuown（定义在 tex_desc 之前）：修复开关，S2A_TEXKEEP=0 回退旧行为。
++static int s2a_texkeep_on(void);
++// S2A_PRESENT_VIEWPORT=crop：present 的 viewport 回到旧行为（按有效子矩形的宽高比居中、其余留黑），只用于 A/B；缺省 layer。
++static int s2a_present_viewport_layer(void) {
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("S2A_PRESENT_VIEWPORT"); v = !(e && !strcmp(e, "crop")); }
++    return v;
++}
++// S2A_PRESENT_PLAIN=1（A/B，缺省 0 = 现状不变）：present 走 nxnative 的最简路径 ——
++//   src = 呈现纹理 → 一次全屏 blit 到 drawable，viewport = 层形状，loadAction = DontCare，blend / depth 都不开；
++//   补帧（FI）、SMAA（S2A_ANTI_ALIASING）、MetalFX / DLSS 类后处理（S2A_SCALING_FILTER）、宽屏画幅与 iOS 镜像全不参与。
++//   只用于判断「画面黑」是呈现源本身黑还是我们的 blit / 后处理有问题（见 present1 报告的判读表）。
++static int s2a_present_plain(void) {
++    static int v = -1;
++    if (v < 0) {
++        const char *e = getenv("S2A_PRESENT_PLAIN");
++        v = e && !strcmp(e, "1");
++        if (v) MLOG("[pres] PLAIN mode: fi/aa/fx/wide disabled, single blit");
++    }
++    return v;
++}
++// S2A_SB_RO=0（A/B，默认开 = 按 cb_extent.tsv 的 s 标记，行为不变）：忽略 s 标记，storage 槽一律当作可写。
++//   builddiff：我们的 s 标记比 nxnative 多 3.5 倍（17,647 vs 5,078），可能让 GPU 写过的 guest 缓冲被当陈旧数据。
++static int s2a_sb_ro_on(void) {
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("S2A_SB_RO"); v = !(e && !strcmp(e, "0")); }
++    return v;
++}
+ void mtl_init(void) {
+     if (g_dev) return;
++    MLOG("[s2a] shell tag: %s", S2A_SHELL_TAG);
++    // 2026-11-18 present1：present 期的 [pres] 读数 + 每 300 帧的呈现源读回；S2A_PRESENT_PLAIN=1 时在这里回显一行。
++    MLOG("[present1] src readback + PLAIN switch");
++    (void)s2a_present_plain();
++    // 2026-11-18 litzero：延迟光照这一遍的输入 / 输出探针（frame ≥ 300、读回每 300 帧一次，见 draw 之前 [lit] 那一段）。
++    MLOG("[litzero] probe v2 (heap buffers, self-disable on error)");
++    // 2026-11-18 present3：present 独立 pass（无 depth/stencil；cull none、sample 1）+ [blit] 前后读数。
++    MLOG("[present3] dedicated present pass (no depth/stencil), cull none, sample 1");
++    // 2026-11-18 presidx：present 索引 ↔ 交换链 serial 对齐（只读日志）。
++    MLOG("[presidx] queue-present index vs swapchain serial");
++    // 2026-11-18 gpuown：修复开关回显（默认新逻辑：可渲染颜色目标 GPU-owned，不从 guest 重传）。
++    MLOG("[gpuown] render targets are GPU-owned; no guest re-upload");
++    (void)s2a_texkeep_on();
++    (void)px_on();
++    // 2026-11-17 arch：翻译器给每个片元都出 main0_u（每色 float / uint / int 三条成员，同一个 [[color(n)]]），宿主按管线
++    //   每个目标的 Metal 格式逐输出设 bool 函数常量（按索引：无符号 208+n、带符号 224+n，两个都假 = 浮点成员）。S2A_UMASK=0 回退旧路。
++    // 2026-11-17 uintread：MSL 声明 texture…<uint|int> 的槽原样绑整数纹理（8/16 位整数没有同位宽 float 视图）。
++    // 2026-11-17 uifit：上一条反过来 —— MSL 声明整数、实际绑浮点 → 建同字节宽整数视图再绑（S2A_UINT_FIT=0 关）。
++    // 2026-11-17 present：viewport = 层形状（nxnative），crop 只用于 UV 子矩形；S2A_PRESENT_VIEWPORT=crop 回旧行为。
++    // 2026-11-18 fmtfix：纹理视图格式映射表（Unorm→Uint / Snorm→Sint / sRGB→Uint / Float→Uint 取位）。
++    //   编译期 _Static_assert 每一对同字节宽；这里再运行期校验一次并打 [fmtfix] 一行（带对数）。
++    s2a_fmt_view_validate();
++    // 2026-11-18 A1：片元入口的选类判据 =「main0 声明类 != 附件类」（任一位置不同就换 main0_u；cls==0 = 全 float 成员）。
++    MLOG("[fmtfix] class = decl XOR attachment; sb-ro=%s", s2a_sb_ro_on() ? "on" : "off");
++    MLOG("[clean] per-target FC; uintread; uifit; present=%s", s2a_present_viewport_layer() ? "layer" : "crop");
+     const char *vbc = getenv("DM_NVN_VBUF_CACHE"); g_vbuf_cache = !(vbc && !strcmp(vbc, "0"));
+     const char *latency = getenv("DM_PRESENT_LATENCY");
+     if (latency && atoi(latency) > 0) g_present_latency = atoi(latency);
+@@ -3115,6 +3205,29 @@ static NSUInteger mtl_samples_supported(const tex_t *t) {
+ }
+ 
+ #include "../../texture_extent.inc"
++// ====================================================================================================================
++// S2Arm 2026-11-18 gpuown：GPU 写过的贴图（渲染目标 / 图像存储）一律 GPU-owned，绝不再从 guest 内存上传（S2A_TEXKEEP=0 回退，A/B）。
++//   根因（真机日志 + nxnative 对照）：被判成 packaged 的窗口 / 交换链纹理（flags 0xd = DISPLAY|IMAGE|COMPRESSIBLE）走 tex_mtl 的打包路径，
++//     这条路径从不问「这张的内容是不是 GPU 写的」，每帧把 guest 里的旧字节（黑）重传上来，覆盖 GPU 刚画好的帧（持续黑、UI 正常）。
++//   判据两条（都不写死 serial）：宿主自己的 GPU 写账本 nvn_be_tex_gpu_owned（gpw_mark：渲染目标 / clear / copy / 图像存储），
++//     以及 Metal usage 的 RenderTarget / ShaderWrite 位（IMAGE 标志的贴图 = 着色器可写）。CPU 逐帧上传的贴图（视频帧）两条都不满足，照旧上传。
++//   配套：① tex_desc 给 display（窗口 / 交换链）纹理在创建时带 RenderTarget（其余可渲染目标在首次 attach 时由 rp_begin_ex_ 的 tex_upgrade 补，
++//     不给所有 packaged 贴图一律加 RT：那会关掉 Apple GPU 的 lossless compression，所有流式贴图都付代价）；② tex_upgrade 的用法保持不变。
++// ====================================================================================================================
++static int s2a_texkeep_on(void) {   // 默认开 = 新逻辑（GPU-owned）；S2A_TEXKEEP=0 = 旧逻辑（packaged 与 CPU 重传照旧）
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("S2A_TEXKEEP"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("[gpuown] S2A_TEXKEEP=0: old packaged / guest re-upload behaviour"); }
++    return v;
++}
++// 每张 GPU-owned 贴图只报一次「跳过重传」（判据是 Metal usage，不看 serial 数值）
++#define PX_SKIP_MAX 64
++static uint64_t g_px_skip[PX_SKIP_MAX]; static int g_px_skipn;
++static void px_gpuown_skip(uint64_t serial) {
++    for (int i = 0; i < g_px_skipn; i++) if (g_px_skip[i] == serial) return;
++    if (g_px_skipn >= PX_SKIP_MAX) return;
++    g_px_skip[g_px_skipn++] = serial;
++    MLOG("[presidx] f=%llu re-upload skipped (gpu_owned) ser=%llu", (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)serial);
++}
+ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
+     uint32_t pf = 0; uint8_t swz[4];
+     if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { RED_ONCE(0, "texture format %#x has no Metal equivalent (first case)", t->d.format); return nil; }
+@@ -3149,7 +3262,11 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
+     { NSUInteger mx = MAX(d.width, d.textureType == MTLTextureType3D ? MAX(d.height, d.depth) : d.height), ml = 1; while (mx >>= 1) ml++;
+       if (d.mipmapLevelCount > ml) d.mipmapLevelCount = ml; }
+     d.storageMode = MTLStorageModePrivate;   // Render targets and assets both go in GPU private storage (lossless compression available)
+-    d.usage = MTLTextureUsageShaderRead | (fmt_compressed(t->d.format) || packaged ? 0 : MTLTextureUsageRenderTarget)
++    // 2026-11-18 gpuown：packaged 的 **display**（窗口 / 交换链）纹理在创建时就带 RenderTarget（它们就是扫描输出的渲染目标）；
++    //   其余 packaged 贴图不在这里加（一律加 RT 会关掉 Apple GPU 的 lossless compression，所有流式贴图都付代价）：它们真被当渲染目标画时，
++    //   rp_begin_ex_ 的 tex_upgrade 会在首次 attach 时补上 usage。S2A_TEXKEEP=0 回退旧条件。
++    int rt_ok = !fmt_compressed(t->d.format) && (!packaged || (s2a_texkeep_on() && d.sampleCount == 1 && !mtl_fmt_depth((MTLPixelFormat)pf) && (t->d.flags & NVN_TEXTURE_FLAGS_DISPLAY)));
++    d.usage = MTLTextureUsageShaderRead | (rt_ok ? MTLTextureUsageRenderTarget : 0)
+             | (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE ? MTLTextureUsageShaderWrite : 0)   // Image usage: shader-writable (compute kernels generating the 3D color lookup table, etc.
+             | (bc_gpu_dec(t) ? MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView : 0)   // no BC, decoded on the GPU: the kernel bcd writes it (an sRGB one through an RGBA8Unorm view)
+             | (pf == MTLPixelFormatRGB9E5Float && !packaged ? MTLTextureUsagePixelFormatView : 0)   // RGB9E5 render targets written through R32UI views (04008E001F098000 packs its HDR color itself):
+@@ -4980,6 +5097,17 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+     if (!packaged && !have && DM_GAME_TEX_DIRTY_UPLOAD && t->mem && on_sub_thread()) { int nvn_ft_written(const tex_t *); packaged = nvn_ft_written(t); }   // first use of a texture the CPU wrote since init without a flush (hle_nvn.c)
+     if (!packaged && !have && on_sub_thread() && tex_cpu_content(t)) { nvn_be_tex_cpu_written(t); packaged = 1; }
+     if (!packaged && !have && on_sub_thread() && tex_linear_needs_upload(t)) { nvn_be_tex_cpu_written(t); packaged = 1; }   // 建不了零拷贝视图的只读线性贴图：上传 + CPU 写后重传（#255 / #262）   // storage the CPU wrote before its first use (tex_cpu_content)
++    // 2026-11-18 gpuown（判据 ③）：已解析成 GPU-owned 的贴图直接返回现有 Metal 贴图，**绝不从 guest 内存上传 / 重传**。
++    //   两条判据（都不看 serial 数值）：宿主 GPU 写账本 nvn_be_tex_gpu_owned（gpw_mark：渲染目标 / clear / copy / 图像存储），
++    //   或 Metal usage 含 RenderTarget / ShaderWrite。CPU 逐帧上传的贴图（视频帧等）两条都不满足，照旧走上传。
++    //   旧行为下 packaged 的窗口 / 交换链纹理每帧被 guest 里的旧字节覆盖（持续黑）。S2A_TEXKEEP=0 回退。
++    //   同时覆盖两种持有者：已经是 Metal 贴图（GPU 路径建过），或 NvPkg（打包路径建过，pk->tex 的 usage 才是判据；稀疏贴图返回它的整段视图）。
++    if (s2a_texkeep_on() && have) {
++        id<MTLTexture> ht = nil, ret = nil;
++        if ([have conformsToProtocol:@protocol(MTLTexture)]) { ht = (id<MTLTexture>)have; ret = ht; }
++        else if ([have isKindOfClass:[NvPkg class]]) { NvPkg *pk = (NvPkg *)have; ht = (id<MTLTexture>)pk->tex; ret = pk->view ? (id<MTLTexture>)pk->view : ht; }
++        if (ht && ((ht.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) || nvn_be_tex_gpu_owned(t->serial))) { px_gpuown_skip(t->serial); return ret; }
++    }
+     if (packaged && atomic_load(&g_sub_thread_set) && !on_sub_thread()) {
+         // S2Arm 10-25：上传批只归提交线程（up_owner_check），上屏线程等别的线程用到 CPU 写过的贴图时不上传：已传过的用现有那份（脏了留给提交线程下次用到时重传），
+         //   没传过的按 GPU 贴图走下面的路。马车8 初始化时 CPU 写过交换链贴图的池，tex_flush_upload 开时它算「随包」，上屏线程 present_now → pkg_upload → abort
+@@ -5584,7 +5712,169 @@ static int xv_present(uint64_t ser) { for (int i = 0; i < g_xv_npresent; i++) if
+ static void xv_forward(void);
+ static int tbdr_on(void);
+ static int xv_on(void) { static int off = -1; if (off < 0) { const char *e = getenv("DM_NVN_XV"); off = e && !strcmp(e, "0"); } return !off && tbdr_on(); }
+-void nvn_be_xv_window_tex(uint64_t serial) { if (!xv_present(serial) && g_xv_npresent < 128) g_xv_present[g_xv_npresent++] = serial; }   // Window (swapchain) texture: never enters the ledger
++// ====================================================================================================================
++// S2Arm 2026-11-18 presidx：present 索引 ↔ 交换链 serial 对齐（**只读日志，不改任何行为**；S2A_PRESIDX=0 关）。
++//   全部判据来自绑定 / 登记关系，不写死任何 serial：
++//     ① 交换链条目：hle nvnWindowInitialize 按交换链下标 0..n-1 调 nvn_be_xv_window_tex(serial)（窗口句柄与条目关系在 hle），
++//        这里按「同一帧内连续登记」的顺序还原 idx；只认活着的 NVN 纹理对象（GL / Vulkan 外部纹理、回放登记都不算）；
++//     ② 本帧写者：颜色附件的像素尺寸 == 交换链尺寸（尺寸在第一次见到交换链 Metal 纹理时学到；还没见到时按已知合成尺寸 1920x1080）；
++//        判据只有「本帧颜色附件 + 尺寸」，不认 serial 数值；
++//     ③ present：hle 入口（QueuePresent）打游戏传的 idx；宿主真正 blit 到 drawable 之前打呈现源 serial / 格式 / 尺寸与登记到的 idx；
++//        每 60 帧再打一行本帧写者集合 ↔ 这次呈现的 serial（same=1 表示呈现的就是本帧写过的目标）。
++//   行数有界：swapchain 每条一次、blit 每次 present 一行、汇总每 60 帧一行；任何一步取不到数据只少一行，不影响绘制 / 上屏。
++// ====================================================================================================================
++#define PX_SC_MAX 8     // 一个窗口最多 4 张交换链纹理；留 8 条给重建
++#define PX_WR_MAX 32    // 本帧写者集合上限（超出只记前 32 个）
++typedef struct { uint64_t ser; int idx, logged, wlogged; } px_sc_ent;
++static px_sc_ent g_px_sc[PX_SC_MAX]; static int g_px_scn;         // 交换链 idx→ser（登记顺序 = 窗口条目下标）
++static uint64_t g_px_reg_frame = ~0ull; static int g_px_reg_run;  // 同一帧内连续登记的下标计数
++static uint32_t g_px_w, g_px_h;                                  // 交换链尺寸（0 = 还没见到交换链 Metal 纹理）
++static uint64_t g_px_wrote[PX_WR_MAX]; static int g_px_wn;       // 本帧写过的、尺寸 = 交换链尺寸的颜色目标 serial
++static uint64_t g_px_wrote_frame = ~0ull;                        // 这个集合属于哪一帧
++static uint64_t g_px_summed = ~0ull;                             // 已经打过汇总的帧
++static pthread_mutex_t g_px_mu = PTHREAD_MUTEX_INITIALIZER;
++static uint64_t g_px_bf, g_px_bser; static int g_px_blog;        // 这一次 present 的帧号 / 呈现源 serial / 是否已打 blit 行
++static uint32_t g_px_bfmt, g_px_bw, g_px_bh; static void *g_px_bmtl;   // 呈现源（Metal 基纹理）的格式 / 尺寸 / 指针
++static __strong id<MTLTexture> g_px_bdst;                        // 这一次 present 的 drawable（blit 行只认它）
++// 写 window 交换链那一遍：开遍时记下真正挂上去的附件（基纹理 + 视图格式 + Metal 指针），遍末连同片元 key 打一行。
++//   mtl 是**基纹理指针**（view.parentTexture ?: view）：present 的源与它不同 → 写的是另一张纹理（判据 D）。
++typedef struct { int on; uint64_t ser; uint32_t base_fmt, view_fmt; void *mtl; } px_wr_ent;
++static px_wr_ent g_px_wr;
++// 本帧最后一个写者，按帧号存一小圈（present 线程可能晚于下一帧的编码：按帧号取，取不到就当没有）
++#define PX_WRING 8
++static struct { int on; uint64_t f, ser; void *mtl; } g_px_wring[PX_WRING]; static int g_px_wrnext;
++static uint64_t g_lz_pk_pass; static char g_lz_pk_key[24];        // 定义在 litzero 段：本遍第一笔的片元 key（writer 行用）
++static int px_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_PRESIDX"); v = !(e && !strcmp(e, "0")); } return v; }
++static int px_sc_index(uint64_t ser) {
++    int r = -1;
++    pthread_mutex_lock(&g_px_mu);
++    for (int i = 0; i < g_px_scn; i++) if (g_px_sc[i].ser == ser) { r = g_px_sc[i].idx; break; }
++    pthread_mutex_unlock(&g_px_mu);
++    return r;
++}
++// 窗口交换链纹理登记（hle nvnWindowInitialize 按 idx 顺序调）：按同一帧内的连续顺序还原 idx
++static void px_sc_note(uint64_t ser) {
++    if (!ser || !px_on() || !nvn_be_tex_is_live(ser)) return;   // 不是活着的 NVN 纹理对象：不是本窗口的交换链条目
++    pthread_mutex_lock(&g_px_mu);
++    int known = 0; for (int i = 0; i < g_px_scn; i++) if (g_px_sc[i].ser == ser) { known = 1; break; }
++    if (!known && g_px_scn < PX_SC_MAX) {
++        uint64_t f = atomic_load(&g_cur_frame);
++        if (f != g_px_reg_frame) { g_px_reg_frame = f; g_px_reg_run = 0; }
++        g_px_sc[g_px_scn].ser = ser; g_px_sc[g_px_scn].idx = g_px_reg_run++ & 3; g_px_sc[g_px_scn].logged = 0;
++        g_px_scn++;
++    }
++    pthread_mutex_unlock(&g_px_mu);
++}
++// 交换链纹理第一次拿到 Metal 对象：打 fmt / 尺寸（登记时还没有 Metal 对象，格式只能等这一刻）
++static void px_sc_touch(uint64_t ser, id<MTLTexture> tex) {
++    if (!px_on() || !ser || !tex) return;
++    pthread_mutex_lock(&g_px_mu);
++    for (int i = 0; i < g_px_scn; i++) if (g_px_sc[i].ser == ser) {
++        if (!g_px_sc[i].logged) {
++            g_px_sc[i].logged = 1; g_px_w = (uint32_t)tex.width; g_px_h = (uint32_t)tex.height;
++            MLOG("[presidx] swapchain idx=%d ser=%llu fmt=0x%x %ux%u", g_px_sc[i].idx, (unsigned long long)ser,
++                 (unsigned)tex.pixelFormat, (unsigned)tex.width, (unsigned)tex.height);
++        } else { g_px_w = (uint32_t)tex.width; g_px_h = (uint32_t)tex.height; }   // 换尺寸（转屏 / 分辨率变化）时写者判据跟着走
++        break;
++    }
++    pthread_mutex_unlock(&g_px_mu);
++}
++// window 纹理的一次性画像：是否被判成 CPU 写（guest 内存重传会覆盖刚画好的帧）、Metal usage 是否算 GPU-owned
++static void px_win_note(uint64_t ser, id<MTLTexture> base) {
++    if (!px_on() || !ser || !base) return;
++    int cw = tex_cpu_written(ser);   // 纹理是否在「CPU 写过、每次重传」的集合里（判据 A）
++    int go = (base.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) != 0;   // RT / ShaderWrite = GPU-owned
++    pthread_mutex_lock(&g_px_mu);
++    int i = -1; for (int k = 0; k < g_px_scn; k++) if (g_px_sc[k].ser == ser) { i = k; break; }
++    int log = i >= 0 && !g_px_sc[i].wlogged;
++    if (log) g_px_sc[i].wlogged = 1;
++    pthread_mutex_unlock(&g_px_mu);
++    if (log) MLOG("[presidx] window tex ser=%llu cpu_written=%d gpu_owned=%d", (unsigned long long)ser, cw, go);
++}
++// 开遍时：颜色附件是本 window 交换链纹理（登记关系判断，不认 serial 数值）且尺寸 = 交换链尺寸 → 记下这一遍的写者
++static void px_writer_note(id<MTLTexture> view, uint64_t ser) {
++    if (!px_on() || !view || !ser) return;
++    if (px_sc_index(ser) < 0) return;   // 不是 window 交换链纹理（外部 / 普通目标）
++    uint32_t w = (uint32_t)view.width, h = (uint32_t)view.height;
++    if (g_px_w ? (w != g_px_w || h != g_px_h) : (w != 1920 || h != 1080)) return;
++    px_sc_touch(ser, view);
++    id<MTLTexture> base = view.parentTexture ? view.parentTexture : view;
++    g_px_wr.on = 1; g_px_wr.ser = ser; g_px_wr.base_fmt = (uint32_t)base.pixelFormat;
++    g_px_wr.view_fmt = (uint32_t)view.pixelFormat; g_px_wr.mtl = (__bridge void *)base;
++}
++// 遍末：连同本遍第一笔的片元 key 打 writer 行，并记为「本帧最后一个写者」
++static void px_writer_end(void) {
++    if (!g_px_wr.on) return;
++    px_wr_ent w = g_px_wr; g_px_wr.on = 0;
++    uint64_t f = atomic_load(&g_cur_frame);
++    const char *key = g_lz_pk_pass == g_stat_pass && g_lz_pk_key[0] ? g_lz_pk_key : "-";
++    MLOG("[presidx] f=%llu writer pass=%llu key=%s ser=%llu base_fmt=0x%x view_fmt=0x%x mtl=%p", (unsigned long long)f,
++         (unsigned long long)g_stat_pass, key, (unsigned long long)w.ser, w.base_fmt, w.view_fmt, w.mtl);
++    pthread_mutex_lock(&g_px_mu);
++    g_px_wring[g_px_wrnext % PX_WRING].on = 1; g_px_wring[g_px_wrnext % PX_WRING].f = f;
++    g_px_wring[g_px_wrnext % PX_WRING].ser = w.ser; g_px_wring[g_px_wrnext % PX_WRING].mtl = w.mtl;
++    g_px_wrnext++;
++    pthread_mutex_unlock(&g_px_mu);
++}
++// 每帧颜色附件（判据：是本帧颜色附件 + 尺寸 = 交换链尺寸；不写死 serial）
++static void px_att(int slot, id<MTLTexture> tex, uint64_t ser) {
++    (void)slot;
++    if (!px_on() || !tex || !ser) return;
++    px_sc_touch(ser, tex);   // 交换链纹理被画进来时顺便打它的登记行（每条一次）
++    uint32_t w = (uint32_t)tex.width, h = (uint32_t)tex.height;
++    if (w < 8 || h < 8) return;
++    pthread_mutex_lock(&g_px_mu);
++    uint64_t f = atomic_load(&g_cur_frame);
++    if (f != g_px_wrote_frame) { g_px_wrote_frame = f; g_px_wn = 0; }
++    int want = g_px_w ? (w == g_px_w && h == g_px_h) : (w == 1920 && h == 1080);
++    if (want && g_px_wn < PX_WR_MAX) {
++        int dup = 0; for (int i = 0; i < g_px_wn; i++) if (g_px_wrote[i] == ser) { dup = 1; break; }
++        if (!dup) g_px_wrote[g_px_wn++] = ser;
++    }
++    pthread_mutex_unlock(&g_px_mu);
++}
++// present 入口（游戏线程，QueueSubmit 之后）：每 60 帧打一行本帧写者集合 ↔ 这次呈现的 serial
++static void px_present_note(uint64_t f, uint64_t ser) {
++    if (!px_on() || !f || f % 60) return;
++    static char set[256];   // 静态缓冲：栈上不留数组；最多列 8 个，其余只报个数
++    pthread_mutex_lock(&g_px_mu);
++    if (f == g_px_summed) { pthread_mutex_unlock(&g_px_mu); return; }
++    g_px_summed = f;
++    int n = g_px_wrote_frame == f ? g_px_wn : 0;   // 这一帧没有颜色附件（或集合还停在旧帧）：按空集合报
++    int same = 0; for (int i = 0; i < n; i++) if (g_px_wrote[i] == ser) same = 1;
++    int k = snprintf(set, sizeof set, "wrote=["), lim = n < 8 ? n : 8;
++    for (int i = 0; i < lim && k < (int)sizeof set - 24; i++) k += snprintf(set + k, sizeof set - k, "%s%s%llu", i ? "," : "", i ? "" : "ser=", (unsigned long long)g_px_wrote[i]);
++    if (n > lim && k < (int)sizeof set - 12) k += snprintf(set + k, sizeof set - k, ",+%d", n - lim);
++    snprintf(set + k, sizeof set - k, "]");
++    pthread_mutex_unlock(&g_px_mu);
++    MLOG("[presidx] f=%llu %s presented_ser=%llu same=%d", (unsigned long long)f, set, (unsigned long long)ser, same);
++}
++// 一次 present：记下帧号 / 呈现源 serial / 源基纹理的格式、尺寸、指针 / drawable（宿主真正 blit 之前打一行）
++static void px_blit_begin(uint64_t f, uint64_t ser, id<MTLTexture> src, id<MTLTexture> dst) {
++    g_px_bf = f; g_px_bser = ser; g_px_blog = 0; g_px_bdst = dst;
++    g_px_bfmt = src ? (uint32_t)src.pixelFormat : 0; g_px_bw = src ? (uint32_t)src.width : 0; g_px_bh = src ? (uint32_t)src.height : 0;
++    g_px_bmtl = (__bridge void *)src;
++}
++static void px_blit_log(id<MTLTexture> src, id<MTLTexture> dst) {
++    if (!px_on() || g_px_blog || !src || !dst || dst != g_px_bdst) return;   // 只认这一次 present 的 drawable
++    g_px_blog = 1;
++    int i = px_sc_index(g_px_bser);
++    if (i >= 0)
++        MLOG("[presidx] f=%llu blit src ser=%llu base_fmt=0x%x mtl=%p fmt=0x%x %ux%u drawable=%lux%lu idx=%d", (unsigned long long)g_px_bf,
++             (unsigned long long)g_px_bser, g_px_bfmt, g_px_bmtl, g_px_bfmt, g_px_bw, g_px_bh, (unsigned long)dst.width, (unsigned long)dst.height, i);
++    else
++        MLOG("[presidx] f=%llu blit src ser=%llu base_fmt=0x%x mtl=%p fmt=0x%x %ux%u drawable=%lux%lu", (unsigned long long)g_px_bf,
++             (unsigned long long)g_px_bser, g_px_bfmt, g_px_bmtl, g_px_bfmt, g_px_bw, g_px_bh, (unsigned long)dst.width, (unsigned long)dst.height);
++    void *wm = NULL;
++    pthread_mutex_lock(&g_px_mu);
++    for (int k = 1; k <= PX_WRING && !wm; k++) {
++        int q = (g_px_wrnext - k + PX_WRING * 2) % PX_WRING;   // 从最近一条往回找这一帧的最后一个写者
++        if (g_px_wring[q].on && g_px_wring[q].f == g_px_bf) wm = g_px_wring[q].mtl;
++    }
++    pthread_mutex_unlock(&g_px_mu);
++    MLOG("[presidx] f=%llu POINTER_SAME=%d", (unsigned long long)g_px_bf, wm && wm == g_px_bmtl ? 1 : 0);
++}
++void nvn_be_xv_window_tex(uint64_t serial) { int seen = xv_present(serial); if (!seen && g_xv_npresent < 128) g_xv_present[g_xv_npresent++] = serial; if (!seen) px_sc_note(serial); }   // Window (swapchain) texture: never enters the ledger  // presidx：登记为交换链条目
+ void xv_test_counts(int *dc, int *viol) { if (dc) *dc = (int)g_xv_dc; if (viol) *viol = (int)g_xv_viol; }
+ static void sd_finish(void);
+ // Load elision (fully covering first draw): if the draw that opens the pass can be proven to cover a color attachment in full (first_draw_covers), that attachment's load becomes DontCare -
+@@ -5619,18 +5909,33 @@ static void defer_fallback(void);
+ static int g_el_w, g_el_h, g_el_draws; static char g_el_key[12];
+ static int enc_label_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_ENC_LABEL"); v = e && atoi(e); } return v; }
+ static int g_nbcrt; static void bcrt_flush(void);   // shadows of block-compressed render targets used by the open pass (see bcrt_attach)
++// 2026-11-18 litzero：延迟光照这一遍的输入 / 输出探针（实现在 draw 之前，见 [lit] 那一段）
++#pragma clang attribute pop   // 这几个声明与它们的定义都放在 objc_externally_retained 区外（非 ARC 下该属性只会刷警告）
++static void lz_fb_add(const char *key);   // 追加 C：从 fallback 翻译装载的 shader key（shader_load 里记）
++static void lz_drain(void);        // 上一次开遍前：这次提交已完成就读回上一帧光照那遍的 1x1 / 8x8 拷贝
++static void lz_pre_end(void);      // 遍末、sd_finish 之前：记下本遍附件的 g_sd 下标（store 决定在 sd_finish 里）
++static void lz_post_end(void);     // 编码器结束后：把 G-buffer 输入 1x1、颜色附件 8x8 拷进 shared 缓冲
++static void lz_att_begin(int slot, id<MTLTexture> t, NSUInteger lv, NSUInteger sl, uint64_t ser);   // 开遍时记下真正挂上去的附件视图（链路时间线要它的 ser）
++static void lz_att_clear(void);
++#pragma clang attribute push(__attribute__((objc_externally_retained)), apply_to = function)
+ static void rp_end(void) { if (!g_rlane) geo_run_flush(); if (g_enc) { AP_B;
+     if (enc_label_on()) { static uint64_t lf = ~0ull, base; uint64_t f = atomic_load(&g_cur_frame); if (f != lf) { lf = f; base = g_stat_pass - 1; }   // Intra-frame serial: the same pass has the same name every frame, so the table can aggregate by name
+         [(id)g_enc setLabel:[NSString stringWithFormat:@"p%02llu %dx%d %s d%d", (unsigned long long)(g_stat_pass - base), g_el_w, g_el_h, g_el_key[0] ? g_el_key : "-", g_el_draws]]; }
+ #ifdef NVN_RT_RANGE_TEST
+     int ranged=g_rt_range_active && !g_rt_range_pending;
+ #endif
+-    sd_finish(); enc_r_end_pass(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
++    lz_pre_end();
++    px_writer_end();   // presidx：本遍写的是 window 交换链 → 遍末打 writer 行（带本遍片元 key）
++    // 2026-11-18 litzero2：lz_post_end 要开 blit 编码器（拷 1×1 / 8×8）；必须等 g_enc = nil 之后再调。
++    //   原来放在 enc_r_end_pass(g_enc) 之后、g_enc = nil 之前 —— blit() → blit_raw() 看见 g_enc 还非空，
++    //   又调 rp_end() → lz_post_end() → blit() … 每层一个 rp_end 大栈帧，真机 300 帧一到就 ___chkstk_darwin 崩（SIGBUS）。
++    sd_finish(); enc_r_end_pass(g_enc); zskip_commit_clears(); g_enc = nil; lz_post_end(); g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
+     if (g_nubd && g_nubd >= ubd_lazy()) ubd_flush();   // the inline updates deferred in this pass, in order (see mtl_sub_update); across passes they wait for the next copy or dispatch (blit_raw)
+     if (g_nbcrt) bcrt_flush();   // blocks drawn into shadows go back into their compressed textures
+ #ifdef NVN_RT_RANGE_TEST
+     rr_finish(ranged);
+ #endif
++    lz_att_clear();
+     AP_E(0);
+ } }
+ // The format an attachment is actually attached with: the view's format if the view changes the format and can be attached, otherwise the base texture's. Shared by attaching (attach) and pipeline prediction (pso_predict_rest) so both agree --
+@@ -5993,6 +6298,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
+     if (rt_range_on()) { reg0 = g_reg_gen; ser0 = g_ser_gen; }
+     if (rt_range_on()) dirty0=nvn_dirty_now();
+     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
++    lz_drain();   // 2026-11-18 litzero：上一帧光照那遍的拷贝已随提交完成，这里读回打 in / out
+     MTL4RenderPassDescriptor *pd = pass_desc();
+     int any = 0;
+     for (int i = 0; i < R.rt.n; i++) {
+@@ -6000,6 +6306,8 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
+         if (rt_dup_slot(&R.rt, i)) continue;   // a slot attached twice is not attached (see rt_dup_slot)
+         attach(pd.colorAttachments[i], R.rt.color[i], &R.rt.cview[i], R.rt.has_cview[i]);
+         if (!pd.colorAttachments[i].texture) continue;
++        lz_att_begin(i, pd.colorAttachments[i].texture, (NSUInteger)pd.colorAttachments[i].level, (NSUInteger)pd.colorAttachments[i].slice, R.rt.color[i] ? R.rt.color[i]->serial : 0);
++        px_att(i, pd.colorAttachments[i].texture, R.rt.color[i] ? R.rt.color[i]->serial : 0);   // presidx：本帧写者集合（尺寸 = 交换链尺寸的颜色附件）
+         any = 1;
+         pd.colorAttachments[i].loadAction = R.clear_c[i] ? MTLLoadActionClear : MTLLoadActionLoad;
+         if (!R.clear_c[i] && (g_noload_mask >> i & 1) && !(g_fb_want_load >> i & 1) && !bcrt_is(pd.colorAttachments[i].texture)) {   // proven unwritten to the pass end: no load (see g_noload_mask)
+@@ -6097,6 +6405,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
+         MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[i];
+         if (!c.texture) continue;
+         uint64_t b = att_bytes(c.texture, c.level); natt++; g_bw_store += b; if (c.loadAction == MTLLoadActionLoad) { g_bw_load += b; nload++; }
++        px_writer_note(c.texture, R.rt.color[i]->serial);   // presidx：颜色附件是 window 交换链纹理 → 记这一遍的写者
+         if (R.rt.has_cview[i] && R.rt.cview[i].set_format) PD("V %llu c%d view format %#x (base texture NVN format %#x)", g_stat_pass + 1, i, R.rt.cview[i].format, R.rt.color[i]->d.format);
+         PD("P %llu c%d ser=%llu fmt=%lu %lux%lu ms%lu lv%lu sl%lu %s mtl=%p", g_stat_pass + 1, i, R.rt.color[i]->serial, (unsigned long)c.texture.pixelFormat,
+            (unsigned long)c.texture.width, (unsigned long)c.texture.height, (unsigned long)c.texture.sampleCount, (unsigned long)c.level, (unsigned long)c.slice,
+@@ -6296,7 +6605,8 @@ static void shmap_load_once(void) {
+ 
+ @interface NvShader : NSObject { @public id<MTLLibrary> ft_lib; uint8_t ft_tried; id<MTLLibrary> bf_lib; uint8_t bf_tried;   // bf_lib: the readable-tile version <key>_bf, looked up once by name (bf_fn)
+     __weak id<MTLLibrary> plib;   // the library fn came from (#1001 two-level build probe, spec_probe: Metal 4 names a function by library + name)
+-    id<MTLFunction> fn, tf_fn, fn_u, geo_fn;   // fn_u: the integer-output entry point (dmsh_build.py fs_uint), for pipelines whose unsigned integer attachments are exactly u_mask (pso_desc)
++    id<MTLFunction> fn, tf_fn, fn_u, geo_fn;   // fn_u: the integer-output entry point main0_u (Dsh.cs FsUint) — every pixel shader has one now; pipelines take it through fs_u_fn (per-target function constants), never this object directly
++    id<MTLLibrary> u_lib; NSString *u_entry_n; NSMutableDictionary<NSNumber *, id> *u_fns;   // S2Arm #427 arch: main0_u's library and entry name, and its specializations by (target classes 208+n/224+n, alpha test, multisampling off) — fs_u_fn; NSNull = a set that failed to build
+     uint8_t s_rec, warm_claimed;   // submit-thread first-use / prewarm handoff counters
+     uint8_t gmem_use;   // 0 未判 / 1 不绑原始内存池表 / 2 绑（gmem_uses：动态占比计数用）
+     uint8_t tensor, tensor_log;   // HMMA: 1 = spatial stand-in, 2 = none, 3 = native SIMD-group matrix ABI 1; 0 = not checked
+@@ -6304,7 +6614,7 @@ static void shmap_load_once(void) {
+     uint16_t tensor_srgb;   // HSETP2 Rd, Ra, 0.04045 (nvn2_srgb_count): its output is the sRGB decode (to linear) of what it reads plus the network's residual, the stand-in decodes its input (nvn_tensor.inc)
+     id<MTLLibrary> at_lib; NSString *at_main, *at_u; NSMutableDictionary<NSNumber *, id<MTLFunction>> *at_fns; uint8_t has_atms;   // gap families 34 / 37: a fragment main0 declaring S2A_AT / S2A_MSOFF (Dsh.cs FsAlphaMs): its library and entry names, specialized per (u, at, msoff) on demand (fs_atms_fn)
+     int load_depth_zero;   // captured with the identity, also used by its layer variant
+-    uint8_t u_mask;   // S2Arm gap 2 A: the colour outputs fn_u returns as uint, bit n = color(n) (json u_mask; dmsh_build.py fs_uint turns only the integer-bit writers)
++    uint8_t u_mask;   // S2Arm gap 2 A: kept as the json's heuristic mask (bit n = the shader's code looks like an integer writer for color(n)); the pipeline no longer compares against it — see fs_u_fn
+     uint16_t tf_stride[4]; uint32_t cb_ext[16], sb_ro; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, afr, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
+     uint32_t geo_vertices, geo_invocations, geo_output, geo_stride, geo_index_stride;
+     // NVN2 task / mesh shader (json msl_entry_kind object / mesh, at stage 3 / 4; nvn_geometry.inc mesh_tasks_draw): mesh_kind 1 object 2 mesh (0 = neither); its workgroup's threads,
+@@ -6334,6 +6644,8 @@ static void shmap_load_once(void) {
+     uint8_t ab_ub;   // #968: that encode bound an s2a_flags.yzw copy (ub_support, an arena block of its submission): reused only within the same submission (ab_size_sub)
+     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn;   // bflib: readable-tile version <key>_bf (merge B step 2)
+     uint64_t mis[4];   // mis: texture slots 0-255 already reported for a type mismatch (tex_mis_note)
++    uint16_t ur[16]; uint8_t ur_n;   // S2Arm #427 [uint-read]：这支 MSL 里被声明成 texture…<uint|int> 的纹理槽（json u_read，Dsh.cs UintRead；这是包里唯一可靠来源）。
++                                     //   encode_args_ 对这些槽原样绑整数纹理（不建 float 视图、不排队升级）：读回就是整数，8/16 位整数在 apple10 上按 float 声明读是 UB（读到 0）。ur_n 而不是 0 判「有」：槽 0 是合法纹理槽
+     uint64_t d2d[4];   // texture slots 0-255 whose sampler type the offline translation did not know and took as 2D (library resolution_scale_reasons "unknown_missing_fact:sampler_type:...slot=N"; audit #1534 P1-20 probe)
+     NSString *ventry, *fnpfx; id<MTLFunction> vfn; int vfn_state;   // fnpfx: a batched library's function name prefix s<key>_ (json fn_prefix, dmsh_build.py unity_flush); ventry stays the logical entry name
+     uint32_t spill, spill_slot;
+@@ -6706,6 +7018,56 @@ static NSString *msl_note(NSString *pc, NSString *src) {
+     return helpers ? [NSString stringWithFormat:@"%@ fallback translation, %ld lines, fnv %016llx, main0 body %ld lines, split into %d helpers%s", pc, lines, (unsigned long long)h, body, helpers, optnone ? ", optnone" : ""]
+                    : [NSString stringWithFormat:@"%@ fallback translation, %ld lines, fnv %016llx, main0 body %ld lines, %s%s", pc, lines, (unsigned long long)h, body, v, optnone ? ", optnone" : ""];
+ }
++// S2Arm #427 [uint-read]：按 key 找这支着色器翻出来的 MSL 源文里那一行 `// s2a:uint-read <reg,reg,…>`（Dsh.cs UintRead 写在文件头），
++//   返回写进 out 的纹理槽号（0 = 没有这行 / 源文不在；"-" 表示这一版没改写任何槽）。这些槽在 MSL 里声明成 texture…<uint|int>，读回就是整数
++//   （译出来的 as_type<uint>(<贴图>.read(…)) 被化简掉了），所以宿主必须把整数纹理原样绑上去：不建 float 视图、不排队升级。
++//   这一版起反射 json 的 "u_read" 是**主来源**（包里只有 metallib，没有 .metal），这里只作兜底（旧翻译器产物 / 有源文的兜底目录）。
++//   候选目录与 msl_discard_probe 同口径：库目录（DM_MSL_DIR/b-<chain>）、DM_MSL_FALLBACK、DM_MSL_DIR、DM_MSL_DIR/wire
++static int msl_uint_read_probe(NSString *pc, uint16_t *out, int cap) {
++    if (!pc.length || !out || cap <= 0) return 0;
++    NSMutableArray<NSString *> *dirs = [NSMutableArray array];
++    if (g_msl_dir) [dirs addObject:g_msl_dir];
++    const char *fb = getenv("DM_MSL_FALLBACK"), *md = getenv("DM_MSL_DIR");
++    if (fb && *fb) [dirs addObject:@(fb)];
++    if (md && *md) { [dirs addObject:@(md)]; [dirs addObject:[@(md) stringByAppendingPathComponent:@"wire"]]; }
++    for (NSString *d in dirs) {
++        NSString *src = [NSString stringWithContentsOfFile:[NSString stringWithFormat:@"%@/%@.metal", d, pc] encoding:NSUTF8StringEncoding error:nil];
++        if (!src) continue;
++        for (NSString *ln in [src componentsSeparatedByString:@"\n"]) {
++            if (![ln hasPrefix:@"// s2a:uint-read "]) continue;   // 17 个字符的前缀
++            NSString *t = [[ln substringFromIndex:17] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
++            int n = 0;
++            for (NSString *f in [t componentsSeparatedByString:@","]) {
++                const char *q = f.UTF8String; int r = 0, any = 0;
++                while (*q >= '0' && *q <= '9') { r = r * 10 + (*q - '0'); q++; any = 1; if (r > 4096) break; }
++                if (!any || r > 4096) continue;   // "-" 或垃圾
++                int dup = 0; for (int i = 0; i < n; i++) dup |= out[i] == (uint16_t)r;
++                if (!dup && n < cap) out[n++] = (uint16_t)r;
++            }
++            return n;   // 只认第一行（UintRead 保证整份源码只写一行）
++        }
++        return 0;   // 源文在、里面没有这行
++    }
++    return 0;
++}
++// 这个槽在不在 sh->ur[] 里（ur_n 判「有」，槽 0 合法）
++static int sh_ur_has(NvShader *sh, int reg) {
++    if (!sh || !sh->ur_n || reg < 0) return 0;
++    for (int i = 0; i < sh->ur_n; i++) if (sh->ur[i] == (uint16_t)reg) return 1;
++    return 0;
++}
++// [uintread] 命中行：每个 (key, 槽, 格式) 只打一次（真机日志里确认「读到的是整数纹理」）
++static struct { char key[24]; uint16_t reg; uint32_t fmt; } g_ur_seen[32];
++static int g_ur_nseen;
++static void uintread_log(const char *key, int reg, MTLPixelFormat pf) {
++    for (int i = 0; i < g_ur_nseen; i++)
++        if (g_ur_seen[i].reg == (uint16_t)reg && g_ur_seen[i].fmt == (uint32_t)pf && !strncmp(g_ur_seen[i].key, key ? key : "", sizeof g_ur_seen[0].key - 1)) return;
++    if (g_ur_nseen < (int)(sizeof g_ur_seen / sizeof g_ur_seen[0])) {
++        snprintf(g_ur_seen[g_ur_nseen].key, sizeof g_ur_seen[0].key, "%s", key ? key : "");
++        g_ur_seen[g_ur_nseen].reg = (uint16_t)reg; g_ur_seen[g_ur_nseen].fmt = (uint32_t)pf; g_ur_nseen++;
++    }
++    MLOG("[uintread] slot %d fmt 0x%lx → bind integer texture as is (shader %s)", reg, (unsigned long)pf, key ? key : "");
++}
+ static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero) {
+     NSError *e = nil; NSString *mnote = nil, *msrc = nil;   // #065090 msl_note
+     // S2Arm: a key missing from the library is looked up in DM_MSL_FALLBACK (the on-device fallback translation writes <key>_b.metal + .json there; iOS cannot store a metallib built at runtime)
+@@ -6744,7 +7106,7 @@ static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero
+     if (!lib && dir != g_msl_dir) {   // S2Arm fallback: MSL source compiled here, same options as the offline chain (dm_msl_opts)
+         NSString *sp = [NSString stringWithFormat:@"%@/%@.metal", dir, pc], *src = [NSString stringWithContentsOfFile:sp encoding:NSUTF8StringEncoding error:&e];
+         if (src) { MTLCompileOptions *co = dm_msl_opts(); t_lib_layer = [src containsString:@"render_target_array_index"]; lib = [g_dev newLibraryWithSource:src options:co error:&e]; mnote = msl_note(pc, src); msrc = sp; }
+-        if (lib) MLOG("shader %s loaded from the fallback translation (%s)", pc.UTF8String, fb);
++        if (lib) { MLOG("shader %s loaded from the fallback translation (%s)", pc.UTF8String, fb); lz_fb_add(pc.UTF8String); }   // 追加 C
+     }
+     if (!lib || !j) { MLOG("【红】 failed to load shader %s: %s", pc.UTF8String, e ? e.localizedDescription.UTF8String : "no reflection json"); return nil; }
+     if (![j[@"chain"] isEqual:@DMSH_CHAIN]) { MLOG("【红】 shader %s has translation chain version %s, but this host expects %s", pc.UTF8String, [[j[@"chain"] description] UTF8String], DMSH_CHAIN); return nil; }
+@@ -6837,7 +7199,7 @@ static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero
+         o->ts[o->nts++] = (typeof(o->ts[0])){(uint8_t)idx, (uint8_t)img, (uint8_t)reg};
+     }
+     if (stage == 5 && j[@"spill"]) { o->spill = [j[@"spill"] unsignedIntValue]; o->spill_slot = [j[@"spill_slot"] unsignedIntValue]; }   // shared-memory spill (dispatch)
+-    if (stage == 1 && j[@"entry_u"]) { o->u_mask = (uint8_t)[j[@"u_mask"] unsignedIntValue]; o->fn_u = [lib newFunctionWithName:fnn(o, j[@"entry_u"])]; if (!o->fn_u) MLOG("【红】 shader %s: no integer-output entry point %s in its library", pc.UTF8String, [j[@"entry_u"] UTF8String]); }
++    if (stage == 1 && j[@"entry_u"]) { o->u_mask = (uint8_t)[j[@"u_mask"] unsignedIntValue]; o->u_lib = lib; o->u_entry_n = fnn(o, j[@"entry_u"]); o->fn_u = [lib newFunctionWithName:o->u_entry_n]; if (!o->fn_u) MLOG("【红】 shader %s: no integer-output entry point %s in its library", pc.UTF8String, [j[@"entry_u"] UTF8String]); }   // S2Arm #427 arch: main0_u is specialized per pipeline (fs_u_fn: 208+n / 224+n); the translator emits it for every pixel shader
+     // Stages 3 / 4 are the tessellation control / evaluation shaders on Switch 1 and task / mesh on NVN2. A tessellation shader's json carries tess (handled below) and its
+     //   msl_entry_kind is vertex / kernel, which is right for it: the task / mesh contract (object / mesh functions, workgroup limits) is not its contract. Applied to it, the
+     //   kind check printed a false red line and the workgroup check found no threads, called the shader not usable and skipped its draws (#418: 19 red lines on a Switch 1 game)
+@@ -6874,7 +7236,7 @@ static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero
+         if (stage == 1 && o->fn.functionConstantsDictionary[@"S2A_AT"]) { o->has_atms = 1; o->at_lib = lib; o->at_main = fnn(o, entry); o->at_u = o->fn_u ? fnn(o, j[@"entry_u"]) : nil; }   // gap families 34 / 37 (fs_atms_fn)
+         NSError *fe = nil; id<MTLFunction> f = [lib newFunctionWithName:fnn(o, entry) constantValues:[MTLFunctionConstantValues new] error:&fe];
+         if (f) o->fn = f; else { MLOG("【红】 shader %s: specializing its function constants failed: %s", pc.UTF8String, fe.localizedDescription.UTF8String); return nil; }
+-        if (o->fn_u) { f = [lib newFunctionWithName:fnn(o, j[@"entry_u"]) constantValues:[MTLFunctionConstantValues new] error:&fe]; o->fn_u = f; }
++        if (o->fn_u) { id<MTLFunction> fu = [lib newFunctionWithName:fnn(o, j[@"entry_u"]) constantValues:[MTLFunctionConstantValues new] error:&fe]; if (fu) o->fn_u = fu; }   // the per-target constants are only set by fs_u_fn: an empty specialization may fail, keep the object
+     }
+     if (!shader_args_init(o)) return nil;
+     if (o->rf.has_c1) c1_store(o);
+@@ -6882,6 +7244,28 @@ static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero
+     for (NSString *f in [ext componentsSeparatedByString:@" "]) { int r = 0, n = 0;
+         if (sscanf(f.UTF8String, "%d:%d", &r, &n) == 2 && r >= 0 && r < 16 && n > 0) o->cb_ext[r] = (uint32_t)n;
+         else if (sscanf(f.UTF8String, "s%d", &r) == 1 && r >= 0 && r < 32) o->sb_ro |= 1u << r; }
++    // S2Arm 2026-11-18 A/B（默认不改行为）：S2A_SB_RO=0 时忽略 cb_extent.tsv 的 s 标记，storage 槽都按可写处理。
++    if (!s2a_sb_ro_on()) o->sb_ro = 0;
++    // S2Arm #427 [uint-read]：这份反射把哪些纹理槽声明成整数读回（json u_read，Dsh.cs UintRead）——**主来源**：包里只有 metallib / 反射，
++    //   没有 .metal，旧实现只问 .metal 所以真机命中 0 次。json 没有这个字段时才回头问盘（.metal 头行，兜底：旧翻译器产物 / 有源文的兜底目录）。
++    {
++        NSArray *ur = j[@"u_read"];
++        if ([ur isKindOfClass:[NSArray class]]) {
++            for (id v in ur) {
++                int r = [v isKindOfClass:[NSNumber class]] ? [v intValue] : -1;
++                if (r < 0 || r >= 256) { MLOG("【红】 shader %s: u_read entry %s is not a texture slot 0..255: ignored", pc.UTF8String, [[v description] UTF8String]); continue; }
++                int dup = 0; for (int i = 0; i < o->ur_n; i++) dup |= o->ur[i] == (uint16_t)r;
++                if (!dup && o->ur_n < (int)(sizeof o->ur / sizeof o->ur[0])) o->ur[o->ur_n++] = (uint16_t)r;
++            }
++        } else if (stage == 1) {   // 没有 u_read 字段：片元才读盘（每支都开 .metal 太贵），其他阶段只认反射
++            o->ur_n = (uint8_t)msl_uint_read_probe(pc, o->ur, (int)(sizeof o->ur / sizeof o->ur[0]));
++        }
++        if (o->ur_n) {
++            char csv[96]; int k = 0;
++            for (int i = 0; i < o->ur_n && k < (int)sizeof csv - 8; i++) k += snprintf(csv + k, sizeof csv - k, "%s%d", i ? "," : "", (int)o->ur[i]);
++            MLOG("[uintread] shader %s (stage %d): %d texture slot(s) declared texture…<uint|int> in its MSL (%s): bound as is, no float view", pc.UTF8String, stage, o->ur_n, csv);
++        }
++    }
+     return o;
+ }
+ // Wait for a shader another thread is building, lending that thread this one's urgency. A dispatch group has no owner, so the system cannot do it by itself: the submit thread used
+@@ -7844,6 +8228,181 @@ static id<MTLTexture> tex_float_fit(int tid, id<MTLTexture> t, uint64_t *rid) {
+     r->im = (void *)CFBridgingRetain(v); r->im_of = (__bridge void *)t; r->im_rid = v.gpuResourceID._impl;
+     *rid = r->im_rid; return v;
+ }
++// ====================================================================================================================
++// S2Arm 2026-11-18 fmtfix：纹理视图的格式映射表（表驱动，替代原来 uifit_pf 里逐条 case 的零散判断）。
++//   真机红行：`[uifit] slot 128 fmt 0xa → 0xe (shader 61df449c2c0998a8_b ser=280)`：
++//     0xa = R8Unorm（0..255 归一化无符号），0xe = R8Sint（有符号）——把 ≥128 的像素读成负数 → 角色材质错乱 / 全黑。
++//   根因：旧 uifit_pf 按「MSL 声明的数值类（b->dpf）」挑 Sint / Uint。归一化格式（Unorm / sRGB）永远是**无符号**，
++//   浮点格式只能**按位**读（也是无符号），所以符号性只能由**源格式**决定，和着色器声明无关。现在映射只查表。
++//
++//   表规（每一对都必须同字节宽）：Unorm → Uint、Snorm → Sint、sRGB → 对应 Uint、Float → Uint（取位）、已是 Uint/Sint → 不变。
++//   返回 0（Invalid，不建视图、保留原样并打红行）的：depth / stencil / 压缩 / RG11B10Float / RGB9E5 / BGR10A2 等
++//   没有同宽整数兄弟的格式；BGRA8 也没有 —— Metal **没有** BGRA8Uint 这个格式（只有 BGRA8Unorm / BGRA8Unorm_sRGB），
++//   所以 BGRA 顺序的 8 位无符号整数视图根本不存在，只能保持原样（见 tex_uint_fit 里的专门原因）。
++//
++//   单一来源：S2A_FMT_BITS_LIST 同时给出「格式 → 每像素位数」与格式名；运行期 s2a_fmt_bits / s2a_fmt_name、
++//   编译期 _Static_assert、以及表里每行的 bits 字段都从它生成，不会再出现「映射到别的宽度 / 别的符号性」。
++// ====================================================================================================================
++#define S2A_FMT_BITS_LIST(X) \
++    X(R8Unorm, 8) X(R8Unorm_sRGB, 8) X(R8Snorm, 8) X(R8Uint, 8) X(R8Sint, 8) \
++    X(RG8Unorm, 16) X(RG8Snorm, 16) X(RG8Uint, 16) X(RG8Sint, 16) \
++    X(RGBA8Unorm, 32) X(RGBA8Unorm_sRGB, 32) X(RGBA8Snorm, 32) X(RGBA8Uint, 32) X(RGBA8Sint, 32) \
++    X(BGRA8Unorm, 32) X(BGRA8Unorm_sRGB, 32) \
++    X(R16Unorm, 16) X(R16Snorm, 16) X(R16Uint, 16) X(R16Sint, 16) X(R16Float, 16) \
++    X(RG16Unorm, 32) X(RG16Snorm, 32) X(RG16Uint, 32) X(RG16Sint, 32) X(RG16Float, 32) \
++    X(RGBA16Unorm, 64) X(RGBA16Snorm, 64) X(RGBA16Uint, 64) X(RGBA16Sint, 64) X(RGBA16Float, 64) \
++    X(R32Uint, 32) X(R32Sint, 32) X(R32Float, 32) \
++    X(RG32Uint, 64) X(RG32Sint, 64) X(RG32Float, 64) \
++    X(RGBA32Uint, 128) X(RGBA32Sint, 128) X(RGBA32Float, 128) \
++    X(RGB10A2Unorm, 32) X(RGB10A2Uint, 32)
++#define S2A_FMT_BITS_ENUM(nm, bits) S2A_FMTBITS_##nm = bits,
++enum { S2A_FMT_BITS_LIST(S2A_FMT_BITS_ENUM) };
++#undef S2A_FMT_BITS_ENUM
++// bit-per-pixel 表（唯一的宽度来源）；表外格式 → 0
++static int s2a_fmt_bits(uint32_t pf) {
++    switch (pf) {
++#define S2A_FMT_BITS_CASE(nm, bits) case MTLPixelFormat##nm: return bits;
++        S2A_FMT_BITS_LIST(S2A_FMT_BITS_CASE)
++#undef S2A_FMT_BITS_CASE
++        default: return 0;
++    }
++}
++// 日志用的短名（"R8Unorm" 这种，不带 MTLPixelFormat 前缀）；表外格式 → "?"
++static const char *s2a_fmt_name(uint32_t pf) {
++    switch (pf) {
++#define S2A_FMT_NAME_CASE(nm, bits) case MTLPixelFormat##nm: return #nm;
++        S2A_FMT_BITS_LIST(S2A_FMT_NAME_CASE)
++#undef S2A_FMT_NAME_CASE
++        default: return "?";
++    }
++}
++typedef struct { MTLPixelFormat src, view; uint8_t bits, sgn; } s2a_fmt_view_ent;   // sgn: 0 = 无符号视图（Uint），1 = 有符号视图（Sint）
++// 映射表全文（src → view）。行数 = [fmtfix] 启动行里的 N。
++#define S2A_FMT_VIEW_LIST(X) \
++    X(R8Unorm, R8Uint, 0) X(RG8Unorm, RG8Uint, 0) X(RGBA8Unorm, RGBA8Uint, 0) \
++    X(R16Unorm, R16Uint, 0) X(RG16Unorm, RG16Uint, 0) X(RGBA16Unorm, RGBA16Uint, 0) X(RGB10A2Unorm, RGB10A2Uint, 0) \
++    X(R8Snorm, R8Sint, 1) X(RG8Snorm, RG8Sint, 1) X(RGBA8Snorm, RGBA8Sint, 1) \
++    X(R16Snorm, R16Sint, 1) X(RG16Snorm, RG16Sint, 1) X(RGBA16Snorm, RGBA16Sint, 1) \
++    X(R8Unorm_sRGB, R8Uint, 0) X(RGBA8Unorm_sRGB, RGBA8Uint, 0) \
++    X(R16Float, R16Uint, 0) X(RG16Float, RG16Uint, 0) X(RGBA16Float, RGBA16Uint, 0) \
++    X(R32Float, R32Uint, 0) X(RG32Float, RG32Uint, 0) X(RGBA32Float, RGBA32Uint, 0) \
++    X(R8Uint, R8Uint, 0) X(R8Sint, R8Sint, 1) X(RG8Uint, RG8Uint, 0) X(RG8Sint, RG8Sint, 1) \
++    X(RGBA8Uint, RGBA8Uint, 0) X(RGBA8Sint, RGBA8Sint, 1) \
++    X(R16Uint, R16Uint, 0) X(R16Sint, R16Sint, 1) X(RG16Uint, RG16Uint, 0) X(RG16Sint, RG16Sint, 1) \
++    X(RGBA16Uint, RGBA16Uint, 0) X(RGBA16Sint, RGBA16Sint, 1) \
++    X(R32Uint, R32Uint, 0) X(R32Sint, R32Sint, 1) X(RG32Uint, RG32Uint, 0) X(RG32Sint, RG32Sint, 1) \
++    X(RGBA32Uint, RGBA32Uint, 0) X(RGBA32Sint, RGBA32Sint, 1) X(RGB10A2Uint, RGB10A2Uint, 0)
++static const s2a_fmt_view_ent fmt_int_view[] = {
++#define S2A_FMT_VIEW_ROW(a, b, s) { MTLPixelFormat##a, MTLPixelFormat##b, S2A_FMTBITS_##b, s },
++    S2A_FMT_VIEW_LIST(S2A_FMT_VIEW_ROW)
++#undef S2A_FMT_VIEW_ROW
++};
++enum { FMT_INT_VIEW_N = (int)(sizeof fmt_int_view / sizeof fmt_int_view[0]) };
++// 静态断言：每一对必须同字节宽（宽度取自上面同一张 bit-per-pixel 表）。再出现「映射到别的符号性 / 别的宽度」直接编不过。
++#define S2A_FMT_VIEW_ASSERT(a, b, s) \
++    _Static_assert(S2A_FMTBITS_##a == S2A_FMTBITS_##b, "fmt_int_view: " #a " -> " #b " is not the same byte width");
++S2A_FMT_VIEW_LIST(S2A_FMT_VIEW_ASSERT)
++#undef S2A_FMT_VIEW_ASSERT
++// 运行期首次校验一次（编译期断言之外的第二道门，mtl_init 调）：位宽必须非 0 且相等，否则红行。
++static void s2a_fmt_view_validate(void) {
++    int bad = 0;
++    for (int i = 0; i < FMT_INT_VIEW_N; i++) {
++        int a = s2a_fmt_bits((uint32_t)fmt_int_view[i].src), b = s2a_fmt_bits((uint32_t)fmt_int_view[i].view);
++        if (!a || a != b || a != (int)fmt_int_view[i].bits) {
++            MLOG("【红】[fmtfix] %s -> %s: bits %d / %d (table says %d): the integer view is not the same byte width",
++                 s2a_fmt_name((uint32_t)fmt_int_view[i].src), s2a_fmt_name((uint32_t)fmt_int_view[i].view), a, b, (int)fmt_int_view[i].bits);
++            bad++;
++        }
++    }
++    MLOG("[fmtfix] same-width integer view table validated (%d pairs)", FMT_INT_VIEW_N);
++    if (bad) MLOG("【红】[fmtfix] %d of %d format pairs fail the byte-width check (see the red lines above)", bad, FMT_INT_VIEW_N);
++}
++static const s2a_fmt_view_ent *uifit_row(MTLPixelFormat src) {
++    for (int i = 0; i < FMT_INT_VIEW_N; i++) if (fmt_int_view[i].src == src) return &fmt_int_view[i];
++    return NULL;
++}
++// 源格式 → 同字节宽、符号性正确的整数视图格式；表外格式 → Invalid（不建视图，保留原样并打红行）。
++static MTLPixelFormat uifit_pf(MTLPixelFormat src) {
++    const s2a_fmt_view_ent *e = uifit_row(src);
++    return e ? e->view : MTLPixelFormatInvalid;
++}
++// S2Arm uifit（S2A_UINT_FIT，默认开、=0 关）：
++//   真机红行：`[uintread] slot N … declared integer in its MSL but the bound texture has a float format 10` → 人物黑剪影
++//   （MSL 按 uint 读、实际绑的是浮点纹理，Metal 对这一读按未定义）。
++//   修法：为这种槽建**同字节宽**的整数视图再绑（格式查 fmt_int_view，符号性由源格式定，不再跟着 MSL 声明走）。
++//   视图按 (纹理 ID, 目标格式) 缓存；失败按具体原因返回（视图不支持 / 格式对不成立 / usage 缺 PixelFormatView / 建视图失败），
++//   usage 缺 PixelFormatView 时先补 usage 再重试一次，补不上就登记 g_imfit_pend，下一段 pass 之前补齐。
++static int uifit_on(void) {
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("S2A_UINT_FIT"); v = !(e && !strcmp(e, "0")); }
++    return v;
++}
++// 视图缓存：按 (纹理 ID, 目标格式) 一份（同 tex_float_fit 的口径：CFBridgingRetain 持有，换掉时 defer_obj_unref + CFRelease）
++typedef struct { int tid; uint32_t pf; void *of; void *view; uint64_t rid; } uifit_ent;
++static uifit_ent g_uifit[64]; static int g_uifit_n;   // 建过的视图（每份都 CFBridgingRetain 持有）
++// 每槽（slot + 源格式 + 目标格式）首次一行：带格式名、位宽、符号性（装机判据就是这一行）。
++static void uifit_log(int reg, MTLPixelFormat from, MTLPixelFormat to, const char *key, uint64_t ser) {
++    static struct { int reg; uint32_t a, b; } seen[32]; static int n;
++    for (int i = 0; i < n; i++) if (seen[i].reg == reg && seen[i].a == (uint32_t)from && seen[i].b == (uint32_t)to) return;   // 每种组合首次
++    if (n < (int)(sizeof seen / sizeof seen[0])) { seen[n].reg = reg; seen[n].a = (uint32_t)from; seen[n].b = (uint32_t)to; n++; }
++    const s2a_fmt_view_ent *e = uifit_row(from);
++    MLOG("[uifit] slot %d fmt 0x%lx(%s) → 0x%lx(%s) bits=%d signed=%s shader=%s ser=%llu", reg,
++         (unsigned long)from, s2a_fmt_name((uint32_t)from), (unsigned long)to, s2a_fmt_name((uint32_t)to),
++         e ? (int)e->bits : 0, (e && e->sgn) ? "yes" : "no", key ? key : "-", (unsigned long long)ser);
++}
++// why：失败的具体原因（给调用处打红行用）。
++//   usage 缺 MTLTextureUsagePixelFormatView 时：没开 pass（g_enc 为空）就当场补 usage 再重试一次；
++//   开着 pass（绑定都在这时，不能在 pass 里拷贝）只能登记升级（img_fit 的同一套 g_imfit_pend），
++//   下一段 draw 之前补齐，到时这一槽就成功（真机日志已证明）。Caller holds g_rmu
++static id<MTLTexture> tex_uint_fit(int tid, int reg, const char *key, id<MTLTexture> t, uint64_t *rid, char *why, size_t whyn) {
++    if (why && whyn) why[0] = 0;
++    if (!t) { if (why) snprintf(why, whyn, "槽上没有纹理"); return nil; }
++    if (tid < 0 || tid >= g_ntreg) { if (why) snprintf(why, whyn, "纹理 ID %d 不在登记表里", tid); return nil; }
++    if (t.textureType == MTLTextureTypeTextureBuffer) { if (why) snprintf(why, whyn, "视图不支持：纹理缓冲区（texture buffer）没有 2D 视图"); return nil; }
++    MTLPixelFormat pf = uifit_pf(t.pixelFormat);
++    if (pf == MTLPixelFormatInvalid) {
++        if (why) {
++            if (t.pixelFormat == MTLPixelFormatBGRA8Unorm || t.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB)
++                snprintf(why, whyn, "Metal 没有 BGRA8Uint（只有 BGRA8Unorm / BGRA8Unorm_sRGB）：BGRA 顺序的 8 位无符号整数格式不存在，建不出同宽无符号视图");
++            else snprintf(why, whyn, "格式对不成立：0x%lx(%s) 没有同字节宽的整数兄弟（表外格式：depth / stencil / 压缩 / RG11B10Float / RGB9E5 / BGR10A2 等）",
++                          (unsigned long)t.pixelFormat, s2a_fmt_name((uint32_t)t.pixelFormat));
++        }
++        return nil;
++    }
++    id<MTLTexture> base = t.parentTexture ? t.parentTexture : t;
++    if (!(base.usage & MTLTextureUsagePixelFormatView)) {
++        if (!g_enc) {   // 没开 pass：先补 usage（tex_upgrade_pfv）再重试一次
++            id<MTLTexture> up = tex_upgrade_pfv(&g_treg[tid].t, base, pf);
++            if (up) { base = up; while (base.parentTexture) base = base.parentTexture; }
++        }
++        if (!(base.usage & MTLTextureUsagePixelFormatView)) {
++            int seen = 0; for (int i = 0; i < g_imfit_npend; i++) seen |= g_imfit_pend[i] == tid;
++            if (!seen && g_imfit_npend < 16) g_imfit_pend[g_imfit_npend++] = tid;
++            if (why) snprintf(why, whyn, "usage 缺 MTLTextureUsagePixelFormatView（当前 0x%lx；已排队升级，下一段 pass 之前补齐，到时这一槽就成功）", (unsigned long)base.usage);
++            return nil;
++        }
++    }
++    for (int i = 0; i < g_uifit_n; i++)
++        if (g_uifit[i].tid == tid && g_uifit[i].pf == (uint32_t)pf && g_uifit[i].of == (__bridge void *)base) {
++            *rid = g_uifit[i].rid; return (__bridge id<MTLTexture>)g_uifit[i].view;
++        }
++    NSUInteger l0 = t.parentTexture ? t.parentRelativeLevel : 0, s0 = t.parentTexture ? t.parentRelativeSlice : 0;
++    NSUInteger ns = t.textureType == MTLTextureType3D ? 1 : t.arrayLength * (t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray ? 6 : 1);
++    id<MTLTexture> v = [base newTextureViewWithPixelFormat:pf textureType:t.textureType levels:NSMakeRange(l0, t.mipmapLevelCount) slices:NSMakeRange(s0, ns)];
++    if (!v) {
++        if (why) snprintf(why, whyn, "建视图失败：0x%lx(%s) → 0x%lx(%s)（Metal 不接受这一对格式 / 类型）",
++                          (unsigned long)t.pixelFormat, s2a_fmt_name((uint32_t)t.pixelFormat), (unsigned long)pf, s2a_fmt_name((uint32_t)pf));
++        return nil;
++    }
++    uifit_ent *e = NULL;
++    if (g_uifit_n < (int)(sizeof g_uifit / sizeof g_uifit[0])) e = &g_uifit[g_uifit_n++];
++    else { static int ev; e = &g_uifit[ev++ % (int)(sizeof g_uifit / sizeof g_uifit[0])];
++           if (e->view) { defer_obj_unref((__bridge id)e->view); CFRelease(e->view); } }
++    e->tid = tid; e->pf = (uint32_t)pf; e->of = (__bridge void *)base;
++    e->view = (void *)CFBridgingRetain(v); e->rid = v.gpuResourceID._impl;
++    uifit_log(reg, t.pixelFormat, pf, key, g_treg[tid].t.serial);
++    *rid = e->rid; return v;
++}
+ // Only bindings with actual native atomic calls lose texture compression. Do
+ // this before opening an encoder, preserving all texels and shared pool views.
+ // st: the NVN stage whose bindings these are (S.img / S.ubo of that stage). IMG and IMGU (handle in a uniform buffer) both: the texture ID as encode_args binds it (img_tid);
+@@ -8650,6 +9209,30 @@ static uint32_t pso_int_need(const pso_key *k, NvShader *fs, int merged) {
+     }
+     return m;
+ }
++// S2Arm 2026-11-18 A1 第一步（同 nxnative pso_cls 的 decl）：main0 为每个输出**声明**的类，位 n = color(n) 声明为整数。
++//   我们的反射没有 nxnative 的 fcols / ucols / scols 三个类掩码，只有 u_mask（翻译器启发式：位 n = 这支 ps 的代码看起来
++//   往 color(n) 写整数），所以声明类只能区分「浮点 0」与「整数 1（无符号）」；带符号声明这里按整数算（sint 附件仍由附件类给 8+n 位）。
++//   u_mask 缺省 0 = 全部浮点，等于旧行为。
++static uint32_t pso_cls_decl(NvShader *fs) {
++    uint32_t d = 0;
++    if (fs) for (int n = 0; n < 8; n++) if ((fs->u_mask >> n) & 1) d |= 1u << n;
++    return d;
++}
++// A1 第二步：管线里任一附件的类 != main0 为那个输出声明的类 → 1（nxnative pso_cls 的 need |= kind != decl）。
++//   「附件是整数」时 pso_int_need 本来就非 0；这一条补的是另一半：**main0 声明整数、附件是浮点**——那时 need==0，
++//   旧的 pso_desc 直接用 float main0（声明却是整数）→ Metal 拒建或静默写未定义；现在换成 main0_u（cls=0 = 全 float 成员）。
++static int pso_cls_mismatch(const pso_key *k, NvShader *fs, int merged) {
++    if (!fs) return 0;
++    uint32_t decl = pso_cls_decl(fs);
++    for (int i = 0; i < 8; i++) {
++        if (!k->cfmt[i]) continue;
++        int l = merged ? k->lmap[i] : i;
++        if (l == 0xff || l > 7 || (fs->rf.color_known && !(fs->rf.color_mask >> l & 1))) continue;
++        int kind = pf_int_kind((MTLPixelFormat)k->cfmt[i]), d = (decl >> l) & 1 ? 1 : 0;
++        if (kind != d) return 1;
++    }
++    return 0;
++}
+ // S2Arm: the fragment output interface the pipeline needs beyond the library's main0: the integer outputs (pso_int_need) and PSO_FOUT_DUAL when attachment 0 blends with the second
+ //   source (pso_dual_source, nvn_pso_skey.h): both come from the typed-output entry main0_t<u>_<s> (fs_typed_fn / pso_fout_variant)
+ static uint32_t pso_fout_need(const pso_key *k, NvShader *fs, int merged) { return pso_int_need(k, fs, merged) | (pso_dual_source(k, merged) ? PSO_FOUT_DUAL : 0); }
+@@ -8671,6 +9254,49 @@ static uint8_t pso_color_round_mask(const pso_key *k, NvShader *fs, int merged)
+ // S2Arm: the fragment shader's typed-output entry point for this need mask: cached, else loaded from the fallback directory's <key>_t<u>_<s>.metal that an earlier pso_fout_variant wrote (this run or
+ // an earlier one: the background prewarm of a recorded pipeline has no guest program to translate from, but the variant is on disk). nil when there is none. Pipelines are built on several threads
+ static pthread_mutex_t g_fnt_mu = PTHREAD_MUTEX_INITIALIZER;
++// S2Arm #427 arch (2026-11-17): the bool function constants that pick main0_u's per-colour member (Dsh.cs S2A_UINT_FC / S2A_SINT_FC).
++//   Set BY INDEX: iPhone Metal puts a function constant in its library's namespace (the metallib names it <hash>::S2A_UI0), so
++//   setConstantValue:…withName: is silently ignored — every member then stays float and an integer target gets undefined values.
++//   100 / 101 are S2A_AT / S2A_MSOFF (Dsh.cs FC_DECL) and stay by name: they are optional constants that main0 / main0_u read through
++//   is_function_constant_defined, so a value is only given when the pipeline actually has an alpha test / multisampling off.
++#define S2A_UINT_FC 208
++#define S2A_SINT_FC 224
++// S2A_UMASK=0: the pre-arch route (pso_desc takes <key>_ft's main0_t<u>_<s> typed variants only), kept as an A/B switch.
++static int s2a_umask_on(void) { const char *e = getenv("S2A_UMASK"); return !(e && *e && !strcmp(e, "0")); }
++// S2Arm #427 arch: main0_u specialized for THIS pipeline's colour target classes — bit n = target n unsigned (FC 208+n), bit 8+n = signed
++//   (FC 224+n), a colour with neither gets the float member (Dsh.cs FsUintEntry: the entry holds float / uint / int members for every
++//   colour, each by its constant). Every pixel shader has this entry now (the translator no longer guesses which ones write integers), so
++//   the pipeline's formats alone decide. Before this the entry was used only when the pipeline's integer set exactly equalled the mask the
++//   build guessed from the shader's code; any other set fell back to main0 (float4 against an RGBA8Uint attachment / undefined integer
++//   targets), which is what Trails in the Sky 1st's G-buffer hit (float colour 0, RGBA8Uint 1..3: the lighting pass read zeros = black 3D).
++//   Also carries the alpha test / multisampling-off constants when the shader declares them (fs->has_atms), so a pipeline with both an
++//   integer target and an alpha test needs no second entry point. Cached per (classes, at, msoff), NSNull = that set failed to build.
++//   Called on the submit thread and by the prewarm.
++static id<MTLFunction> fs_u_fn(NvShader *fs, uint32_t cls, int at, int msoff) {
++    cls &= 0xffffu;
++    // 2026-11-18 A1：cls == 0 也要能特化（全 float 成员 = main0 的输出类型，但走 main0_u 的函数体）：这就是
++    //   「main0 声明整数、附件是浮点」那一类的修法（nxnative side_spec 同样接受全假）。以前 `|| !cls` 让这条永远拿不到入口。
++    if (!fs || !fs->u_lib || !fs->u_entry_n) return nil;
++    NSNumber *key = @(cls | (uint32_t)(at ? 1 : 0) << 16 | (uint32_t)(msoff ? 1 : 0) << 17);
++    pthread_mutex_lock(&g_fnt_mu);
++    id c = fs->u_fns[key];
++    if (c) { pthread_mutex_unlock(&g_fnt_mu); return c == NSNull.null ? nil : c; }
++    MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
++    for (int n = 0; n < 8; n++) {   // every colour gets all its constants, those the function does not declare left aside by Metal (as nxnative's side_spec)
++        bool u = (cls >> n & 1) != 0, si = (cls >> (8 + n) & 1) != 0;
++        [cv setConstantValue:&u type:MTLDataTypeBool atIndex:S2A_UINT_FC + n];
++        [cv setConstantValue:&si type:MTLDataTypeBool atIndex:S2A_SINT_FC + n]; }
++    if (fs->has_atms) {   // 100 / 101, declared on main0 and main0_u (FC_DECL): a name for a constant the function does not declare raises
++        if (at) { int32_t a = at; [cv setConstantValue:&a type:MTLDataTypeInt withName:@"S2A_AT"]; }
++        if (msoff) { bool b = true; [cv setConstantValue:&b type:MTLDataTypeBool withName:@"S2A_MSOFF"]; } }
++    NSError *e = nil; id<MTLFunction> f = [fs->u_lib newFunctionWithName:fs->u_entry_n constantValues:cv error:&e];
++    if (!f) { static int nlog; if (nlog++ < 8) MLOG("【红】 fragment shader %s: main0_u specialized for target classes %#x (alpha test %d, multisampling off %d) failed to build: %s", fs->key, cls, at, msoff, e.localizedDescription.UTF8String); f = NSNull.null; }
++    else { static int nok; int k = ++nok; if (k <= 4 || !(k & (k - 1))) MLOG("[arch] main0_u specialized: %s classes=%#x at=%d msoff=%d (%d so far)", fs->key, cls, at, msoff, k); }
++    if (!fs->u_fns) fs->u_fns = [NSMutableDictionary dictionary];
++    fs->u_fns[key] = f;
++    pthread_mutex_unlock(&g_fnt_mu);
++    return f == NSNull.null ? nil : f;
++}
+ static id<MTLFunction> fs_typed_fn(NvShader *fs, uint32_t need) {
+     pthread_mutex_lock(&g_fnt_mu);
+     id f = fs->fn_t[@(need)];
+@@ -8937,13 +9563,35 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
+             if (hl) d.fragmentFunction = [hl newFunctionWithName:[NSString stringWithFormat:@"hl%d", i]];
+             break; } }
+     uint32_t need = fs && !fsfn && d.fragmentFunction == fs->fn ? pso_fout_need(k, fs, merged) : 0;
+-    if (need && fs->fn_u && need == fs->u_mask) d.fragmentFunction = fs->fn_u;   // the integer attachments are exactly the outputs main0_u turns (dmsh_build.py fs_uint u_mask)
+-    else if (need) { id<MTLFunction> t = fs_typed_fn(fs, need); if (t) d.fragmentFunction = t; }   // S2Arm: mixed float / integer targets, dual-source blending (pso_fout_variant)
++    // S2Arm 2026-11-18 A1：除了「附件是整数」（need 的低 16 位），「main0 声明的类 != 附件类」也要换带类型的片元入口。
++    int cls_mis = fs && !fsfn && d.fragmentFunction == fs->fn ? pso_cls_mismatch(k, fs, merged) : 0;
++    int u_typed = 0;   // this pipeline took main0_u (fs_u_fn), so its alpha test / multisampling-off constants are already set in it
++    if (need || cls_mis) {   // S2Arm 2026-11-17 arch + 2026-11-18 A1: main0_u types EACH colour by THIS pipeline's target formats
++        //   (fs_u_fn: 208+n unsigned / 224+n signed; cls == 0 = every colour on its float member), so any unsigned / signed / mixed set fits.
++        uint32_t cls = need & 0xffff;   // 只取附件类：main0_u 的输出类型必须等于附件的 Metal 格式（decl 不同的是那些位 → cls 位为 0，float 成员）
++        id<MTLFunction> t = s2a_umask_on() && !(need & PSO_FOUT_DUAL) ? fs_u_fn(fs, cls, k->at, k->msoff) : nil;   // dual-source blending stays on the typed variant
++        if (t) u_typed = 1;
++        else if (need) t = fs_typed_fn(fs, need);   // 只有附件类掩码与 <key>_ft 的 main0_t<u>_<s> 命名对得上；cls_mis 单发时不走这条
++        if (t) d.fragmentFunction = t;
++        if (fs) {   // A1 诊断：每 key 首次一行（前 128 条，之后每 256 条一条，避免刷屏）
++            static struct { char key[24]; } seen[256]; static int nkey;
++            int i = 0; for (; i < nkey; i++) if (!strcmp(seen[i].key, fs->key)) break;
++            if (i == nkey) {
++                if (nkey < (int)(sizeof seen / sizeof seen[0])) { snprintf(seen[nkey].key, sizeof seen[nkey].key, "%s", fs->key); nkey++; }
++                static int nlog; int kk = __atomic_add_fetch(&nlog, 1, __ATOMIC_RELAXED);
++                if (kk <= 128 || !(kk & 255))
++                    MLOG("[cls] %s decl=0x%x att=0x%x need=0x%x mis=%d -> %s", fs->key, pso_cls_decl(fs), cls, need, cls_mis,
++                         t ? (u_typed ? "main0_u" : "_ft") : "main0");
++            }
++        }
++        if (!t && (need || s2a_umask_on()))
++            RED_ONCE(152, "fragment shader %s: no entry point for target classes %#x (declared classes differ from the attachments: %d; main0_u and the typed variants both failed): the integer targets take undefined values", fs->key, cls, cls_mis); }
+     else if (k->fc && fs && d.fragmentFunction == fs->fn) {   // S2Arm #800: the sampler-emulation variant (se_want: never with integer outputs)
+         id<MTLFunction> f = se_fn(fs, k->fc); if (f) d.fragmentFunction = f; else MLOG("【红】 fragment shader %s: pipeline keyed for its sampler-emulation variant (bits %d), which is not there: main0", fs->key, k->fc); }
+-    if (fs && (k->at || k->msoff) && (d.fragmentFunction == fs->fn || (fs->fn_u && d.fragmentFunction == fs->fn_u))) {   // gap families 34 / 37: main0 / main0_u with the alpha test / full sample mask
++    int at_done = u_typed && (k->at || k->msoff) && fs->has_atms;   // fs_u_fn set 100 / 101 in the same specialization: no second entry point
++    if (fs && (k->at || k->msoff) && !at_done && (d.fragmentFunction == fs->fn || (fs->fn_u && d.fragmentFunction == fs->fn_u))) {   // gap families 34 / 37: main0 / main0_u with the alpha test / full sample mask
+         id<MTLFunction> f = fs_atms_fn(fs, d.fragmentFunction == fs->fn_u, k->at, k->msoff); if (f) d.fragmentFunction = f; }
+-    else if (fs && (k->at || k->msoff)) RED_ONCE(135, "fragment shader %s: alpha test %d / multisampling off %d on a variant entry point without the constants (typed / sampler-emulation / merged): drawn without them", fs->key, k->at, k->msoff);
++    else if (fs && (k->at || k->msoff) && !at_done) RED_ONCE(135, "fragment shader %s: alpha test %d / multisampling off %d on a variant entry point without the constants (typed / sampler-emulation / merged): drawn without them", fs->key, k->at, k->msoff);
+     if (vs && vs->layer_out && k->fsfn != GEO_MARK) d.inputPrimitiveTopology = vs->geo_output == 1 ? MTLPrimitiveTopologyClassPoint : vs->geo_output == 6 ? MTLPrimitiveTopologyClassLine : MTLPrimitiveTopologyClassTriangle;
+     if (vs && (k->fsfn == TF_MARK || k->fsfn == GEO_MARK)) { d.vertexFunction = k->fsfn == GEO_MARK ? vs->geo_fn : vs->tf_fn; d.fragmentFunction = nil; d.rasterizationEnabled = NO; }   // transform feedback capture (tf_draw)
+     d.rasterSampleCount = k->samples ? k->samples : 1;
+@@ -10997,7 +11645,39 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
+                 // any other mismatch: no texture there (Ryujinx's GetTargetTexture returns null for a target of other dimensions), so the zero texture of the declared type below.
+                 //   Bound as is it was undefined in Metal: a GPU fault can stall the queue for the whole run
+                 else { tex_mis_note(sh, nvn_stage, b->kind == NVN_RB_TEX ? reg : -1, tid, t, (MTLTextureType)b->dtt, "the slot reads 0 (the zero texture of the declared type, as Ryujinx leaves it unbound)"); t = nil; } }
+-            if (t && b->dpf == NVN_DPF_FLOAT && mtl_pf_dpf(t.pixelFormat) != NVN_DPF_FLOAT) { uint64_t r2 = 0; id<MTLTexture> v = tex_float_fit(tid, t, &r2); if (v) { t = v; trid = r2; } }   // see tex_float_fit
++            // S2Arm #427 [uint-read]：这支 MSL 把这个槽声明成 texture…<uint|int>（反射 u_read / .metal 头行兜底）：读回就是整数，绑定必须**原样给整数纹理**
++            //   —— 不建 float 视图（tex_float_fit 只补 32 位；8/16 位整数没有同位宽 float 视图，apple10 上按 float 声明读整数纹理是 UB、读到 0：空之轨迹
++            //   the 1st 的 G-buffer 后期光照全黑），也不排队格式视图升级（tex_float_fit 的 g_imfit_pend）；0.4.3 宿主没有输入侧变体 main0_i 那套，无需排除。
++            //   绑定本身不合法（纹理没有 shader read usage）→ 红行 + 退回旧路径（不静默画错）。
++            int ur = b->kind == NVN_RB_TEX && reg >= 0 && sh_ur_has(sh, reg);
++            if (ur && t) {
++                if (!(t.usage & MTLTextureUsageShaderRead)) {
++                    RED_ONCE(148, "[uintread] slot %d (shader %s, stage %d) is declared integer in its MSL but the bound texture cannot be sampled (usage %#lx): falling back to the old path",
++                             reg, sh->key, nvn_stage, (unsigned long)t.usage); ur = 0;
++                } else if (mtl_pf_dpf(t.pixelFormat) == NVN_DPF_FLOAT) {
++                    // S2Arm 2026-11-17 uifit：MSL 声明整数、实际绑浮点 → 建同字节宽整数视图再绑，否则 Metal 对这一读未定义
++                    //   （真机读到 0：人物黑剪影）。失败按**具体原因**打红行（视图不支持 / 格式对不成立 / usage 缺 PixelFormatView），
++                    //   保留原样；usage 那条已经在 tex_uint_fit 里排了升级，下一段 pass 之前补齐后这一槽就成功。
++                    uint64_t r2 = 0; char why[220] = "";
++                    id<MTLTexture> uv_t = uifit_on() ? tex_uint_fit(tid, reg, sh->key, t, &r2, why, sizeof why) : nil;
++                    if (uv_t) { t = uv_t; trid = r2; }
++                    else if (uifit_on()) {
++                        static struct { int reg; uint32_t pf; } seen[8]; static int n;
++                        int i = 0; for (; i < n; i++) if (seen[i].reg == reg && seen[i].pf == (uint32_t)t.pixelFormat) break;
++                        if (i == n) {   // 每个 (slot, 格式) 首次一行，带具体原因
++                            if (n < 8) { seen[n].reg = reg; seen[n].pf = (uint32_t)t.pixelFormat; n++; }
++                            MLOG("【红】[uifit] slot %d fmt 0x%lx 建不出同字节宽的整数视图（shader %s）：%s；保留原样，Metal 对这一读按未定义",
++                                 reg, (unsigned long)t.pixelFormat, sh->key, why[0] ? why : "原因不明");
++                        }
++                        uintread_log(sh->key, reg, t.pixelFormat);
++                    } else {
++                        RED_ONCE(149, "[uintread] slot %d (shader %s, stage %d) is declared integer in its MSL but the bound texture has a float format %lu: Metal leaves that read undefined, bound as is",
++                                 reg, sh->key, nvn_stage, (unsigned long)t.pixelFormat);
++                        uintread_log(sh->key, reg, t.pixelFormat);
++                    }
++                } else uintread_log(sh->key, reg, t.pixelFormat);
++            }
++            if (!ur && t && b->dpf == NVN_DPF_FLOAT && mtl_pf_dpf(t.pixelFormat) != NVN_DPF_FLOAT) { uint64_t r2 = 0; id<MTLTexture> v = tex_float_fit(tid, t, &r2); if (v) { t = v; trid = r2; } }   // see tex_float_fit
+             if (t && nvn_stage == 1 && afr_want(sh)) { uint64_t r2 = 0; id<MTLTexture> v = tex_alpha_red(tid, t, &r2); if (v) { t = v; trid = r2; } }   // see tex_alpha_red
+             size_abi_texture(sh, nvn_stage, b, tid, size_view, t);
+             rs_bind_check(t, sh, nvn_stage, 0);   // S2Arm internal resolution: read where scaling is not supported → back to 1 at the next safe point
+@@ -14440,6 +15120,791 @@ static int gmem_uses(NvShader *s) {
+ }
+ static void gmem_count_draw(NvProg *pr) { g_gmem_draws_all++; for (int i = 0; i < 5; i++) if (gmem_uses(pr->sh[i])) { g_gmem_draws++; break; } }
+ 
++// ---------- 2026-11-18 litzero：延迟光照这一遍的输入 / 输出摊开（真机诊断；S2A_LITZERO=0 关） ----------
++#pragma clang attribute pop   // 下面这段是诊断代码，不进 objc_externally_retained 区（非 ARC 下该属性只会刷警告）
++// 现场：屏幕 3D 全黑（房间与角色都黑），UI / 小地图 / 对话框 / 火焰正常，遮挡与深度正确；G-buffer 非 0
++//   （上一局观测：材质目标 mean 159.6、法线目标 mean 101；lightmap 一类有房间没角色）。编号每局重排，
++//   所以本段**一律按 key / 尺寸 / 格式 / 绑定关系识别，代码里没有任何写死的纹理编号**。
++//   推断「动态光照这一遍」输出恒 0：所有受光表面乘 0 变黑。这一段只读，不改绘制 / 绑定 / 管线 / 输出。
++// ① draw 里筛：颜色附件是 1600x900 一类场景 target，且片元槽里绑了 2~4 张「本帧先当过颜色附件的 target」
++//    或整数 / 法线格式的纹理（G-buffer）——打 [lit] 头行、片元常量缓冲、片元缓冲槽表；
++// ② 该遍结束时（rp_end，编码器已结束、store 已定）把 G-buffer 输入各拷 1x1 中心、颜色附件拷 8x8 中心到
++//    一块 shared 缓冲；下一次开遍前（这次提交已完成，g_done 到位）在 CPU 读回打 in / out 行。
++//    不在 draw 里同步读：当前提交还没交给 GPU，那时 finish 只能等到上一笔提交，G-buffer 会被读成 0（假阴性）。
++// 限频：frame ∈ [300, ∞)；读回每 300 帧一次；[lit]/[cs]/[dim] 每类每帧 ≤ 4 行、[chain] 每帧 ≤ 8 行；总上限 20000 行，
++//   到顶 / 任何一步失败就 [probe] disabled after <原因> 关掉全部探针。每帧最多 2 个详细块（输入更多的那一遍优先，各 in ≤ 4 / out ≤ 4）。
++//   S2A_LITZERO=0 关；S2A_LITZERO_KEY=<片元 key 前缀> 只对这一支片元取详细块（自动挑到别的遍时手动指定）。
++// 判读：in 非 0 而 out 全 0 → 光照计算为 0（常量 / 矩阵 / 光源列表）；cb head 全 0 → 常量缓冲没上传；
++//   buffers len=0 → 光源列表为空（light_cull 的 key 不匹配）；out mean>0 但屏幕黑 → 问题在更后面的合成。
++#define LZ_FRAME_LO 300ull
++#define LZ_FRAME_HI 1000000000ull   // 只有下限：诊断局用的帧号（3600 / 7200）也在范围内
++#define LZ_MAX_IN 4
++#define LZ_MAX_ATT 4
++#define LZ_SER_MAX 96
++#define LZ_SLOT_MAX 3
++#define LZ_LINE_MAX 4           // [lit] / [cs] / [dim] 每类每帧上限
++#define LZ_CHAIN_LINE_MAX 8     // 链路时间线每帧上限
++#define LZ_LINE_TOTAL_MAX 20000 // 全项目行数上限：到顶即关
++#define LZ_CHAIN_MAX 64
++#define LZ_OUT_MAX_BPP 4        // 中心读回每像素最多 4 字节 → 单张附件 ≤ 8×8×4B
++enum { LZ_IN_OFF = 0, LZ_IN_STRIDE = 16, LZ_OUT_OFF = 256, LZ_OUT_STRIDE = 256 };
++#define LZ_BUF_BYTES (LZ_OUT_OFF + LZ_OUT_STRIDE * LZ_MAX_ATT)
++// 采样只在 frame ≥ 300 且 f % 300 == 0 的帧做（读回降到每 5 秒一次）
++static int lz_sample_frame(uint64_t f) { return f >= LZ_FRAME_LO && f <= LZ_FRAME_HI && f % 300 == 0; }
++typedef struct { int reg, tid; uint64_t ser; uint32_t nvn_fmt, mtl_fmt; __strong id<MTLTexture> tex; } lz_inp;
++typedef struct { int slot, sdi, lv, sl, wrote, load, dead, noread; uint64_t ser; uint32_t nvn_fmt, mtl_fmt; } lz_atte;
++typedef struct { int reg; uint64_t len, addr; } lz_bufe;   // 追加 A：光照遍的每个片元缓冲槽（下次开遍前读前 64 字节）
++typedef struct {
++    int used, ready, kind, nin, natt, nbuf; uint64_t frame, pass, fence;   // kind: 0 光照遍 / 1 压暗层专项
++    char key[24]; lz_inp in[LZ_MAX_IN]; lz_atte att[LZ_MAX_ATT]; lz_bufe buf[6]; __strong id<MTLBuffer> buf_obj;
++} lz_slot_t;
++static lz_slot_t g_lz_slot[LZ_SLOT_MAX];
++static __strong id<MTLTexture> g_lz_at[8];   // 当前遍真正挂上去的颜色附件视图（rp_begin_ex_ 记）
++static int g_lz_at_lv[8], g_lz_at_sl[8]; static uint64_t g_lz_at_ser[8];
++static uint64_t g_lz_frame = ~0ull;          // 帧号（每帧重置「本帧见过的颜色附件」与行数）
++static uint64_t g_lz_ser[LZ_SER_MAX]; static int g_lz_nser;
++static uint64_t g_lz_lines_total; static int g_lz_lines_lit, g_lz_lines_cs, g_lz_lines_dim, g_lz_chain_lines, g_lz_blocks_frame, g_lz_scan_frame, g_lz_best_nin;
++static uint64_t g_lz_pk_pass = ~0ull; static char g_lz_pk_key[24];   // 本遍第一笔的片元 key（链路 / 压暗行用）
++static int g_lz_on = -1;
++static int g_lz_off;                     // 1 = 自愈关闭：任何一步失败 / 行数到顶后，全部探针停手（不再尝试）
++static int g_lz_post_busy;               // lz_post_end 重入哨兵：它要开 blit 编码器，绝不能在 rp_end 里递归
++// 探针的临时缓冲全部静态（只在编码线程使用：draw / rp_end / present / dispatch 都在同一条命令编码线程上）。
++//   栈上只留 ≤256 字节的小数组。真机 ___chkstk_darwin+0x3c 就是栈帧太大 / 递归太深把栈探到保护页（SIGBUS）。
++static char lz_b_desc[192];              // 一个像素的 px=(...) / u=(...)
++static char lz_b_hex[160];               // 前 64 字节十六进制
++static char lz_b_bufs[420];              // 片元缓冲槽表
++static char lz_b_sum[1024];              // [cs] / [fallback] summary 的 key 串
++static char lz_b_pd[512];                // passdump 一行（硬上限 512 字节）
++static char lz_b_gs[200];                // [lit] gbuf_slots
++static char lz_b_dim[192];               // [dim] 一行的值
++static tex_t lz_tc[12];                  // lz_detect 的输入画像
++static tex_t lz_cand[8];                 // lz_detect 的候选输入
++static lz_inp lz_lin[LZ_MAX_IN];         // lz_detect 过筛后的输入
++static void lz_disable(const char *why) {
++    if (g_lz_off) return;
++    g_lz_off = 1;
++    MLOG("[probe] disabled after %s", why && *why ? why : "error");
++}
++static int lz_on(void) {
++    if (g_lz_off) return 0;
++    if (g_lz_on < 0) {
++        const char *e = getenv("S2A_LITZERO");
++        g_lz_on = !(e && *e && !strcmp(e, "0"));
++        if (!g_lz_on) MLOG("[litzero] S2A_LITZERO=0：光照输入 / 输出探针关");
++    }
++    return g_lz_on;
++}
++static float lz_h2f(uint16_t h) {   // 16 位浮点 → float（诊断只看「有没有内容」，与 litdbg 同一份换算）
++    uint32_t s = (uint32_t)(h >> 15) & 1u, e = (uint32_t)(h >> 10) & 0x1fu, m = (uint32_t)h & 0x3ffu, f;
++    if (!e) { if (!m) f = s << 31; else { int sh = 0; while (!(m & 0x400u)) { m <<= 1; sh++; } m &= 0x3ffu; f = (s << 31) | ((uint32_t)(127 - 15 - sh) << 23) | (m << 13); } }
++    else if (e == 31) f = (s << 31) | 0x7f800000u | (m << 13);
++    else f = (s << 31) | ((e + 112u) << 23) | (m << 13);
++    float r; memcpy(&r, &f, sizeof r); return r;
++}
++// 颜色格式 → (类, 分量数, 分量字节数)：类 0 unorm 1 snorm 2 float 3 uint 4 sint；打包格式不入表（按原始字节打）
++typedef struct { uint32_t pf; uint8_t cls, nc, cb; } lz_pfent;
++static const lz_pfent g_lz_pf[] = {
++    {MTLPixelFormatR8Unorm,0,1,1}, {MTLPixelFormatR8Snorm,1,1,1}, {MTLPixelFormatR8Uint,3,1,1}, {MTLPixelFormatR8Sint,4,1,1},
++    {MTLPixelFormatR16Unorm,0,1,2}, {MTLPixelFormatR16Snorm,1,1,2}, {MTLPixelFormatR16Uint,3,1,2}, {MTLPixelFormatR16Sint,4,1,2}, {MTLPixelFormatR16Float,2,1,2},
++    {MTLPixelFormatR32Uint,3,1,4}, {MTLPixelFormatR32Sint,4,1,4}, {MTLPixelFormatR32Float,2,1,4},
++    {MTLPixelFormatRG8Unorm,0,2,1}, {MTLPixelFormatRG8Snorm,1,2,1}, {MTLPixelFormatRG8Uint,3,2,1}, {MTLPixelFormatRG8Sint,4,2,1},
++    {MTLPixelFormatRG16Unorm,0,2,2}, {MTLPixelFormatRG16Snorm,1,2,2}, {MTLPixelFormatRG16Uint,3,2,2}, {MTLPixelFormatRG16Sint,4,2,2}, {MTLPixelFormatRG16Float,2,2,2},
++    {MTLPixelFormatRG32Uint,3,2,4}, {MTLPixelFormatRG32Sint,4,2,4}, {MTLPixelFormatRG32Float,2,2,4},
++    {MTLPixelFormatRGBA8Unorm,0,4,1}, {MTLPixelFormatRGBA8Unorm_sRGB,0,4,1}, {MTLPixelFormatRGBA8Snorm,1,4,1}, {MTLPixelFormatRGBA8Uint,3,4,1}, {MTLPixelFormatRGBA8Sint,4,4,1},
++    {MTLPixelFormatRGBA16Unorm,0,4,2}, {MTLPixelFormatRGBA16Snorm,1,4,2}, {MTLPixelFormatRGBA16Uint,3,4,2}, {MTLPixelFormatRGBA16Sint,4,4,2}, {MTLPixelFormatRGBA16Float,2,4,2},
++    {MTLPixelFormatRGBA32Uint,3,4,4}, {MTLPixelFormatRGBA32Sint,4,4,4}, {MTLPixelFormatRGBA32Float,2,4,4},
++    {MTLPixelFormatBGRA8Unorm,0,4,1}, {MTLPixelFormatBGRA8Unorm_sRGB,0,4,1},
++};
++static const lz_pfent *lz_pf_get(MTLPixelFormat pf) {
++    for (size_t i = 0; i < sizeof g_lz_pf / sizeof *g_lz_pf; i++) if (g_lz_pf[i].pf == (uint32_t)pf) return &g_lz_pf[i];
++    return NULL;
++}
++static double lz_comp(const lz_pfent *e, const uint8_t *p, int i) {
++    if (e->cb == 1) {
++        uint8_t v = p[i];
++        switch (e->cls) { case 0: return v / 255.0; case 1: { double s = (double)(int8_t)v / 127.0; return s < -1.0 ? -1.0 : s; }
++                          case 3: return (double)v; case 4: return (double)(int8_t)v; default: return 0; }
++    }
++    if (e->cb == 2) {
++        uint16_t h; memcpy(&h, p + 2 * i, 2);
++        switch (e->cls) { case 0: return h / 65535.0; case 1: { double s = (double)(int16_t)h / 32767.0; return s < -1.0 ? -1.0 : s; }
++                          case 2: return lz_h2f(h); case 3: return (double)h; case 4: return (double)(int16_t)h; default: return 0; }
++    }
++    if (e->cb == 4) {
++        uint32_t u; memcpy(&u, p + 4 * i, 4);
++        if (e->cls == 2) { float f; memcpy(&f, &u, 4); return (double)f; }
++        if (e->cls == 3) return (double)u;
++        if (e->cls == 4) return (double)(int32_t)u;
++    }
++    return 0;
++}
++// 一个像素 → "px=(r,g,b,a)"（浮点 / 归一化）或 "u=(a,b,c,d)"（整数）；不认识的格式按原始字节。alpha 只打不算。
++static void lz_desc(MTLPixelFormat pf, const uint8_t *p, char *out, size_t n) {
++    const lz_pfent *e = lz_pf_get(pf);
++    if (!e) { uint32_t v = (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; snprintf(out, n, "raw=0x%08x", v); return; }
++    char *b = lz_b_desc; size_t o = 0; int ing = e->cls == 3 || e->cls == 4;   // 静态缓冲：栈上不放大数组
++    o += snprintf(b + o, sizeof lz_b_desc - o, ing ? "u=(" : "px=(");
++    for (int i = 0; i < e->nc && o + 24 < sizeof lz_b_desc; i++) {
++        double v = lz_comp(e, p, i);
++        if (ing) o += snprintf(b + o, sizeof lz_b_desc - o, "%s%lld", i ? "," : "", (long long)v);
++        else o += snprintf(b + o, sizeof lz_b_desc - o, "%s%.3f", i ? "," : "", v);
++    }
++    snprintf(b + o, sizeof lz_b_desc - o, ")");
++    snprintf(out, n, "%s", b);
++}
++// 8x8 中心区（RGB 三通道，各化成 0..255）→ mean / max；alpha 不算（清成 (0,0,0,1) 的黑目标不该被算成「有内容」）
++// WxH（通常 8x8；1x1 / 4x4 的曝光目标按实际尺寸）中心的 RGB 三通道（各化成 0..255）→ mean / max；alpha 不算
++static void lz_stats(MTLPixelFormat pf, const uint8_t *p, NSUInteger w, NSUInteger h, NSUInteger row, double *mean, uint32_t *mx) {
++    const lz_pfent *e = lz_pf_get(pf);
++    size_t bpp = e ? (size_t)e->cb * (size_t)e->nc : mtl_pf_bytes(pf);
++    if (!bpp || bpp > 16) bpp = 4;
++    double sum = 0; double m = 0;
++    for (NSUInteger y = 0; y < h; y++) for (NSUInteger x = 0; x < w; x++) {
++        const uint8_t *q = p + y * row + x * bpp;
++        for (int c = 0; c < 3; c++) {
++            double v;
++            if (!e) v = (double)q[c];
++            else {
++                v = c < e->nc ? lz_comp(e, q, c) : 0;
++                if (e->cls == 0) v *= 255.0;
++                else if (e->cls == 1) v = (v * 0.5 + 0.5) * 255.0;
++                else if (e->cls == 2) v = (v > 0 ? (v < 1 ? v : 1) : 0) * 255.0;
++                else v = v < 0 ? 0 : v > 255 ? 255 : v;
++            }
++            sum += v; if (v > m) m = v;
++        }
++    }
++    *mean = sum / (3.0 * (double)w * (double)h); *mx = (uint32_t)(m + 0.5);
++}
++// G-buffer 类格式：整数（材质 / ID）、snorm、16 位以下浮点（法线 / HDR 中间量）。8 位 unorm 太常见，靠「本帧当过颜色附件」判
++static int lz_fmt_gbuf(MTLPixelFormat pf) {
++    const lz_pfent *e = lz_pf_get(pf);
++    if (!e) return 0;
++    if (e->cls == 3 || e->cls == 4 || e->cls == 1) return 1;
++    return e->cls == 2 && e->cb <= 2;
++}
++// cat: 0 = [lit]，1 = [cs]，2 = [dim]（每类每帧 ≤ LZ_LINE_MAX 行）；总行数到顶就把全部探针关掉
++static int lz_line_ok(int cat) {
++    if (g_lz_off) return 0;
++    if (g_lz_lines_total >= LZ_LINE_TOTAL_MAX) { lz_disable("20000 lines"); return 0; }
++    int *p = cat == 1 ? &g_lz_lines_cs : cat == 2 ? &g_lz_lines_dim : &g_lz_lines_lit;
++    if (*p >= LZ_LINE_MAX) return 0;
++    (*p)++; g_lz_lines_total++; return 1;
++}
++static int lz_chain_ok(void) {   // 链路时间线单独计数（每帧 ≤ 8 行）
++    if (g_lz_off) return 0;
++    if (g_lz_lines_total >= LZ_LINE_TOTAL_MAX) { lz_disable("20000 lines"); return 0; }
++    if (g_lz_chain_lines >= LZ_CHAIN_LINE_MAX) return 0;
++    g_lz_chain_lines++; g_lz_lines_total++; return 1;
++}
++static void lz_frame_begin(uint64_t f) {
++    if (f == g_lz_frame) return;
++    g_lz_frame = f; g_lz_nser = 0; g_lz_lines_lit = 0; g_lz_lines_cs = 0; g_lz_lines_dim = 0; g_lz_chain_lines = 0; g_lz_blocks_frame = 0; g_lz_scan_frame = 0; g_lz_best_nin = 0;
++}
++static int lz_ser_has(uint64_t s) { for (int i = 0; i < g_lz_nser; i++) if (g_lz_ser[i] == s) return 1; return 0; }
++static void lz_ser_add(uint64_t s) { if (!s || lz_ser_has(s) || g_lz_nser >= LZ_SER_MAX) return; g_lz_ser[g_lz_nser++] = s; }
++static int lz_slot_of(uint64_t pass) { for (int i = 0; i < LZ_SLOT_MAX; i++) if (g_lz_slot[i].used && g_lz_slot[i].pass == pass) return i; return -1; }
++static int lz_slot_free(void) { for (int i = 0; i < LZ_SLOT_MAX; i++) if (!g_lz_slot[i].used) return i; return -1; }
++static int lz_buf_hex(uint64_t addr, uint64_t len, char *out, size_t n) {   // 前 64 字节十六进制；读不到返回 0
++    if (!addr || !len) { snprintf(out, n, "-"); return 1; }
++    void *mb; uint64_t mo; const uint8_t *p;
++    if (!nvn_be_addr(addr, len, &mb, &mo) || !(p = [(__bridge id<MTLBuffer>)mb contents])) return 0;
++    size_t k = len < 64 ? (size_t)len : 64, o = 0;
++    for (size_t i = 0; i < k && o + 3 < n; i++) o += snprintf(out + o, n - o, "%02x", p[mo + i]);
++    return 1;
++}
++// 片元常量缓冲：每一个 CBUF 槽一行（最多 2 行），前 64 字节；全 0 = 没上传
++static void lz_print_cb(NvShader *fs) {
++    int shown = 0;
++    for (int i = 0; i < fs->rf.nb && shown < 2; i++) {
++        const nvn_rbind *b = &fs->rf.b[i];
++        if (b->kind != NVN_RB_CBUF || b->reg >= 16) continue;
++        const p_bind_buf *u = &S.ubo[1][b->reg];
++        uint64_t len = u->addr ? u->size : 0; char *head = lz_b_hex;
++        if (!u->addr || !u->size) snprintf(head, sizeof lz_b_hex, "-");
++        else if (pend_hits(u->addr, len) || !lz_buf_hex(u->addr, len, head, sizeof lz_b_hex)) snprintf(head, sizeof lz_b_hex, "P");
++        if (!lz_line_ok(0)) return;
++        MLOG("[lit] cb len=%llu head=%s reg=%d", (unsigned long long)len, head, (int)b->reg);
++        shown++;
++    }
++}
++// 片元缓冲槽表：槽数 + 每槽字节数；len==0（没绑 / 没长度）与内容全 0 的重点标注。
++//   追加 A：把每个槽的地址记进本遍的详细块，下次开遍前（GPU 跑完）读前 64 字节打 [lit] buf（head + nonzero）。
++static void lz_print_buffers(NvShader *fs, lz_slot_t *s) {
++    char *b = lz_b_bufs; size_t o = 0; int nb = 0, len0 = 0, zero = 0;
++    b[0] = 0;
++    for (int i = 0; i < fs->rf.nb && nb < 10; i++) {
++        const nvn_rbind *r = &fs->rf.b[i];
++        const p_bind_buf *u = NULL;
++        if ((r->kind == NVN_RB_CBUF || r->kind == NVN_RB_UBOP) && r->reg < 16) u = &S.ubo[1][r->reg];
++        else if (r->kind == NVN_RB_SBUFP && r->reg < 16) u = &S.ssbo[1][r->reg];
++        else continue;
++        uint64_t len = u->addr ? u->size : 0; const char *mark = "";
++        if (u->addr && len && s && s->nbuf < 6) { s->buf[s->nbuf].reg = (int)r->reg; s->buf[s->nbuf].len = len; s->buf[s->nbuf].addr = u->addr; s->nbuf++; }
++        if (!u->addr || !len) { mark = "!len0"; len0++; }
++        else {
++            void *mb; uint64_t mo; const uint8_t *p; int st = 2;   // 1 全 0 / 0 非 0 / 2 读不到（本提交里 GPU 要写）
++            if (!pend_hits(u->addr, len) && nvn_be_addr(u->addr, len, &mb, &mo) && (p = [(__bridge id<MTLBuffer>)mb contents])) {
++                size_t k = len < 256 ? (size_t)len : 256; st = 1;
++                for (size_t q = 0; q < k; q++) if (p[mo + q]) { st = 0; break; }
++            }
++            if (st == 1) { mark = "!zero"; zero++; } else if (st == 2) mark = "!pend";
++        }
++        o += snprintf(b + o, sizeof lz_b_bufs - o, "%s%d:%llu%s", nb ? "," : "", (int)r->reg, (unsigned long long)len, mark);
++        nb++;
++    }
++    if (!lz_line_ok(0)) return;
++    MLOG("[lit] buffers: n=%d [%s]%s", nb, b, len0 ? "  ← 有缓冲 len=0：光源列表可能为空" : zero ? "  ← 有缓冲内容全 0" : "");
++}
++// 追加 A（读回侧）：一个缓冲前 64 字节的十六进制与其中非零字节数
++static void lz_buf_head(uint64_t addr, uint64_t len, char *out, size_t n, uint32_t *nz, uint32_t *k) {
++    *nz = 0; *k = 0;
++    if (!addr || !len) { snprintf(out, n, "-"); return; }
++    void *mb; uint64_t mo; const uint8_t *p;
++    if (!nvn_be_addr(addr, len, &mb, &mo) || !(p = [(__bridge id<MTLBuffer>)mb contents])) { snprintf(out, n, "P"); return; }
++    size_t kb = len < 64 ? (size_t)len : 64, o = 0;
++    for (size_t i = 0; i < kb && o + 3 < n; i++) { if (p[mo + i]) (*nz)++; o += snprintf(out + o, n - o, "%02x", p[mo + i]); }
++    *k = (uint32_t)kb;
++}
++// 追加 B / C：整局里执行过的 compute key、从 fallback 翻译装载的 shader key（各去重，最多 40 个）；
++//   compute 派发的输出缓冲在 GPU 跑完后读前 64 字节（[cs] 行），每 600 帧打一次 [cs] / [fallback] summary。
++#define LZ_CS_MAX 40
++#define LZ_CS_REC 16
++typedef struct { uint64_t frame, fence, addr, len; int reg; uint32_t gx, gy, gz; char key[24]; } lz_csrec;
++static lz_csrec g_lz_csrec[LZ_CS_REC]; static int g_lz_csrec_n;
++static char g_lz_cs_key[LZ_CS_MAX][24]; static int g_lz_cs_n; static uint64_t g_lz_cs_total;
++static char g_lz_fb_key[LZ_CS_MAX][24]; static int g_lz_fb_n; static uint64_t g_lz_fb_total;
++static uint64_t g_lz_csf_frame; static char g_lz_csf[6][24]; static int g_lz_csf_n;   // 本帧已打过的 cs key（每帧 ≤ 6 行）
++static uint64_t g_lz_sum_last; static int g_lz_sum_n;
++static void lz_key_add(char tab[LZ_CS_MAX][24], int *n, uint64_t *total, const char *k) {
++    if (!k || !*k) return;
++    for (int i = 0; i < *n; i++) if (!strcmp(tab[i], k)) return;
++    (*total)++;
++    if (*n >= LZ_CS_MAX) return;
++    snprintf(tab[*n], sizeof tab[0], "%s", k); (*n)++;
++}
++static void lz_fb_add(const char *k) { lz_key_add(g_lz_fb_key, &g_lz_fb_n, &g_lz_fb_total, k); }
++static void lz_summary(void) {
++    if (g_lz_off || g_lz_sum_n >= 12) return;
++    if (g_lz_cs_n) {
++        char *b = lz_b_sum; size_t o = 0; b[0] = 0;
++        for (int i = 0; i < g_lz_cs_n && o + 30 < sizeof lz_b_sum; i++) o += snprintf(b + o, sizeof lz_b_sum - o, "%s%s", i ? "," : "", g_lz_cs_key[i]);
++        if (lz_line_ok(1)) { MLOG("[cs] summary: n=%llu keys=%s", (unsigned long long)g_lz_cs_total, b); g_lz_sum_n++; }
++    }
++    if (g_lz_fb_n) {
++        char *b = lz_b_sum; size_t o = 0; b[0] = 0;
++        for (int i = 0; i < g_lz_fb_n && o + 30 < sizeof lz_b_sum; i++) o += snprintf(b + o, sizeof lz_b_sum - o, "%s%s", i ? "," : "", g_lz_fb_key[i]);
++        if (lz_line_ok(0)) { MLOG("[fallback] summary: n=%llu keys=%s", (unsigned long long)g_lz_fb_total, b); g_lz_sum_n++; }
++    }
++}
++// 追加 4：passdump.tsv —— 每次抓取（链路写 / 光照输入）在内存里攒一行，写 logs/passdump.tsv（失败退当前目录）；
++//   每行同时按 [pdump] 日志输出（present3 起每帧 ≤ 8 行），导出诊断包只收 diagrun/*.png，日志一定带着。
++//   表头固定；UTF-8 / Tab / LF；最多 200000 行，超出加 "# capped"。
++#define LZ_PD_MAX_LINES 200000
++static char *g_lz_pd; static size_t g_lz_pd_len, g_lz_pd_cap; static int g_lz_pd_lines, g_lz_pd_capped;
++static uint64_t g_lz_pd_frame = ~0ull; static int g_lz_pd_order;
++static uint64_t g_lz_pd_log_frame = ~0ull; static int g_lz_pd_log_n;
++static void lz_pd_row(uint64_t f, uint64_t pass, const char *key, const char *role, uint64_t ser, uint32_t w, uint32_t h, uint32_t fmt, const char *fmtn, double mean, uint32_t mx) {
++    if (g_lz_off) return;
++    if (g_lz_pd_lines >= LZ_PD_MAX_LINES) { g_lz_pd_capped = 1; return; }
++    if (f != g_lz_pd_frame) { g_lz_pd_frame = f; g_lz_pd_order = 0; }
++    char *line = lz_b_pd;   // 栈外：passdump 行缓冲硬上限 512 字节
++    int n = snprintf(line, sizeof lz_b_pd, "%llu\t%d\t%lld\t%s\t%s\t%llu\t%u\t%u\t0x%x(%s)\t%.1f\t%u\t-\n", (unsigned long long)f, g_lz_pd_order++,
++                     (long long)pass, key && key[0] ? key : "-", role, (unsigned long long)ser, w, h, fmt, fmtn ? fmtn : "?", mean, mx);
++    if (n <= 0) return;
++    if (n >= (int)sizeof lz_b_pd) { n = (int)sizeof lz_b_pd - 1; lz_b_pd[n - 1] = '\n'; }   // 截断也仍然是合法的一行
++    // 2026-11-18 present3：每行同时按 [pdump] 写日志（每帧 ≤ 8 行），保证诊断包里一定有（导出只收 diagrun/*.png）。
++    if (f != g_lz_pd_log_frame) { g_lz_pd_log_frame = f; g_lz_pd_log_n = 0; }
++    if (g_lz_pd_log_n < 8) { g_lz_pd_log_n++; MLOG("[pdump] %.*s", n > 0 ? n - 1 : 0, line); }
++    if (g_lz_pd_len + (size_t)n + 1 > g_lz_pd_cap) {
++        size_t nc = g_lz_pd_cap ? g_lz_pd_cap * 2 : (1u << 20);
++        while (nc < g_lz_pd_len + (size_t)n + 1) nc *= 2;
++        char *p = realloc(g_lz_pd, nc);
++        if (!p) { g_lz_pd_capped = 1; return; }
++        g_lz_pd = p; g_lz_pd_cap = nc;
++    }
++    memcpy(g_lz_pd + g_lz_pd_len, line, (size_t)n); g_lz_pd_len += (size_t)n;
++    g_lz_pd_lines++;
++}
++// 2026-11-18 present3：先 logs/passdump.tsv，失败再当前工作目录；两次都失败只打一行 [pdump] write failed (errno=..)，
++//   继续跑其它探针（上版 lz_disable("passdump write failed") 因写盘失败把 [lit] / [chain] 全关了）。
++static int lz_pd_flush(const char *dir) {
++    (void)dir;
++    const char *path = "logs/passdump.tsv";
++    mkdir("logs", 0755);
++    FILE *fp = fopen(path, "wb");
++    if (!fp) {
++        int e1 = errno;
++        path = "passdump.tsv";
++        fp = fopen(path, "wb");
++        if (!fp) {
++            int e2 = errno;
++            static int once;
++            if (!once++) MLOG("[pdump] write failed (errno=%d)", e2 ? e2 : e1);
++            return -1;
++        }
++    }
++    fputs("frame\torder\tpass\tkey\trole\tserial\twidth\theight\tfmt\tmean\tmax\tfile\n", fp);
++    if (g_lz_pd_len) fwrite(g_lz_pd, 1, g_lz_pd_len, fp);
++    if (g_lz_pd_capped) fputs("# capped\n", fp);
++    fclose(fp);
++    MLOG("[pdump] wrote %d rows to %s%s", g_lz_pd_lines, path, g_lz_pd_capped ? " (capped)" : "");
++    return g_lz_pd_lines;
++}
++// 追加 3：compute 的输出是纹理时的读数（纹理是 GPU 私有的，只能 blit + wait；每 300 帧一次、一次一行）
++typedef struct { uint64_t frame, fence; int tid; char key[24]; } lz_cstrec;
++static lz_cstrec g_lz_cst[8]; static int g_lz_cst_n;
++static const char *lz_pf_name(MTLPixelFormat pf);
++// 每个 compute 派发：记 key（整局去重表）+ 记下它的输出缓冲（可写的存储缓冲优先），行在下个开遍前打（那时 GPU 跑完、能读）
++static void lz_cs_note(__unsafe_unretained NvShader *cs, const p_dispatch *dp, uint32_t gx, uint32_t gy) {
++    if (!lz_on() || !cs) return;
++    lz_key_add(g_lz_cs_key, &g_lz_cs_n, &g_lz_cs_total, cs->key);
++    uint64_t f = atomic_load(&g_cur_frame);
++    if (f != g_lz_csf_frame) { g_lz_csf_frame = f; g_lz_csf_n = 0; }
++    if (!lz_sample_frame(f)) return;
++    for (int i = 0; i < g_lz_csf_n; i++) if (!strcmp(g_lz_csf[i], cs->key)) return;
++    if (g_lz_csf_n >= 6 || g_lz_csrec_n >= LZ_CS_REC) return;
++    snprintf(g_lz_csf[g_lz_csf_n++], sizeof g_lz_csf[0], "%s", cs->key);
++    int oreg = -1; uint64_t olen = 0, oaddr = 0;
++    for (int i = 0; i < cs->rf.nb; i++) {
++        const nvn_rbind *b = &cs->rf.b[i];
++        if (b->kind != NVN_RB_SBUFP || b->reg >= 16) continue;
++        const p_bind_buf *u = &S.ssbo[5][b->reg];
++        if (!u->addr) continue;
++        if (b->rw) { oreg = b->reg; olen = u->size; oaddr = u->addr; break; }
++        if (oreg < 0) { oreg = b->reg; olen = u->size; oaddr = u->addr; }
++    }
++    if (oreg < 0) {   // 只写图像的核：记下它的图像槽，下个开遍前 blit + wait 读中心（[cs] out tex）
++        int iimg = -1;
++        for (int i = 0; i < cs->rf.nb; i++) { const nvn_rbind *b = &cs->rf.b[i]; if (b->kind == NVN_RB_IMG && b->rw) { iimg = i; oreg = b->reg; break; } }
++        if (iimg >= 0 && g_lz_cst_n < 8) {
++            int tid = img_tid(&cs->rf.b[iimg], 5);
++            if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) {
++                lz_cstrec *r = &g_lz_cst[g_lz_cst_n++];
++                r->frame = f; r->fence = g_fence + 1; r->tid = tid; snprintf(r->key, sizeof r->key, "%s", cs->key);
++            }
++        }
++        if (lz_line_ok(1)) MLOG("[cs] f=%llu key=%s groups=%u,%u,%u out reg=%d len=0 head=- nonzero=0/0", (unsigned long long)f, cs->key, gx, gy, (unsigned)dp->z, oreg);
++        return;
++    }
++    lz_csrec *r = &g_lz_csrec[g_lz_csrec_n++];
++    r->frame = f; r->fence = g_fence + 1; r->addr = oaddr; r->len = olen; r->reg = oreg;
++    r->gx = gx; r->gy = gy; r->gz = (uint32_t)dp->z;
++    snprintf(r->key, sizeof r->key, "%s", cs->key);
++}
++static void lz_cs_drain(void) {
++    for (int i = 0; i < g_lz_csrec_n; ) {
++        lz_csrec *r = &g_lz_csrec[i];
++        if (r->fence > g_done) { i++; continue; }
++        char *head = lz_b_hex; uint32_t nz = 0, k = 0;
++        lz_buf_head(r->addr, r->len, head, sizeof lz_b_hex, &nz, &k);
++        if (lz_line_ok(1)) MLOG("[cs] f=%llu key=%s groups=%u,%u,%u out reg=%d len=%llu head=%s nonzero=%u/%u",
++                               (unsigned long long)r->frame, r->key, r->gx, r->gy, r->gz, r->reg, (unsigned long long)r->len, head, nz, k);
++        g_lz_csrec[i] = g_lz_csrec[--g_lz_csrec_n];
++    }
++}
++// 追加 1：链路时间线 —— 对**所有作为颜色附件被写**的目标，结束时把中心（≤8x8，按目标实际尺寸）拷进 shared 缓冲，
++//   下个开遍前读回打 [chain]。同一帧里多遍写同一张目标，于是每一步一个数，正是要的时间线。
++//   判据：只看「这一遍挂了哪些颜色附件」，**没有任何写死的 serial**；ser 只作为输出字段。
++//   同一处按特征再打两条（同样不看编号）：输出 ≤16x16 → [exp]（曝光 / 自适应目标）；
++//   有 HDR 浮点输入且输出任一边 ≤ 输入的一半 → [bloom]（bright-pass / 降采样链）。
++typedef struct { uint64_t frame, pass, ser, fence; uint32_t fmt, w, h, inw, inh; int bloom, exp; char key[24]; __strong id<MTLBuffer> buf; } lz_chainrec;
++static lz_chainrec g_lz_chain[LZ_CHAIN_MAX]; static int g_lz_chain_n;
++static uint32_t g_lz_pk_inw, g_lz_pk_inh; static int g_lz_pk_infloat;   // 本遍输入的边长（最大的一张）与是否有浮点 / HDR 输入
++static void lz_chain_cap(void) {
++    uint64_t f = atomic_load(&g_cur_frame);
++    if (!lz_on() || !lz_sample_frame(f)) return;
++    for (int i = 0; i < 8; i++) {
++        uint64_t ser = g_lz_at_ser[i];
++        if (!ser || g_lz_chain_n >= LZ_CHAIN_MAX) continue;
++        id<MTLTexture> t = g_lz_at[i];
++        if (!t || t.sampleCount != 1) continue;
++        NSUInteger lv = (NSUInteger)g_lz_at_lv[i], sl = (NSUInteger)g_lz_at_sl[i];
++        NSUInteger w = MAX(t.width >> lv, 1u), h = MAX(t.height >> lv, 1u);
++        NSUInteger bpp = mtl_pf_bytes(t.pixelFormat);
++        if (!bpp || bpp > LZ_OUT_MAX_BPP) continue;   // 中心读回上限 8×8×4B：更宽的格式不采
++        NSUInteger cw = MIN(w, (NSUInteger)8), ch = MIN(h, (NSUInteger)8);
++        id<MTLBuffer> b = [g_dev newBufferWithLength:(NSUInteger)(8 * 8 * LZ_OUT_MAX_BPP) options:MTLResourceStorageModeShared];
++        if (!b) { lz_disable("buffer alloc failed"); return; }
++        res_add(b);
++        id e = blit();
++        if (!e) { lz_disable("blit failed"); res_remove(b); return; }
++        enc_b_copy_texture_buffer(e, t, sl, lv, MTLOriginMake((w - cw) / 2, (h - ch) / 2, 0), MTLSizeMake(cw, ch, 1), b, 0, cw * bpp, cw * bpp * ch);
++        lz_chainrec *r = &g_lz_chain[g_lz_chain_n++];
++        r->frame = f; r->pass = g_stat_pass; r->ser = ser; r->fence = g_fence + 1; r->fmt = (uint32_t)t.pixelFormat;
++        r->w = (uint32_t)w; r->h = (uint32_t)h; r->buf = b; r->inw = g_lz_pk_inw; r->inh = g_lz_pk_inh;
++        r->exp = w <= 8 && h <= 8;
++        r->bloom = g_lz_pk_infloat && g_lz_pk_inw && g_lz_pk_inh && (w * 2 <= g_lz_pk_inw || h * 2 <= g_lz_pk_inh);
++        snprintf(r->key, sizeof r->key, "%s", g_lz_pk_pass == g_stat_pass && g_lz_pk_key[0] ? g_lz_pk_key : "-");
++    }
++}
++static void lz_chain_drain(void) {
++    if (!g_lz_chain_n) return;
++    for (int i = 0; i < g_lz_chain_n; i++) if (g_lz_chain[i].fence > g_done) return;   // 整轮都跑完再打（同一帧的先后顺序才有意义）
++    int first = g_lz_chain_n > LZ_CHAIN_LINE_MAX ? g_lz_chain_n - LZ_CHAIN_LINE_MAX : 0;
++    if (first && lz_line_ok(0)) MLOG("[chain] clip: 本帧写了 %d 个颜色附件，只打最后 %d 个（帧尾合成链才是压暗发生的地方）", g_lz_chain_n, g_lz_chain_n - first);
++    for (int i = first; i < g_lz_chain_n; i++) {
++        lz_chainrec *r = &g_lz_chain[i];
++        double mean = 0; uint32_t mx = 0;
++        NSUInteger bpp = mtl_pf_bytes((MTLPixelFormat)r->fmt); if (!bpp || bpp > LZ_OUT_MAX_BPP) bpp = LZ_OUT_MAX_BPP;
++        NSUInteger cw = MIN((NSUInteger)r->w, (NSUInteger)8), ch = MIN((NSUInteger)r->h, (NSUInteger)8);
++        lz_stats((MTLPixelFormat)r->fmt, (const uint8_t *)r->buf.contents, cw, ch, cw * bpp, &mean, &mx);
++        lz_pd_row(r->frame, r->pass, r->key, "ATT", r->ser, r->w, r->h, r->fmt, lz_pf_name((MTLPixelFormat)r->fmt), mean, mx);   // 追加 4：passdump.tsv
++        if (lz_chain_ok()) MLOG("[chain] f=%llu pass=%llu ser=%llu key=%s fmt=0x%x(%s) %ux%u mean=%.1f max=%u", (unsigned long long)r->frame, (unsigned long long)r->pass,
++                                (unsigned long long)r->ser, r->key, r->fmt, lz_pf_name((MTLPixelFormat)r->fmt), r->w, r->h, mean, mx);
++        if (r->exp && lz_line_ok(0)) MLOG("[exp] f=%llu key=%s out ser=%llu %ux%u mean=%.1f", (unsigned long long)r->frame, r->key, (unsigned long long)r->ser, r->w, r->h, mean);
++        if (r->bloom && lz_line_ok(0)) MLOG("[bloom] f=%llu key=%s in=%ux%u out=%ux%u outMean=%.1f", (unsigned long long)r->frame, r->key, r->inw, r->inh, r->w, r->h, mean);
++    }
++    for (int i = 0; i < g_lz_chain_n; i++) { res_remove(g_lz_chain[i].buf); g_lz_chain[i].buf = nil; }
++    g_lz_chain_n = 0;
++}
++// 一个片元纹理绑定 → 1~4 个候选 tid（TEX 槽 / TEXU 单句柄 / TEXU 句柄数组，读法同 encode_args）
++static int lz_tids(const nvn_rbind *b, int tids[4]) {
++    int nt = 0;
++    if (b->kind == NVN_RB_TEX) tids[nt++] = (int)(tex_slot_h(S.tex[1], S.img[1], b->reg) & 0xfffff);
++    else if (b->kind == NVN_RB_TEXU && !b->n) tids[nt++] = ubo_tex_id(ubo_packed(1, b));
++    else if (b->kind == NVN_RB_TEXU && b->n) { for (int k = 0; k < b->n && k < 4; k++) tids[nt++] = ubo_tex_id(ubo_handle(1, b->reg, 8 * k)); }
++    return nt;
++}
++// 追加 3：compute 的输出是纹理时的读数（纹理是 GPU 私有的，只能 blit + wait；每 300 帧一次、一次一行）
++static void lz_cs_tex_drain(void) {
++    for (int i = 0; i < g_lz_cst_n; ) {
++        if (g_lz_off) return;
++        lz_cstrec *r = &g_lz_cst[i];
++        if (r->fence > g_done) { i++; continue; }
++        tex_t cp; int ok = 0;
++        pthread_mutex_lock(&g_rmu);
++        if (r->tid > 0 && r->tid < g_ntreg && g_treg[r->tid].ok) { cp = g_treg[r->tid].t; ok = 1; }
++        pthread_mutex_unlock(&g_rmu);
++        id<MTLTexture> t = ok ? tex_mtl(&cp) : nil;
++        if (t && t.sampleCount == 1 && t.width && t.height) {
++            NSUInteger cw = MIN(t.width, (NSUInteger)8), ch = MIN(t.height, (NSUInteger)8);
++            NSUInteger bpp = mtl_pf_bytes(t.pixelFormat);
++            if (!bpp || bpp > LZ_OUT_MAX_BPP) {   // 中心读回上限 8×8×4B：更宽的格式不采
++                g_lz_cst[i] = g_lz_cst[--g_lz_cst_n];
++                continue;
++            }
++            id<MTLBuffer> b = [g_dev newBufferWithLength:(NSUInteger)(8 * 8 * LZ_OUT_MAX_BPP + 16) options:MTLResourceStorageModeShared];
++            if (!b) { lz_disable("buffer alloc failed"); return; }
++            res_add(b);
++            mtl_finish_gpu();
++            id<MTLCommandBuffer> cb = q_cb();
++            if (!cb) { lz_disable("blit failed"); res_remove(b); return; }
++            id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
++            if (!be) { lz_disable("blit failed"); res_remove(b); return; }
++            [be copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake((t.width - cw) / 2, (t.height - ch) / 2, 0)
++                         sourceSize:MTLSizeMake(cw, ch, 1) toBuffer:b destinationOffset:0 destinationBytesPerRow:cw * bpp destinationBytesPerImage:cw * bpp * ch];
++            [be endEncoding]; [cb commit]; [cb waitUntilCompleted];
++            if (cb.status != MTLCommandBufferStatusCompleted) {   // 读回失败 / 超时：立刻关全部探针
++                lz_disable(cb.status == MTLCommandBufferStatusError ? "readback failed" : "readback timeout");
++                res_remove(b); return;
++            }
++            double mean = 0; uint32_t mx = 0;
++            lz_stats((MTLPixelFormat)t.pixelFormat, (const uint8_t *)b.contents, cw, ch, cw * bpp, &mean, &mx);
++            if (lz_line_ok(1)) MLOG("[cs] out tex ser=%llu fmt=0x%x(%s) %ux%u mean=%.1f max=%u", (unsigned long long)cp.serial, cp.d.format,
++                                   lz_pf_name(t.pixelFormat), (unsigned)(t.width), (unsigned)(t.height), mean, mx);
++            res_remove(b);
++        }
++        g_lz_cst[i] = g_lz_cst[--g_lz_cst_n];
++    }
++}
++// 像素格式名（[dim] 行里 fmt=0x..(名) 用；只列诊断里会碰到的）
++static const char *lz_pf_name(MTLPixelFormat pf) {
++    switch (pf) {
++        case MTLPixelFormatDepth32Float: return "Depth32Float";
++        case MTLPixelFormatDepth16Unorm: return "Depth16Unorm";
++        case MTLPixelFormatDepth32Float_Stencil8: return "Depth32F_S8";
++        case MTLPixelFormatR8Unorm: return "R8Unorm"; case MTLPixelFormatR8Uint: return "R8Uint";
++        case MTLPixelFormatR16Unorm: return "R16Unorm"; case MTLPixelFormatR16Float: return "R16Float";
++        case MTLPixelFormatRG8Unorm: return "RG8Unorm"; case MTLPixelFormatRG16Unorm: return "RG16Unorm";
++        case MTLPixelFormatRG16Float: return "RG16Float";
++        case MTLPixelFormatRGBA8Unorm: return "RGBA8Unorm"; case MTLPixelFormatRGBA8Uint: return "RGBA8Uint";
++        case MTLPixelFormatRGBA8Snorm: return "RGBA8Snorm";
++        case MTLPixelFormatRGBA16Unorm: return "RGBA16Unorm"; case MTLPixelFormatRGBA16Float: return "RGBA16Float";
++        case MTLPixelFormatRGBA32Float: return "RGBA32Float";
++        case MTLPixelFormatBGRA8Unorm: return "BGRA8Unorm";   // present3：上屏目标本作 0x46(BGRA8Unorm)
++        case MTLPixelFormatBGRA8Unorm_sRGB: return "BGRA8Unorm_sRGB";
++        default: return "?";
++    }
++}
++// 1x1 值：深度打 val=<float>，其余交给 lz_desc（px=(...) / u=(...)）
++static void lz_val_desc(MTLPixelFormat pf, const uint8_t *p, char *out, size_t n) {
++    if (pf == MTLPixelFormatDepth32Float || pf == MTLPixelFormatDepth32Float_Stencil8) {
++        float v; memcpy(&v, p, 4); snprintf(out, n, "val=%.5f", (double)v); return;
++    }
++    if (pf == MTLPixelFormatDepth16Unorm) { uint16_t v; memcpy(&v, p, 2); snprintf(out, n, "val=%.5f", v / 65535.0); return; }
++    lz_desc(pf, p, out, n);
++}
++static void lz_att_begin(int slot, id<MTLTexture> t, NSUInteger lv, NSUInteger sl, uint64_t ser) {
++    if (slot < 0 || slot >= 8) return;
++    g_lz_at[slot] = t; g_lz_at_lv[slot] = (int)lv; g_lz_at_sl[slot] = (int)sl; g_lz_at_ser[slot] = ser;
++}
++static void lz_att_clear(void) {
++    for (int i = 0; i < 8; i++) { g_lz_at[i] = nil; g_lz_at_lv[i] = 0; g_lz_at_sl[i] = 0; g_lz_at_ser[i] = 0; }
++}
++// 遍末、sd_finish 之前：把本遍附件的 g_sd 下标记下来（store 决定在 sd_finish 里写回 g_sd，之后 g_nsd 清零）
++static void lz_pre_end(void) {
++    if (!lz_on()) return;
++    for (int k = 0; k < LZ_SLOT_MAX; k++) {
++        lz_slot_t *s = &g_lz_slot[k];
++        if (!s->used || s->pass != g_stat_pass) continue;
++        for (int i = 0; i < s->natt; i++) {
++            int sdi = -1;
++            for (int j = 0; j < g_nsd; j++) if (!g_sd[j].depth && g_sd[j].idx == s->att[i].slot) { sdi = j; break; }
++            s->att[i].sdi = sdi;
++            if (sdi >= 0) { s->att[i].wrote = g_sd[sdi].wrote; s->att[i].load = g_sd[sdi].load; }
++        }
++    }
++}
++// 编码器结束之后：G-buffer 输入各拷 1x1 中心、颜色附件拷 8x8 中心到 shared 缓冲，记下这次提交的栅栏号
++static void lz_post_end(void) {
++    if (!lz_on() || g_lz_post_busy) return;   // 重入哨兵：blit 绝不能再把 rp_end 调回来（否则无限递归）
++    g_lz_post_busy = 1;
++    lz_chain_cap();   // 追加 1：本遍所有颜色附件（不筛编号），结束时拷中心区
++    if (g_lz_off) { g_lz_post_busy = 0; return; }
++    for (int k = 0; k < LZ_SLOT_MAX; k++) {
++        if (g_lz_off) break;
++        lz_slot_t *s = &g_lz_slot[k];
++        if (!s->used || s->ready || s->pass != g_stat_pass) continue;
++        if (!s->buf_obj) {
++            s->buf_obj = [g_dev newBufferWithLength:LZ_BUF_BYTES options:MTLResourceStorageModeShared];
++            if (!s->buf_obj) { lz_disable("buffer alloc failed"); s->used = 0; continue; }
++            res_add(s->buf_obj);
++        }
++        id e = blit();   // 纹理拷贝：先放 barrier，并把「全写」记进账，后面的绘制会等它
++        if (!e) { lz_disable("blit failed"); s->used = 0; continue; }
++        memset((void *)s->buf_obj.contents, 0, LZ_BUF_BYTES);   // 没拷成的槽读回 0，不冒充上一次的数
++        for (int i = 0; i < s->nin; i++) {
++            id<MTLTexture> t = s->in[i].tex;
++            if (!t || t.textureType != MTLTextureType2D || t.sampleCount != 1) continue;
++            NSUInteger x = (t.width - 1) / 2, y = (t.height - 1) / 2;
++            enc_b_copy_texture_buffer(e, t, 0, 0, MTLOriginMake(x, y, 0), MTLSizeMake(1, 1, 1),
++                                      s->buf_obj, LZ_IN_OFF + (NSUInteger)i * LZ_IN_STRIDE, LZ_IN_STRIDE, LZ_IN_STRIDE);
++        }
++        for (int i = 0; i < s->natt; i++) {
++            lz_atte *a = &s->att[i];
++            a->noread = 0;
++            id<MTLTexture> t = a->slot >= 0 && a->slot < 8 ? g_lz_at[a->slot] : nil;
++            if (!t || t.sampleCount != 1) { a->noread = 1; continue; }
++            NSUInteger lv = a->slot >= 0 && a->slot < 8 ? (NSUInteger)g_lz_at_lv[a->slot] : 0;
++            NSUInteger sl = a->slot >= 0 && a->slot < 8 ? (NSUInteger)g_lz_at_sl[a->slot] : 0;
++            NSUInteger w = MAX(t.width >> lv, 1u), h = MAX(t.height >> lv, 1u);
++            if (w < 8 || h < 8) { a->noread = 1; continue; }
++            NSUInteger bpp = mtl_pf_bytes(t.pixelFormat);
++            if (!bpp || bpp > LZ_OUT_MAX_BPP) { a->noread = 1; continue; }   // 中心读回上限 8×8×4B
++            a->lv = (int)lv; a->sl = (int)sl; a->mtl_fmt = (uint32_t)t.pixelFormat;
++            a->dead = (a->sdi >= 0 && g_sd[a->sdi].state == 2) || (udc_on() && a->load && !a->wrote);
++            NSUInteger row = 8 * bpp;
++            enc_b_copy_texture_buffer(e, t, sl, lv, MTLOriginMake((w - 8) / 2, (h - 8) / 2, 0), MTLSizeMake(8, 8, 1),
++                                      s->buf_obj, LZ_OUT_OFF + (NSUInteger)i * LZ_OUT_STRIDE, row, row * 8);
++        }
++        s->ready = 1; s->fence = g_fence + 1;
++    }
++    g_lz_post_busy = 0;
++}
++// 下一次开遍前：这次提交已完成（g_done 到位）就把上一帧光照那遍的拷贝读回打 in / out
++static void lz_drain(void) {
++    if (!lz_on()) return;
++    uint64_t f = atomic_load(&g_cur_frame);
++    for (int k = 0; k < LZ_SLOT_MAX; k++) {
++        if (g_lz_off) break;
++        lz_slot_t *s = &g_lz_slot[k];
++        if (!s->used) continue;
++        if (!s->ready) { if (s->frame + 2 < f) { for (int i = 0; i < LZ_MAX_IN; i++) s->in[i].tex = nil; s->used = 0; } continue; }   // 那一遍没结束：两帧后丢掉，不占槽
++        if (s->fence > g_done) continue;   // 还没跑完：等下一次开遍
++        const uint8_t *p = s->buf_obj ? (const uint8_t *)s->buf_obj.contents : NULL;
++        int dim = s->kind == 1;
++        if (p) for (int i = 0; i < s->nin; i++) {
++            char *d = lz_b_dim;
++            if (dim) lz_val_desc((MTLPixelFormat)s->in[i].mtl_fmt, p + LZ_IN_OFF + (size_t)i * LZ_IN_STRIDE, d, sizeof lz_b_dim);
++            else lz_desc((MTLPixelFormat)s->in[i].mtl_fmt, p + LZ_IN_OFF + (size_t)i * LZ_IN_STRIDE, d, sizeof lz_b_dim);
++            if (!lz_line_ok(dim ? 2 : 0)) break;
++            if (dim) MLOG("[dim] f=%llu pass=%llu in reg=%d ser=%llu fmt=0x%x(%s) %s", (unsigned long long)s->frame, (unsigned long long)s->pass,
++                          s->in[i].reg, (unsigned long long)s->in[i].ser, s->in[i].nvn_fmt, lz_pf_name((MTLPixelFormat)s->in[i].mtl_fmt), d);
++            else MLOG("[lit] in reg=%d ser=%llu fmt=0x%x mtl=0x%x %s", s->in[i].reg, (unsigned long long)s->in[i].ser, s->in[i].nvn_fmt, s->in[i].mtl_fmt, d);
++            if (!dim) {   // 追加 4：光照遍的输入也进 passdump.tsv（role=IN）
++                NSUInteger ib = mtl_pf_bytes((MTLPixelFormat)s->in[i].mtl_fmt); if (!ib || ib > 16) ib = 4;
++                double im = 0; uint32_t ix = 0; lz_stats((MTLPixelFormat)s->in[i].mtl_fmt, p + LZ_IN_OFF + (size_t)i * LZ_IN_STRIDE, 1, 1, ib, &im, &ix);
++                id<MTLTexture> it = s->in[i].tex;
++                lz_pd_row(s->frame, s->pass, s->key, "IN", s->in[i].ser, it ? (uint32_t)it.width : 0, it ? (uint32_t)it.height : 0,
++                          s->in[i].nvn_fmt, lz_pf_name((MTLPixelFormat)s->in[i].mtl_fmt), im, ix);
++            }
++        }
++        if (p) for (int i = 0; i < s->natt; i++) {
++            if (s->att[i].noread) continue;   // 没拷（格式 >4B/像素 / 尺寸不够 / 没挂上）
++            double mean = 0; uint32_t mx = 0;
++            NSUInteger ab = mtl_pf_bytes((MTLPixelFormat)s->att[i].mtl_fmt); if (!ab || ab > LZ_OUT_MAX_BPP) ab = LZ_OUT_MAX_BPP;
++            lz_stats((MTLPixelFormat)s->att[i].mtl_fmt, p + LZ_OUT_OFF + (size_t)i * LZ_OUT_STRIDE, 8, 8, (NSUInteger)8 * ab, &mean, &mx);
++            if (!lz_line_ok(dim ? 2 : 0)) break;
++            if (dim) MLOG("[dim] f=%llu pass=%llu out ser=%llu fmt=0x%x(%s) mean=%.1f max=%u", (unsigned long long)s->frame, (unsigned long long)s->pass,
++                          (unsigned long long)s->att[i].ser, s->att[i].nvn_fmt, lz_pf_name((MTLPixelFormat)s->att[i].mtl_fmt), mean, mx);
++            else MLOG("[lit] out ser=%llu fmt=0x%x mean=%.1f max=%u store=%s", (unsigned long long)s->att[i].ser, s->att[i].nvn_fmt, mean, mx, s->att[i].dead ? "dontcare" : "store");
++        }
++        // 追加 A：这一遍片元缓冲槽的前 64 字节（本遍提交已跑完，CPU 能读共享存储）
++        if (!dim) for (int i = 0; i < s->nbuf; i++) {
++            char *head = lz_b_hex; uint32_t nz = 0, kb = 0;
++            lz_buf_head(s->buf[i].addr, s->buf[i].len, head, sizeof lz_b_hex, &nz, &kb);
++            if (!lz_line_ok(0)) break;
++            MLOG("[lit] buf reg=%d len=%llu head=%s nonzero=%u/%u", s->buf[i].reg, (unsigned long long)s->buf[i].len, head, nz, kb);
++        }
++        if (s->buf_obj) { res_remove(s->buf_obj); s->buf_obj = nil; }
++        for (int i = 0; i < LZ_MAX_IN; i++) s->in[i].tex = nil;
++        s->used = 0; s->ready = 0; s->nin = 0; s->natt = 0; s->nbuf = 0;
++    }
++    lz_chain_drain();   // 追加 1：链路时间线（每一遍一个数）
++    lz_cs_drain();      // 追加 B：compute 输出缓冲读完的行
++    lz_cs_tex_drain();  // 追加 3：compute 输出纹理的读数（blit + wait）
++    if (!g_lz_off && f >= LZ_FRAME_LO && f % 600 == 0 && f != g_lz_sum_last) { g_lz_sum_last = f; lz_summary(); }   // 追加 B / C：每 600 帧的整局 key 汇总
++}
++// draw 里（一遍的第一笔、开遍之前）：记本帧颜色附件，筛光照那遍并记下详细块的输入 / 附件
++static void lz_detect(__unsafe_unretained NvProg *pr) {
++    if (!lz_on()) return;
++    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
++    lz_frame_begin(f);
++    for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i]) lz_ser_add(R.rt.color[i]->serial);
++    if (g_enc || !pr || !pr->sh[1]) return;                       // 只在一遍的第一笔记（开遍之前）
++    uint64_t pass = g_stat_pass + 1;
++    g_lz_pk_pass = pass; snprintf(g_lz_pk_key, sizeof g_lz_pk_key, "%s", pr->sh[1]->key);   // 本遍第一笔的片元 key（链路 / 压暗行用）
++    if (!lz_sample_frame(f)) return;                              // 采样按每 300 帧一次
++    // 本遍的输入画像（[bloom] 判据，全按尺寸 / 格式，不看编号）：最大输入边长 + 是否有浮点 / HDR 输入
++    g_lz_pk_inw = g_lz_pk_inh = 0; g_lz_pk_infloat = 0;
++    {
++        tex_t *tc = lz_tc; int ntc = 0;   // 静态：栈上不放大结构体数组
++        pthread_mutex_lock(&g_rmu);
++        for (int i = 0; i < pr->sh[1]->rf.nb && ntc < 12; i++) {
++            int tids[4], nt = lz_tids(&pr->sh[1]->rf.b[i], tids);
++            for (int q = 0; q < nt && ntc < 12; q++) { int tid = tids[q]; if (tid <= 0 || tid >= g_ntreg || !g_treg[tid].ok) continue; tc[ntc++] = g_treg[tid].t; }
++        }
++        pthread_mutex_unlock(&g_rmu);
++        for (int i = 0; i < ntc; i++) {
++            id<MTLTexture> t = tex_mtl(&tc[i]);
++            if (!t || t.textureType != MTLTextureType2D) continue;
++            if ((uint32_t)t.width > g_lz_pk_inw) g_lz_pk_inw = (uint32_t)t.width;
++            if ((uint32_t)t.height > g_lz_pk_inh) g_lz_pk_inh = (uint32_t)t.height;
++            if (pf_is_float(t.pixelFormat)) g_lz_pk_infloat = 1;
++        }
++    }
++    if (lz_slot_of(pass) >= 0) return;                            // 这一遍已经记过
++    NvShader *fs = pr->sh[1];
++    if (!fs->rf.nb) return;
++    const tex_t *t0 = R.rt.n > 0 ? R.rt.color[0] : NULL;
++    if (!t0) return;
++    uint64_t ser0; int lv0, sl0; rt_sub(&R.rt, 0, &ser0, &lv0, &sl0);
++    NSUInteger tw = MAX(t0->d.width >> lv0, 1u), th = MAX(t0->d.height >> lv0, 1u);
++    if (tw < 1280 || th < 720) return;                            // 场景级 target（真机 1600x900）
++    int attslot[LZ_MAX_ATT], natt = 0;
++    for (int i = 0; i < R.rt.n && i < 8 && natt < LZ_MAX_ATT; i++) {
++        if (!R.rt.color[i] || rt_dup_slot(&R.rt, i)) continue;
++        attslot[natt++] = i;
++    }
++    // 候选输入：片元 TEX / TEXU（单句柄与句柄数组），尺寸与本遍 target 一致、不是本遍附件
++    tex_t *cand = lz_cand; int creg[8], ctid[8]; int nc = 0;   // 静态：栈上不放大结构体数组
++    pthread_mutex_lock(&g_rmu);
++    for (int i = 0; i < fs->rf.nb && nc < 8; i++) {
++        const nvn_rbind *b = &fs->rf.b[i];
++        int tids[4], nt = 0;   // 一个绑定 → 1~4 个候选 tid（TEXU 数组按元素取，同 encode_args 的读法）
++        if (b->kind == NVN_RB_TEX) tids[nt++] = (int)(tex_slot_h(S.tex[1], S.img[1], b->reg) & 0xfffff);
++        else if (b->kind == NVN_RB_TEXU && !b->n) tids[nt++] = ubo_tex_id(ubo_packed(1, b));
++        else if (b->kind == NVN_RB_TEXU && b->n) { for (int k = 0; k < b->n && k < 4; k++) tids[nt++] = ubo_tex_id(ubo_handle(1, b->reg, 8 * k)); }
++        for (int q = 0; q < nt && nc < 8; q++) {
++            int tid = tids[q];
++            if (tid <= 0 || tid >= g_ntreg || !g_treg[tid].ok) continue;
++            const tex_t *t = &g_treg[tid].t;
++            if (!t->serial || t->d.width != tw || t->d.height != th) continue;
++            int self = 0; for (int r = 0; r < natt; r++) if (R.rt.color[attslot[r]] && R.rt.color[attslot[r]]->serial == t->serial) self = 1;
++            if (self) continue;
++            int dup = 0; for (int r = 0; r < nc; r++) if (cand[r].serial == t->serial) dup = 1;
++            if (dup) continue;
++            cand[nc] = *t; creg[nc] = b->reg; ctid[nc] = tid; nc++;
++        }
++    }
++    pthread_mutex_unlock(&g_rmu);
++    // 追加 2：压暗层专项（84893b3e8e78b10d）：它采样的每张同尺寸纹理（深度/其余分开打）+ 片元常量缓冲 + 输出，
++    //   单独占一块（kind=1）；1x1 每张输入、8x8 输出都在遍末编码、下个开遍前读回。
++    if (!strncmp(fs->key, "84893b3e8e78b10d", 16)) {
++        int k = lz_slot_free(); if (k < 0) return;
++        lz_slot_t *s = &g_lz_slot[k];
++        s->kind = 1; s->used = 0; s->ready = 0; s->frame = f; s->pass = pass; s->fence = 0; s->nin = 0; s->natt = 0; s->nbuf = 0;
++        snprintf(s->key, sizeof s->key, "%s", fs->key);
++        for (int i = 0; i < nc && s->nin < LZ_MAX_IN; i++) {
++            id<MTLTexture> t = tex_mtl(&cand[i]);
++            if (!t || t.textureType != MTLTextureType2D || t.sampleCount != 1) continue;
++            lz_inp *p = &s->in[s->nin++];
++            p->reg = creg[i]; p->tid = ctid[i]; p->ser = cand[i].serial; p->nvn_fmt = cand[i].d.format;
++            p->mtl_fmt = (uint32_t)t.pixelFormat; p->tex = t;
++        }
++        for (int i = 0; i < natt; i++) {
++            int slot = attslot[i]; const tex_t *ct = R.rt.color[slot];
++            s->att[s->natt].slot = slot; s->att[s->natt].sdi = -1; s->att[s->natt].ser = ct ? ct->serial : 0;
++            s->att[s->natt].nvn_fmt = ct ? ct->d.format : 0; s->att[s->natt].mtl_fmt = 0; s->natt++;
++        }
++        s->used = 1;
++        for (int i = 0; i < fs->rf.nb; i++) {   // [dim] cb：片元常量缓冲前 64 字节（CPU 侧，无 GPU 依赖）
++            const nvn_rbind *b = &fs->rf.b[i];
++            if (b->kind != NVN_RB_CBUF || b->reg >= 16) continue;
++            const p_bind_buf *u = &S.ubo[1][b->reg];
++            char *head = lz_b_hex; uint64_t len = u->addr ? u->size : 0;
++            if (!u->addr || !u->size) snprintf(head, sizeof lz_b_hex, "-");
++            else if (pend_hits(u->addr, len) || !lz_buf_hex(u->addr, len, head, sizeof lz_b_hex)) snprintf(head, sizeof lz_b_hex, "P");
++            if (lz_line_ok(2)) MLOG("[dim] f=%llu pass=%llu cb reg=%d len=%llu head=%s", (unsigned long long)f, (unsigned long long)pass, (int)b->reg, (unsigned long long)len, head);
++            break;
++        }
++        return;
++    }
++    // 过筛：本帧先当过颜色附件的 target（G-buffer）或整数 / 法线格式
++    lz_inp *lin = lz_lin; int nin = 0;   // 静态：栈上不放大结构体数组
++    for (int i = 0; i < nc && nin < LZ_MAX_IN; i++) {
++        id<MTLTexture> t = tex_mtl(&cand[i]);
++        if (!t || t.textureType != MTLTextureType2D || t.sampleCount != 1) continue;
++        int seen = lz_ser_has(cand[i].serial), gb = lz_fmt_gbuf(t.pixelFormat);
++        if (!seen && !gb) continue;
++        lz_inp *p = &lin[nin++];
++        p->reg = creg[i]; p->tid = ctid[i]; p->ser = cand[i].serial; p->nvn_fmt = cand[i].d.format;
++        p->mtl_fmt = (uint32_t)t.pixelFormat; p->tex = t;
++    }
++    if (!nin) {   // 这一帧第一次看到「大 target 但没 G-buffer 输入」：留一行扫描线索（每帧最多一行）
++        if (f % 300 == 0 && !g_lz_scan_frame) {
++            g_lz_scan_frame = 1;
++            if (lz_line_ok(0)) MLOG("[lit] scan f=%llu tgt=%lux%lu colors=%d same_size_tex=%d -> 0 个 G-buffer 输入（片元 %s）",
++                                   (unsigned long long)f, (unsigned long)tw, (unsigned long)th, natt, nc, fs->key);
++        }
++        return;
++    }
++    char *gs = lz_b_gs; size_t gso = 0; gs[0] = 0;
++    for (int i = 0; i < nin; i++) gso += snprintf(gs + gso, sizeof lz_b_gs - gso, "%s%d:%llu", i ? "," : "", lin[i].reg, (unsigned long long)lin[i].ser);
++    const char *sel = getenv("S2A_LITZERO_KEY");
++    // 自动挑：本帧第一个读 ≥2 张 G-buffer 的遍；之后只有输入更多的遍才再占一块（疑似的光照遍 = 读得最多的那一遍）
++    int want = sel && *sel ? !strncmp(fs->key, sel, strlen(sel)) : nin >= 2 && (g_lz_blocks_frame == 0 || nin > g_lz_best_nin);
++    if (!want) {   // 不是详细块的目标：头行按签名 / 每 300 帧打一次，够对照就够
++        static char sig[96]; char cur[96];
++        snprintf(cur, sizeof cur, "%s/%lux%lu/%d", fs->key, (unsigned long)tw, (unsigned long)th, nin);
++        if (!strcmp(cur, sig) && f % 300 != 0) return;
++        if (!lz_line_ok(0)) return;
++        snprintf(sig, sizeof sig, "%s", cur);
++        MLOG("[lit] f=%llu pass=%llu key=%s colors=%d gbuf_slots=%s", (unsigned long long)f, (unsigned long long)pass, fs->key, natt, gs);
++        return;
++    }
++    if (g_lz_blocks_frame >= 2) return;                    // 每帧最多两个详细块（输入更多的那一遍优先）
++    int k = lz_slot_free();
++    if (k < 0) return;
++    lz_slot_t *s = &g_lz_slot[k];
++    s->used = 0; s->ready = 0; s->kind = 0; s->frame = f; s->pass = pass; s->fence = 0; s->nin = nin; s->natt = natt; s->nbuf = 0;
++    snprintf(s->key, sizeof s->key, "%s", fs->key);
++    for (int i = 0; i < nin; i++) s->in[i] = lin[i];
++    for (int i = 0; i < natt; i++) {
++        int slot = attslot[i]; const tex_t *ct = R.rt.color[slot];
++        s->att[i].slot = slot; s->att[i].sdi = -1; s->att[i].ser = ct ? ct->serial : 0;
++        s->att[i].nvn_fmt = ct ? ct->d.format : 0; s->att[i].mtl_fmt = 0;
++    }
++    s->used = 1; g_lz_blocks_frame++; if (nin > g_lz_best_nin) g_lz_best_nin = nin;
++    if (!lz_line_ok(0)) return;
++    MLOG("[lit] f=%llu pass=%llu key=%s colors=%d gbuf_slots=%s", (unsigned long long)f, (unsigned long long)pass, fs->key, natt, gs);
++    lz_print_cb(fs);
++    lz_print_buffers(fs, s);
++}
++
++#pragma clang attribute push(__attribute__((objc_externally_retained)), apply_to = function)   // 回到全文件那一区（draw 起）
++
+ static void draw(const p_draw *dw, const p_draw_idx *di) {
+     // internal resolution: textures this draw's program holds in image slots go back to 1 before the draw (nvn_rscale_ops.inc rs_pre_draw; may end the open pass). Not on the
+     //   re-entered calls (geometry / mesh inner draws, deferred replays, the on-chip double render): the outer call or the capture already did it, and their pass must stay open
+@@ -14555,6 +16020,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
+     g_rp_layered = pr->sh[0] && pr->sh[0]->layer_out;
+     if (g_enc && g_pass.layered != g_rp_layered) rp_end();   // a layered pass only for layer-writing vertex shaders (see rp_begin_ex)
+     g_noload_mask = g_enc ? 0 : pass_color_unwritten(pr);   // color attachments proven unwritten to this pass's end are not loaded (see g_noload_mask)
++    lz_detect(pr);   // 2026-11-18 litzero：这一遍的第一笔、开遍之前（光照那遍的输入 / 输出摊开，见 litzero 那一段）
+     id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
+     g_noload_mask = 0;
+     g_rp_layered = 0;
+@@ -14982,6 +16448,7 @@ static void dispatch(const p_dispatch *dp) {
+     g_dispatch_dim[0] = gx; g_dispatch_dim[1] = gy; g_dispatch_dim[2] = (uint32_t)dp->z;   // read back by the driver segment c0 (encode_args_)
+     g_c0_dim_buf = nil;
+     encode_args(ce, cs, 5, 0);
++    lz_cs_note(cs, dp, gx, gy);   // 2026-11-18 litzero 追加 B：compute 派发一览（key / 组数 / 输出缓冲），行在下个开遍前打
+     if (fc) se_bind(ce, cs, 5);   // the variant reads its table at RED_SLOT, filled for this dispatch
+     // Binding ended the shared encoder (same as draw's retry, 11-02 Need for Speed): an image / texture view that needs a format-view usage upgrades its texture (tex_upgrade), whose copy
+     //   goes through blit(). On Metal 3 a copy needs a blit encoder, so blit_open_k ends the shared compute encoder g_blit and ce is an ended encoder; the dispatch below then crashed
+@@ -16670,6 +18137,12 @@ static void td_dump(void) {
+     g_td_done = 1;
+     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+     mtl_finish_gpu();
++    lz_chain_drain(); lz_cs_drain();   // 追加 4：先把选中帧的抓取落成 passdump 行，再写 tsv
++    {   // 2026-11-18 present3：passdump 写 logs/passdump.tsv（失败退当前目录）；写失败只打一行 [pdump]，不关探针。
++        //   每行内容已经随 lz_pd_row 以 [pdump] 打进日志（每帧 ≤ 8 行），诊断包里一定有一份。
++        int nrows = lz_pd_flush(NULL);
++        MLOG("[pdump] tsv rows=%d (每帧 ≤ 8 行见上面的 [pdump] 行)", nrows);
++    }
+     static id<MTLRenderPipelineState> ps, ps_i[2], ps_3d[3]; static id<MTLSamplerState> sp;
+     if (!ps) {
+         static const char *src_msl =
+@@ -16850,6 +18323,17 @@ id<CAMetalDrawable> s2a_ios_reflection_drawable(CAMetalLayer *game) __attribute_
+ #endif
+ void mtl_present_test_stall(uint64_t ns) { g_present_stall_ns = ns; }
+ #include "nvn_present_aa.inc"
++// 2026-11-18 present3：S2A_PRESENT_NODEPTH 默认开 = present 走独立的 pass / pipeline（无 depth/stencil 附件）；
++//   =0 回退旧 present 路径（A/B）。nxnative de704d9 的 present_pipeline / present_encode 就是这个形状。
++static int p3_dedicated(void) {
++    static int v = -1;
++    if (v < 0) {
++        const char *e = getenv("S2A_PRESENT_NODEPTH");
++        v = !(e && *e && !strcmp(e, "0"));
++        if (!v) MLOG("[present3] S2A_PRESENT_NODEPTH=0: old present path (A/B)");
++    }
++    return v;
++}
+ static void present_pipeline(MTLPixelFormat format) {
+     present_options();
+     if (!g_blit_pso || g_blit_fmt != format) {
+@@ -16865,6 +18349,13 @@ static void present_pipeline(MTLPixelFormat format) {
+         MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+         pd.vertexFunction = [lib newFunctionWithName:@"vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
+         pd.colorAttachments[0].pixelFormat = format;
++        pd.colorAttachments[0].blendingEnabled = NO;   // present1 / present3：只把源字节写过去 —— 不混合
++        if (p3_dedicated()) {   // present3：nxnative present_pipeline 的字段 —— 没有 depth / stencil 附件，单采样，写掩码全开
++            pd.colorAttachments[0].writeMask = MTLColorWriteMaskAll;
++            pd.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
++            pd.stencilAttachmentPixelFormat = MTLPixelFormatInvalid;
++            pd.rasterSampleCount = 1;
++        }
+         g_blit_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+         if (!g_blit_pso) MDIE("present pipeline failed %s", e.localizedDescription.UTF8String);
+         g_blit_fmt = format;
+@@ -16890,7 +18381,91 @@ static id<MTLTexture> present_raw_src(id<MTLTexture> src) {
+ }
+ __attribute__((weak)) double s2a_cpatch_present_aspect(void) { return 0; }   // native runtime/src/cpatch.c: current aspect while an adaptive community widescreen patch is on; graphics unit tests without the host have none
+ #include "nvn_present_fit.h"   // pf_crop_fit (present_now) / pf_viewport (both blits); plain C, tested by graphics/nvn/tests/t_present_fit.c
++// S2Arm 2026-11-17 present（照 nxnative 的参考实现）：present 的 viewport 用**层形状**（整个 drawable）定，crop 只用于 UV 子矩形。
++//   旧路（S2A_PRESENT_VIEWPORT=crop，仅 A/B）按有效子矩形的宽高比居中、其余留黑；自适应画幅补丁只在画进画布（screen）那一次套。
++//   present1 S2A_PRESENT_PLAIN=1：viewport 一律层形状（nxnative），宽屏画幅补丁不参与。
++static pf_vp present_viewport_of(double dw, double dh, double cw, double ch, int screen) {
++    if (s2a_present_viewport_layer() || s2a_present_plain()) return (pf_vp){0, 0, dw, dh};
++    double ca = screen ? s2a_cpatch_present_aspect() : 0;
++    return ca > 0 ? pf_viewport(dw, dh, ca, 1) : pf_viewport(dw, dh, cw, ch);
++}
++// ---------- 2026-11-18 present3：present 独立 pass 的 [blit] 状态 / before / after ----------
++//   before：present_src_sample（首帧 + 每 300 帧，blit → buffer → wait，8×8 中心 mean/max）
++//   after ：同一次 present 的最后一个 render pass 之后，在同一个命令缓冲里把 drawable 8×8 中心拷进 shared 缓冲，
++//           命令缓冲完成（M3 completed handler / M4 feedback）后读回。drawable 没有 NVN serial，after 行 ser=0。
++#define P3_AFTER_SLOT 3
++static __strong id<MTLTexture> g_p3_atex;
++static __strong id<MTLBuffer> g_p3_abuf[P3_AFTER_SLOT];
++static int g_p3_awant, g_p3_alogged, g_p3_adone, g_p3_aslot;
++static uint32_t g_p3_afmt;
++static id<MTLBuffer> p3_abuf(int slot) {
++    if (slot < 0 || slot >= P3_AFTER_SLOT) return nil;
++    if (!g_p3_abuf[slot]) {
++        id<MTLBuffer> b = [g_dev newBufferWithLength:256 options:MTLResourceStorageModeShared];
++        if (!b) return nil;
++        res_add(b); g_p3_abuf[slot] = b;
++    }
++    return g_p3_abuf[slot];
++}
++static void p3_begin(uint64_t n, id<MTLTexture> dst) {
++    g_p3_awant = (n == 1 || n % 300 == 0);
++    g_p3_alogged = 0; g_p3_adone = 0; g_p3_aslot = (int)(n % P3_AFTER_SLOT);
++    g_p3_atex = dst; g_p3_afmt = 0;
++}
++static void p3_end(void) { g_p3_atex = nil; g_p3_awant = 0; }
++static void p3_state_log(uint64_t n, id<MTLTexture> dst, pf_vp vp) {
++    if (!g_p3_awant || g_p3_alogged || !dst || dst != g_p3_atex) return;
++    g_p3_alogged = 1;
++    MLOG("[blit] f=%llu pass=%llu key=present blend=0 srcRGB=0 dstRGB=0 dt=none dw=none cmp=none vp=%.0f,%.0f,%.0f,%.0f sc=0,0,%lu,%lu wm=0xf tgt=%lux%lu fmt=0x%x(%s) depthAttachment=none",
++         (unsigned long long)n, (unsigned long long)(g_stat_pass + 1), vp.x, vp.y, vp.w, vp.h,
++         (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.width, (unsigned long)dst.height,
++         (unsigned)dst.pixelFormat, s2a_fmt_name((uint32_t)dst.pixelFormat));
++}
++static void p3_after_log(id<MTLBuffer> b, uint32_t fmt) {
++    if (!b || !b.contents) return;
++    double mean = 0; uint32_t mx = 0;
++    lz_stats((MTLPixelFormat)fmt, (const uint8_t *)b.contents, 8, 8, 32, &mean, &mx);
++    MLOG("[blit] after  dst ser=0 fmt=0x%x mean=%.1f max=%u", fmt, mean, mx);
++}
++static int p3_after_common(id<MTLTexture> dst) {
++    if (!g_p3_awant || g_p3_adone || !dst || dst != g_p3_atex) return 0;
++    if (dst.width < 8 || dst.height < 8) return 0;
++    if (!p3_abuf(g_p3_aslot)) return 0;
++    g_p3_adone = 1; g_p3_afmt = (uint32_t)dst.pixelFormat;
++    return 1;
++}
++static void p3_after_m3(id<MTLCommandBuffer> cb, id<MTLTexture> dst) {
++    if (!p3_after_common(dst)) return;
++    id<MTLBuffer> b = p3_abuf(g_p3_aslot);
++    NSUInteger x = (dst.width - 8) / 2, y = (dst.height - 8) / 2;
++    id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
++    if (!be) { g_p3_adone = 0; return; }
++    [be copyFromTexture:dst sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x, y, 0) sourceSize:MTLSizeMake(8, 8, 1)
++               toBuffer:b destinationOffset:0 destinationBytesPerRow:32 destinationBytesPerImage:256];
++    [be endEncoding];
++    uint32_t fmt = g_p3_afmt;
++    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { if (c.status == MTLCommandBufferStatusCompleted) p3_after_log(b, fmt); }];
++}
++static void p3_after_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> dst) {
++    if (!p3_after_common(dst)) return;
++    id<MTLBuffer> b = p3_abuf(g_p3_aslot);
++    NSUInteger x = (dst.width - 8) / 2, y = (dst.height - 8) / 2;
++    id e = enc_c_begin_on(cb, YES);
++    if (!e) { g_p3_adone = 0; return; }
++    [e copyFromTexture:dst sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x, y, 0) sourceSize:MTLSizeMake(8, 8, 1)
++             toBuffer:b destinationOffset:0 destinationBytesPerRow:32 destinationBytesPerImage:256];
++    enc_end_on(e, YES);
++}
++static void p3_after_feedback(id o) {
++    if (!g_p3_adone) return;
++    id<MTLBuffer> b = p3_abuf(g_p3_aslot);
++    if (!b) { g_p3_adone = 0; return; }
++    uint32_t fmt = g_p3_afmt;
++    g_p3_adone = 0;
++    fb_add(o, ^(id<MTL4CommitFeedback> f) { if (!f.error) p3_after_log(b, fmt); });
++}
+ static int present_blit(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], BOOL flip, int screen) {
++    px_blit_log(src, dst);   // presidx：真正 blit 到 drawable 之前（dst == 这一次 present 的 drawable 时打一行）
+     NSUInteger cx = 0, cy = 0, cw = src.width, ch = src.height;
+     if (crop && (crop[2] || crop[3])) {
+         if (crop[0] < 0 || crop[1] < 0 || crop[2] <= 0 || crop[3] <= 0 ||
+@@ -16905,17 +18480,22 @@ static int present_blit(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTextu
+              (unsigned long)cx, (unsigned long)cy, (unsigned long)cw, (unsigned long)ch, (unsigned long)dst.width, (unsigned long)dst.height); }
+     present_pipeline(dst.pixelFormat);
+     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
++    if (p3_dedicated()) {   // present3：独立 pass 只挂 colorAttachments[0]，显式不设 depth / stencil
++        rp.depthAttachment.texture = nil;
++        rp.stencilAttachment.texture = nil;
++    }
+     // Keep the game picture's aspect ratio and center it, leaving black bars in the rest (no stretching when the screen ratio differs from the game's, e.g. iPhone about 19.5:9 versus the game's 16:9);
+     // when the ratio difference is < 1% (the remainder from the game width being a multiple of 8 in the full-screen setup, e.g. 1952x900 versus 2868x1320 differs by 0.17%) fill directly, leaving no few-pixel border
+     // 自适应画幅补丁开着：游戏按当前画幅画世界，16:9 尺寸的图拉满到这个画幅。只在画进画布（screen）这一次套：
+     //   拷进抗锯齿 / 放大器的中间图要原样拷满，中间图里套了画幅就只剩居中一块、四周黑边，最后拉满时黑边跟着留下、画面挤窄（#1169 SMAA 中 / 高左右留黑）
+-    double dw = dst.width, dh = dst.height, ca = screen ? s2a_cpatch_present_aspect() : 0;
+-    pf_vp pv = ca > 0 ? pf_viewport(dw, dh, ca, 1) : pf_viewport(dw, dh, cw, ch); MTLViewport vp = {pv.x, pv.y, pv.w, pv.h, 0, 1};
++    double dw = dst.width, dh = dst.height;
++    pf_vp pv = present_viewport_of(dw, dh, cw, ch, screen); MTLViewport vp = {pv.x, pv.y, pv.w, pv.h, 0, 1};
+     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
++    p3_state_log(g_present_n, dst, pv);
+     static double last_vp[4];   // Log one line when the viewport changes (used by the real-device screen-level acceptance screen_check.py to check the aspect ratio)
+     if (memcmp(last_vp, &vp, sizeof last_vp)) { memcpy(last_vp, &vp, sizeof last_vp);
+         MLOG("present viewport %.0f,%.0f %.0fx%.0f / canvas %.0fx%.0f (game image %lux%lu)", vp.originX, vp.originY, vp.width, vp.height, dw, dh, (unsigned long)src.width, (unsigned long)src.height); }
+-    rp.colorAttachments[0].texture = dst; rp.colorAttachments[0].loadAction = full ? MTLLoadActionDontCare : MTLLoadActionClear;
++    rp.colorAttachments[0].texture = dst; rp.colorAttachments[0].loadAction = (full || s2a_present_plain()) ? MTLLoadActionDontCare : MTLLoadActionClear;
+     rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+@@ -16927,9 +18507,11 @@ static int present_blit(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTextu
+     [en setFragmentBytes:uv length:sizeof uv atIndex:0];
+     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+     [en endEncoding];
++    p3_after_m3(cb, dst);   // present3：同一条命令缓冲里拷 drawable 8×8，完成后读回打 [blit] after
+     return 1;
+ }
+ static int present_blit_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], id<MTLBuffer> uvBuffer, id table, BOOL flip, int screen) {
++    px_blit_log(src, dst);   // presidx：真正 blit 到 drawable 之前（dst == 这一次 present 的 drawable 时打一行）
+     NSUInteger cx = 0, cy = 0, cw = src.width, ch = src.height;
+     if (crop && (crop[2] || crop[3])) {
+         if (crop[0] < 0 || crop[1] < 0 || crop[2] <= 0 || crop[3] <= 0 ||
+@@ -16941,12 +18523,18 @@ static int present_blit_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLT
+     present_pipeline(dst.pixelFormat);
+     // 自适应画幅补丁开着：游戏按当前画幅画世界，16:9 尺寸的图拉满到这个画幅。只在画进画布（screen）这一次套：
+     //   拷进抗锯齿 / 放大器的中间图要原样拷满，中间图里套了画幅就只剩居中一块、四周黑边，最后拉满时黑边跟着留下、画面挤窄（#1169 SMAA 中 / 高左右留黑）
+-    double dw = dst.width, dh = dst.height, ca = screen ? s2a_cpatch_present_aspect() : 0;
+-    pf_vp pv = ca > 0 ? pf_viewport(dw, dh, ca, 1) : pf_viewport(dw, dh, cw, ch); MTLViewport vp = {pv.x, pv.y, pv.w, pv.h, 0, 1};
++    double dw = dst.width, dh = dst.height;
++    pf_vp pv = present_viewport_of(dw, dh, cw, ch, screen); MTLViewport vp = {pv.x, pv.y, pv.w, pv.h, 0, 1};
+     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
++    p3_state_log(g_present_n, dst, pv);
+     MTL4RenderPassDescriptor *rp = pass_desc();
++    if (p3_dedicated()) {   // present3：独立 pass 只挂 colorAttachments[0]，显式不设 depth / stencil
++        rp.depthAttachment.texture = nil;
++        rp.stencilAttachment.texture = nil;
++        rp.defaultRasterSampleCount = 1;
++    }
+     rp.colorAttachments[0].texture = dst;
+-    rp.colorAttachments[0].loadAction = full ? MTLLoadActionDontCare : MTLLoadActionClear;
++    rp.colorAttachments[0].loadAction = (full || s2a_present_plain()) ? MTLLoadActionDontCare : MTLLoadActionClear;
+     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+     rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+     id<MTL4RenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+@@ -16963,6 +18551,7 @@ static int present_blit_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLT
+     [en setViewport:vp]; [en setRenderPipelineState:g_blit_pso];
+     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+     enc_end_on(en, YES);
++    p3_after_m4(cb, dst);   // present3：同一条命令缓冲里拷 drawable 8×8，完成后 feedback 读回
+     return 1;
+ }
+ #include "nvn_present_fx.inc"
+@@ -16986,10 +18575,14 @@ static const int *rs_aa_crop(id<MTLTexture> src, id<MTLTexture> dst, const int c
+ static int present_encode_slot(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, id<MTLTexture> mirror, const int crop[4], int slot) {
+     present_options();
+     BOOL flip = atomic_load_explicit(&g_origin_ll, memory_order_relaxed) != 0;
+-    NvPresentFX *fx = present_fx_for(slot, src, dst, crop, NO);
+-    if (!g_present_aa && !fx) return present_blit(cb, src, dst, crop, flip, 1) && (!mirror || present_blit(cb, src, mirror, crop, flip, 1));
++    // present1 S2A_PRESENT_PLAIN=1：只保留一次全屏 blit（无 SMAA / MetalFX / 镜像；blend / depth 见 present_pipeline）
++    //   参数是 objc_externally_retained（文件头 #pragma），不能赋值，镜像用本地量关掉。
++    int plain = s2a_present_plain(), aa = plain ? 0 : g_present_aa;
++    NvPresentFX *fx = plain ? nil : present_fx_for(slot, src, dst, crop, NO);
++    id<MTLTexture> mir = plain ? nil : mirror;
++    if (!aa && !fx) return present_blit(cb, src, dst, crop, flip, 1) && (!mir || present_blit(cb, src, mir, crop, flip, 1));
+     id<MTLTexture> out;
+-    if (g_present_aa) {
++    if (aa) {
+         int ac[4]; NvPresentAA *s = present_aa_prepare(slot, src, rs_aa_crop(src, dst, crop, fx, ac));   // rs_aa_crop
+         if (!s || !present_blit(cb, src, s->input, crop, flip, 0) || !present_aa_encode(cb, s, NO)) return 0;
+         out = s->output;
+@@ -17005,7 +18598,7 @@ static int present_encode_slot(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<M
+         present_fx_encode(cb, fx, out);
+         out = fx->output;
+     }
+-    return present_blit(cb, out, dst, NULL, NO, 1) && (!mirror || present_blit(cb, out, mirror, NULL, NO, 1));
++    return present_blit(cb, out, dst, NULL, NO, 1) && (!mir || present_blit(cb, out, mir, NULL, NO, 1));
+ }
+ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4]) {
+     return present_encode_slot(cb, src, dst, nil, crop, 3); // synchronous screen captures
+@@ -17014,11 +18607,15 @@ API_AVAILABLE(macos(26.0), ios(26.0))
+ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, id<MTLTexture> mirror, const int crop[4], int slot) {
+     present_options();
+     BOOL flip = atomic_load_explicit(&g_origin_ll, memory_order_relaxed) != 0;
+-    NvPresentFX *fx = present_fx_for(slot, src, dst, crop, YES);
++    // present1 S2A_PRESENT_PLAIN=1：只保留一次全屏 blit（无 SMAA / MetalFX / 镜像；blend / depth 见 present_pipeline）
++    //   参数是 objc_externally_retained（文件头 #pragma），不能赋值，镜像用本地量关掉。
++    int plain = s2a_present_plain(), aa = plain ? 0 : g_present_aa;
++    NvPresentFX *fx = plain ? nil : present_fx_for(slot, src, dst, crop, YES);
++    id<MTLTexture> mir = plain ? nil : mirror;
+     // The mirror blit writes the same values into the same parameter buffer / table as the blit before it
+-    if (!g_present_aa && !fx) return present_blit_m4(cb, src, dst, crop, g_present_uv[slot], g_present_args, flip, 1) && (!mirror || present_blit_m4(cb, src, mirror, crop, g_present_uv[slot], g_present_args, flip, 1));
++    if (!aa && !fx) return present_blit_m4(cb, src, dst, crop, g_present_uv[slot], g_present_args, flip, 1) && (!mir || present_blit_m4(cb, src, mir, crop, g_present_uv[slot], g_present_args, flip, 1));
+     id<MTLTexture> out;
+-    if (g_present_aa) {
++    if (aa) {
+         int ac[4]; NvPresentAA *s = present_aa_prepare(slot, src, rs_aa_crop(src, dst, crop, fx, ac));   // rs_aa_crop
+         if (!s || !present_blit_m4(cb, src, s->input, crop, s->cropUV, s->cropTable, flip, 0) || !present_aa_encode(cb, s, YES)) return 0;
+         out = s->output;
+@@ -17035,7 +18632,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
+         present_fx_encode(cb, fx, out);
+         out = fx->output;
+     }
+-    return present_blit_m4(cb, out, dst, NULL, g_present_uv[slot], g_present_args, NO, 1) && (!mirror || present_blit_m4(cb, out, mirror, NULL, g_present_uv[slot], g_present_args, NO, 1));
++    return present_blit_m4(cb, out, dst, NULL, g_present_uv[slot], g_present_args, NO, 1) && (!mir || present_blit_m4(cb, out, mir, NULL, g_present_uv[slot], g_present_args, NO, 1));
+ }
+ static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
+ #if !TARGET_OS_SIMULATOR
+@@ -17074,6 +18671,61 @@ API_AVAILABLE(macos(26.0), ios(26.0)) static inline void m4_begin_on(id cb, id a
+ API_AVAILABLE(macos(26.0), ios(26.0)) static inline id m4_render_on(id cb, id d) { return [(id<MTL4CommandBuffer>)cb renderCommandEncoderWithDescriptor:d]; }
+ API_AVAILABLE(macos(26.0), ios(26.0)) static inline void m4_commit_one(id cb, id o) { id<MTL4CommandBuffer> b[] = {cb}; [g_q4 commit:b count:1 options:o]; }
+ #include "nvn_present_fi.inc"   // 出图补帧（没有社区帧率补丁的 30 帧款缺省补到 60，开关按游戏）
++// present1 A：present 出图前的读数 —— 帧号 / 呈现源序列号 / 格式 / 尺寸 / 视口 / 补帧,抗锯齿,MetalFX 是否参与。
++//   每帧一行会刷屏，而且交换链每帧换纹理（ser 一直变）：ser 只打印、不进签名。
++//   只有首帧、格式/尺寸/视口/fi,aa,fx 变化、以及每 300 帧才打一行（与下面 8×8 读回同一节拍）。
++static void present_log(uint64_t n, uint64_t ser, id<MTLTexture> src, pf_vp vp, int fi, int aa, int fx) {
++    struct sig { uint32_t fmt; unsigned long w, h; double vw, vh; int fi, aa, fx; };
++    static struct sig last;
++    struct sig cur; memset(&cur, 0, sizeof cur);   // 连同填充字节一起清零，memcmp 才是稳定的签名比较
++    cur.fmt = (uint32_t)src.pixelFormat; cur.w = (unsigned long)src.width; cur.h = (unsigned long)src.height;
++    cur.vw = vp.w; cur.vh = vp.h; cur.fi = fi; cur.aa = aa; cur.fx = fx;
++    if (n != 1 && n % 300 != 0 && !memcmp(&cur, &last, sizeof cur)) return;
++    last = cur;
++    MLOG("[pres] frame %llu src ser=%llu fmt=0x%lx(%s) %lux%lu viewport=%.0fx%.0f fi=%d aa=%d fx=%d",
++         (unsigned long long)n, (unsigned long long)ser, (unsigned long)cur.fmt, s2a_fmt_name(cur.fmt),
++         cur.w, cur.h, vp.w, vp.h, fi, aa, fx);
++}
++// present1 A2：首帧 + 之后每 300 帧，对呈现时刻的源做一次 8×8 中心区 GPU→CPU 读回，打 mean/max。
++//   一次性 MTLBlitCommandEncoder → MTLBuffer → waitUntilCompleted；失败只打一行红字，不重试。
++//   先 mtl_finish_gpu()：源纹理的写在这次 present 之前提交，和截图（DM_NVN_SHOT）同一条等待路径，避免读到上一帧 / 空纹理。
++static void present_src_sample(id<MTLTexture> src, uint64_t n, uint64_t ser) {
++    if (n != 1 && n % 300 != 0) return;
++    MTLPixelFormat pf = src.pixelFormat;
++    if (s2a_fmt_bits((uint32_t)pf) != 32 ||
++        !(pf == MTLPixelFormatRGBA8Unorm || pf == MTLPixelFormatBGRA8Unorm ||
++          pf == MTLPixelFormatRGBA8Unorm_sRGB || pf == MTLPixelFormatBGRA8Unorm_sRGB)) {
++        RED_ONCE(156, "[pres] src readback: format 0x%lx(%s) is not an 8-bit RGBA / BGRA format; no sample",
++                 (unsigned long)pf, s2a_fmt_name((uint32_t)pf));
++        return;
++    }
++    if (src.width < 8 || src.height < 8) {
++        RED_ONCE(157, "[pres] src readback: source %lux%lu is smaller than 8x8; no sample", (unsigned long)src.width, (unsigned long)src.height);
++        return;
++    }
++    static id<MTLBuffer> buf;
++    if (!buf) {
++        buf = [g_dev newBufferWithLength:256 options:MTLResourceStorageModeShared];
++        if (!buf) { RED_ONCE(158, "[pres] src readback: cannot allocate the 256-byte readback buffer"); return; }
++        res_add(buf);
++    }
++    NSUInteger x = (src.width - 8) / 2, y = (src.height - 8) / 2;
++    mtl_finish_gpu();
++    id<MTLCommandBuffer> cb = q_cb();
++    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
++    if (!b) { RED_ONCE(159, "[pres] src readback: cannot create the blit encoder"); return; }
++    [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x, y, 0) sourceSize:MTLSizeMake(8, 8, 1)
++              toBuffer:buf destinationOffset:0 destinationBytesPerRow:32 destinationBytesPerImage:256];
++    [b endEncoding];
++    [cb commit]; [cb waitUntilCompleted];
++    if (cb.status != MTLCommandBufferStatusCompleted) {
++        RED_ONCE(160, "[pres] src readback: the blit did not complete (status %lu)", (unsigned long)cb.status);
++        return;
++    }
++    const uint8_t *q = buf.contents; uint32_t sum = 0, mx = 0;
++    for (int i = 0; i < 64; i++) { const uint8_t *px = q + 4 * i; for (int c = 0; c < 3; c++) { sum += px[c]; if (px[c] > mx) mx = px[c]; } }
++    MLOG("[blit] before src ser=%llu fmt=0x%x mean=%.1f max=%u", (unsigned long long)ser, (unsigned)pf, sum / (3.0 * 64.0), mx);
++}
+ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
+     if (mtl_gpu_halted()) { atomic_fetch_add_explicit(&g_gpu_refused, 1, memory_order_relaxed); return 0; }   // GPU 安全停：不取画布、不交上屏（调用方按「没交」把票记完成）
+     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
+@@ -17090,6 +18742,8 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+     PD("X ser=%llu", t->serial);
+     id<MTLTexture> src = tex_mtl(t);
+     if (!src) { RED_ONCE(8, "present texture could not get an MTLTexture"); return 0; }
++    px_sc_touch(t->serial, src);   // presidx：交换链纹理第一次拿到 Metal 对象时打 idx / ser / fmt / 尺寸（每条一次）
++    px_win_note(t->serial, src);   // presidx：window 纹理一次性画像（cpu_written / gpu_owned）
+     // S2Arm: a crop reaching past the source (10-28 Splatoon 3 direct full screen: the game sets a 2346x1080 crop for a few frames while the swap chain texture is still
+     //   1920x1080) is shown as the part inside the source, 16:9 with black bars (pf_crop_fit), instead of dropping the frame with "present crop out of bounds";
+     //   once the source covers the crop it is used as given again. Everything below (present, grab, screenshots, fit check, AA) takes the fitted crop
+@@ -17177,17 +18831,30 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+     present_pipeline(layer.pixelFormat);   // Same as the original path: the first frame compiles the pipeline before taking the drawable
+     fit_geom(layer.drawableSize.width, layer.drawableSize.height, pcw, pch);   // game units (was the crop / source size read here)
+     if (g_grab_cb) grab_present(src, crop, layer.drawableSize, ticket);   // Game picture needed by the whole-window screenshot (peek without the lock first; the real take locks inside the function)
+-    if (fi_wanted() && !supplied) { if (@available(macOS 26.0, iOS 26.0, *)) { int fr = fi_frame(src, crop, layer, period, ticket); if (fr >= 0) return fr; } }   // 实验：出图补帧接手这一帧
++    // present1 A：呈现那一刻的读数（在任何 encode、取 drawable 之前）；首帧 + 每 300 帧再做一次 8×8 中心区读回。
++    int plain = s2a_present_plain();
++    int fi = !plain && fi_wanted() && !supplied;   // present1 B：PLAIN 时补帧整条路径不参与
++    { double dw = layer.drawableSize.width, dh = layer.drawableSize.height;
++      NSUInteger sw = crop && (crop[2] || crop[3]) ? (NSUInteger)crop[2] : src.width;
++      NSUInteger sh = crop && (crop[2] || crop[3]) ? (NSUInteger)crop[3] : src.height;
++      pf_vp pv = present_viewport_of(dw, dh, sw, sh, 1);
++      present_log(g_present_n, t->serial, src, pv, fi, !plain && g_present_aa != 0, !plain && g_present_fx != 0);
++      present_src_sample(src, g_present_n, t->serial); }
++    // 实验：出图补帧接手这一帧（不看我们改过的 drawable）
++    if (fi) { if (@available(macOS 26.0, iOS 26.0, *)) { int fr = fi_frame(src, crop, layer, period, ticket); if (fr >= 0) return fr; } }   // 实验：出图补帧接手这一帧
+     uint64_t dt0 = now_ns();
+     id<CAMetalDrawable> dr = supplied ? supplied : [layer nextDrawable];
+     if (!supplied) g_drawable_ns += now_ns() - dt0;
+     if (!dr) return 0;
++    p3_begin(g_present_n, dr.texture);   // present3：这一次 present 的 drawable（[blit] 状态 / after 读数只认它）
++    px_blit_begin(frame, t->serial, src, dr.texture);   // presidx：这一次 present 的帧号 / 呈现源 serial / 源基纹理 / drawable
+     // iOS split view: the lower-area reflection gets this frame too, drawn in this same present (nil when it is not showing)
+ #if TARGET_OS_IPHONE
+     id<CAMetalDrawable> mdr = s2a_ios_reflection_drawable ? s2a_ios_reflection_drawable(layer) : nil;
+ #else
+     id<CAMetalDrawable> mdr = nil;
+ #endif
++    if (plain) mdr = nil;   // present1 B：PLAIN 不做 iOS 镜像（只画 drawable 这一次）
+     if (mdr && !g_m3 && g_present_mirror_resident != mdr.layer) { if (@available(macOS 26.0, iOS 26.0, *)) { [g_q4 addResidencySet:((CAMetalLayer *)mdr.layer).residencySet]; g_present_mirror_resident = mdr.layer; } }
+     int alloc_i = (int)(ticket % 3);
+     present_options();
+@@ -17206,6 +18873,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+         cb3 = [g_q3 commandBuffer];   // retained references: keeps the drawable and the source until it is done
+         ext_wait3(cb3);
+         if (!present_encode_slot(cb3, src, dr.texture, mdr.texture, crop, alloc_i)) return 0;
++        p3_end();
+     } else if (@available(macOS 26.0, iOS 26.0, *)) {
+         [g_present_alloc4[alloc_i] reset];
+         [g_q4 waitForDrawable:dr];
+@@ -17213,6 +18881,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+         cb = g_present_cb[alloc_i];
+         [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
+         if (!present_encode_m4(cb, src, dr.texture, mdr.texture, crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; if (mdr) [g_q4 signalDrawable:mdr]; return 0; }
++        p3_end();
+         if (rl_m4) {   // DM_NVN_REGLUM: after the present blit, behind the same queue barrier
+             id<MTLBuffer> b = g_rl_buf[alloc_i];
+             if (!b || b.length < rw * rh * 4) { if (b) res_remove(b); b = g_rl_buf[alloc_i] = [g_dev newBufferWithLength:rw * rh * 4 options:MTLResourceStorageModeShared]; res_add(b); }
+@@ -17223,6 +18892,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+         [cb endCommandBuffer];
+     } else MDIE("【红】 Metal 4 presentation requires macOS / iOS 26");
+     id o = fb_new();
++    if (!g_m3) p3_after_feedback(o);   // present3：M4 的 after 拷贝在命令缓冲里，feedback 里读回
+     if (rl_m4) { id<MTLBuffer> b = g_rl_buf[alloc_i]; NSUInteger w = rw, h = rh; unsigned long long n = rn, tns = rtns;   // added before the slot-release handler below: the slot (and this buffer) is reused only after that one ran
+         fb_add(o, ^(id<MTL4CommitFeedback> f) { if (!f.error) rl_row(b.contents, w, h, n, tns); }); }
+     NvPresentAA *aa = g_present_aa ? g_present_aa_slots[alloc_i] : nil;
+@@ -17591,7 +19261,11 @@ void mtl_link_pause(int on);
+ // (hle_nvn.c nvnWindowAcquireTexture -> nvn_be_present_wait). Without clearing, the game cannot advance a single tick during those 2.5 seconds of waiting for the save, and the save is not written (the same pattern three times in player logs: 3 frames queued, 0 submits)
+ void mtl_present_discard(int on) { atomic_store(&g_present_discard, on != 0); if (on) present_drop_for_suspend(); }
+ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4], uint64_t ev_val);
+-uint64_t nvn_be_present(const tex_t *t, double period, const int crop[4]) { int c[4] = {0}; if (crop) memcpy(c, crop, sizeof c); wd_present(t, c); return present_enqueue(t, period, crop || c[2] || c[3] ? c : NULL, 0); }   // S2Arm widen: present notice (a fallback crop the core set counts even when the game gave none)
++uint64_t nvn_be_present(const tex_t *t, double period, const int crop[4]) {
++    int c[4] = {0}; if (crop) memcpy(c, crop, sizeof c);
++    if (t) px_present_note(atomic_load(&g_cur_frame), t->serial);   // presidx：每 60 帧一行本帧写者集合 ↔ 本次呈现的 serial
++    wd_present(t, c); return present_enqueue(t, period, crop || c[2] || c[3] ? c : NULL, 0);   // S2Arm widen: present notice (a fallback crop the core set counts even when the game gave none)
++}
+ void *mtl_device(void) { mtl_init(); return (__bridge void *)g_dev; }
+ // An external producer's texture (the Vulkan layer's swapchain images): a serial the present path resolves (serial_put), resident for the Metal 4 queue, never collected by the cross-submit ledger
+ uint64_t mtl_ext_tex(void *tex) {
+@@ -17852,4 +19526,4 @@ void nvn_be_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_a
+ // 弱链接[nvntest]：s2a_frame_replay_screen（同上，runtime/src/widen.c）
+ // 弱链接[nvntest]：s2a_npdm_program_id_set（同上，runtime/src/gfxmode.c）
+ #include "nvn_frame_rec.inc"   // 帧录放（graphics/nvn/docs/frame_replay.md）
+-#pragma clang attribute pop
++#pragma clang attribute pop
+\ No newline at end of file
+diff --git a/graphics/tools/direct/dsh/Dsh.cs b/graphics/tools/direct/dsh/Dsh.cs
+index 7e9a62a..b15ab50 100644
+--- a/graphics/tools/direct/dsh/Dsh.cs
++++ b/graphics/tools/direct/dsh/Dsh.cs
+@@ -136,6 +136,7 @@ namespace S2A.Dsh
+         {
+             public string Key, Out, W; public ISpvCross Xc; public DshTables T;
+             public readonly List<string> Written = new();
++            public List<long> URegs; public string UFallback;   // #427 [uint-read]：最近一次 Msl 改写的纹理槽（反射 "u_read"）/ 整支回退的原因（反射 "u_read_fallback"）
+             string Spv => Path.Combine(W, Key + ".spv");
+ 
+             // ---- job_for ----
+@@ -353,7 +354,10 @@ namespace S2A.Dsh
+                 s = GatherOffsets(s);   // 四偏移 gather 拆成四次常量偏移（见 GatherOffsets）
+                 s = PoolArrays(s);   // 追不到槽的句柄读宿主的池表（见 PoolArrays）
+                 string resPath = Path.Combine(Path.GetDirectoryName(spvPath) ?? "", (resKey ?? Path.GetFileNameWithoutExtension(spvPath)) + ".res.json");
+-                return XIo.Exists(resPath) ? PoolNoInline(s, JsonNode.Parse(XIo.ReadAllText(resPath)) as JsonObject) : s;
++                string r = XIo.Exists(resPath) ? PoolNoInline(s, JsonNode.Parse(XIo.ReadAllText(resPath)) as JsonObject) : s;
++                string w = UintRead(r, Key, out var ureg, out var ufb);   // #427 [uint-read]：整数纹理按 uint 读（保守改写 + 整份校验 + 回退）
++                URegs = ureg; UFallback = ufb;
++                return w;
+             }
+ 
+             void Save(string name, string text)
+@@ -436,7 +440,7 @@ namespace S2A.Dsh
+                 // 片元：Alpha 测试与多重采样关的可选函数常量（FsAlphaMs，族 34 / 37）进库里的主入口；src 不带它（反射、可读瓦片 _bf、输出类型 _ft 照旧读 src）
+                 string srcx = stage == "ps" ? FsAlphaMs(src) : src;
+                 if (stage == "ps") full = srcx;
+-                var (fu, uMask) = stage == "ps" ? FsUint(srcx, colorAnalysis) : (null, 0u);
++                var (fu, uMask) = stage == "ps" ? FsUint(srcx, colorAnalysis, Key) : (null, 0u);
+                 if (fu != null) { plain = srcx; full = fu; }
+                 var res = JsonNode.Parse(XIo.ReadAllText(Path.Combine(W, Key + ".res.json"))).AsObject();
+                 full = DshFlat.GiantFix(full).Item1;   // 巨型着色器的尾部阶梯压平（同 dmsh_build.py giant_fix）
+@@ -453,6 +457,9 @@ namespace S2A.Dsh
+                 if (j["tf"] is JsonArray tf2) { refl["entry_tf"] = "main0_tf"; refl["tf_strides"] = tf2.Select(e => (object)(e is JsonArray ea && ea.Count > 0 ? (long)ea[0] : 0L)).ToList(); }
+                 if (lay != null) { refl["entry_layer"] = "main0_l"; refl["entry_layer_z"] = "main0_lz"; refl["layer_from"] = lay; }
+                 if (fu != null) { refl["entry_u"] = "main0_u"; refl["u_mask"] = (long)uMask; }
++                // #427 [uint-read]：这支 MSL 里被声明成 texture…<uint|int> 的纹理槽（宿主 nvn_mtl.m 的**唯一**可靠来源，包里没有 .metal）
++                if (URegs is { Count: > 0 }) refl["u_read"] = URegs.Select(x => (object)x).ToList();
++                if (UFallback != null) refl["u_read_fallback"] = UFallback;
+                 refl["threadgroup_size"] = j["local"]?.DeepClone();
+                 if (stage == "cs") { refl["tensor_mma_abi"] = tensorMma >= 0 ? 1L : 0L; refl["tensor_mma_count"] = (long)tensorMma; }
+                 if (spill != 0) { refl["spill"] = (long)spill; refl["spill_slot"] = (long)SPILL_SLOT; }
+@@ -506,6 +513,8 @@ namespace S2A.Dsh
+                     if (kind == "ms") refl["mesh_relay_slice_words"] = (long)sw;   // 每个任务组的片数 = 任务线程数（mesh_threads），宿主写进中转头
+                 }
+                 if (kind == "ms") { refl["mesh_task"] = mi.Task; refl["max_vertices"] = (long)mi.MaxV; refl["max_primitives"] = (long)mi.MaxP; }
++                if (URegs is { Count: > 0 }) refl["u_read"] = URegs.Select(x => (object)x).ToList();   // #427 [uint-read]
++                if (UFallback != null) refl["u_read_fallback"] = UFallback;
+                 refl["threadgroup_size"] = j["local"]?.DeepClone();
+                 refl["c1"] = Convert.ToHexStringLower(c1); refl["notes"] = notes; refl["drv_reads"] = dr; refl["drv_unfillable"] = Unfillable(dr, kind);
+                 refl["bindings"] = Reflect(kind, src, res);
+@@ -572,7 +581,8 @@ namespace S2A.Dsh
+                         if (rc != 0 || !XIo.Exists(spv)) throw new DshError("translation failed", Sl($"hull shader for {TESS_DOM.GetValueOrDefault(d, d.ToString())}: " + err.Trim(), 0, 160));
+                     }
+                     var (src, flags, ocp) = NxgalSpvCross.TessMsl(NxgalSpvCross.Harden(XIo.ReadAllBytes(spv)), 0, TESS_BASE);
+-                    src = Precise(PoolArrays(GatherOffsets(src))); Save(lk + ".metal", src);
++                    src = UintRead(Precise(PoolArrays(GatherOffsets(src))), Key, out URegs, out UFallback);   // #427 [uint-read]（曲面不走 Msl，这里补上）
++                    Save(lk + ".metal", src);
+                     variants[TESS_DOM.GetValueOrDefault(d, d.ToString())] = new PyDict { ["library"] = lk, ["flags"] = (long)flags, ["output_control_points"] = (long)ocp };
+                     first ??= src;
+                 }
+@@ -583,6 +593,8 @@ namespace S2A.Dsh
+                     ["entry"] = "main0", ["msl_entry_kind"] = stage == "hs" ? "kernel" : "vertex", ["c1"] = Convert.ToHexStringLower(c1), ["notes"] = notes, ["drv_reads"] = dr,
+                     ["drv_unfillable"] = Unfillable(dr), ["bindings"] = Reflect(stage, first, res), ["vertex_inputs"] = new List<object>(), ["raster"] = new PyDict(), ["vs_pad"] = new List<object>(),
+                     ["tess"] = new PyDict { ["base_slot"] = (long)TESS_BASE, ["mode"] = mode, ["variants"] = variants } };
++                if (URegs is { Count: > 0 }) refl["u_read"] = URegs.Select(x => (object)x).ToList();   // #427 [uint-read]
++                if (UFallback != null) refl["u_read_fallback"] = UFallback;
+                 SaveJson(Key + "_b.json", refl);
+             }
+ 
+@@ -618,6 +630,8 @@ namespace S2A.Dsh
+                         ["geometry"] = new PyDict { ["vertices"] = (long)nvt, ["invocations"] = (long)inv, ["output"] = (long)topology, ["stride"] = Py.FromJson(res["geometry_stride"]), ["index_stride"] = (long)nidx },
+                         ["c1"] = Convert.ToHexStringLower(c1), ["notes"] = notes, ["drv_reads"] = DrvReads(src), ["drv_unfillable"] = new List<object>(),
+                         ["bindings"] = Reflect("gs", src, res), ["vertex_inputs"] = new List<object>(), ["raster"] = new PyDict() };
++                    if (URegs is { Count: > 0 }) refl["u_read"] = URegs.Select(x => (object)x).ToList();   // #427 [uint-read]
++                    if (UFallback != null) refl["u_read_fallback"] = UFallback;
+                     if (j["gs_tf"] is JsonArray gtf) ((PyDict)refl["geometry"])["tf"] = GeoTf(Key, gtf, res);   // 同 dmsh_build.py geometry_finish：有 gs_tf 就写，换算不了是 null
+                     foreach (var field in ScaleMetadata(res)) refl[field.Key] = field.Value;
+                     if (fast)
+@@ -650,6 +664,8 @@ namespace S2A.Dsh
+                 var meta = new PyDict { ["key"] = Key + suffix, ["route"] = "B", ["chain"] = Chain, ["xfp"] = Xfp, ["dm_ctl"] = Key, ["stage"] = "vs", ["entry"] = "main0", ["entry_z"] = "main0_z", ["msl_entry_kind"] = "vertex",
+                     ["geometry_reader"] = true, ["geometry_output"] = (long)topology, ["c1"] = "", ["notes"] = new List<object>(), ["drv_reads"] = new PyDict(), ["drv_unfillable"] = new List<object>(),
+                     ["bindings"] = Reflect("vs", analysis, new JsonObject { ["sbufs"] = new JsonArray() }), ["vertex_inputs"] = new List<object>(), ["raster"] = new PyDict() };
++                if (URegs is { Count: > 0 }) meta["u_read"] = URegs.Select(x => (object)x).ToList();   // #427 [uint-read]
++                if (UFallback != null) meta["u_read_fallback"] = UFallback;
+                 if (full.Contains(PushParam, StringComparison.Ordinal)) meta["s2a_push"] = true;
+                 meta["resolution_scale_abi"] = 2L;
+                 meta["resolution_scale_exact"] = false;
+@@ -1987,10 +2003,21 @@ namespace S2A.Dsh
+             return (full + add, new PyDict { ["loc"] = (long)locs[name], ["comp"] = comp });
+         }
+ 
+-        /// <summary>整数输出入口 main0_u（同 dmsh_build.fs_uint，缺口 2 A 段）：只把按整数位写的颜色输出改 uint，其余照旧浮点；只写常量的（清屏）全部改 uint。
+-        /// → (接上 main0_u 的源码, u_mask：位 n = 改成 uint 的 color(n))；不像整数写的返回 (null, 0)</summary>
+-        internal static (string Src, uint UMask) FsUint(string src, string analysis = null)
++        /// <summary>整数输出入口 main0_u（同 nxnative dmsh_entry.py fs_uint）：**每一个**像素着色器都出这一支。
++        /// Maxwell 把输出寄存器的位原样写进目标，目标的格式（不是着色器）决定这些位是浮点、无符号还是带符号整数；没有 PC 版时翻译器把所有颜色输出声明成浮点，
++        /// 浮点成员接到整数画布上 Metal 给的是未定义值（画面不报错，只是黑 / 花）。所以 main0_u 是同一份函数体分别按 float / uint / int 三种位型返回每个颜色槽
++        /// （as_type 位拷贝，不换算），由**按索引**的 bool 函数常量选：S2A_UIn = 208 + n（无符号）、S2A_SIn = 224 + n（带符号），两个都假 = 浮点
++        /// （S2A_UFn = !S2A_UIn &amp;&amp; !S2A_SIn，派生常量）。为什么第三个不用 240+n 的**真**函数常量：MSL 规定带 function_constant 属性的变量不能带初值，
++        /// 而每个声明出来的常量在特化时都必须给值——派生常量既少一个常量，又让「一个都不给」的那次特化（宿主载入时 nvn_mtl.m 6959 行）自然等于 main0。
++        /// 宿主按管线每个目标的 Metal 格式逐输出设这几个常量（nvn_mtl.m fs_u_fn），所以「哪些输出进整数画布」由管线说了算，不再从着色器代码猜。
++        /// 以前这里是「build 期猜 u_mask + 34 条手工真值表，宿主只在 need == u_mask 时用 main0_u」，5,294 个片元里绝大多数没有整数入口 → 整数附件被静默写未定义。
++        /// u_mask 仍按启发式算出来写进反射（出包侧的 _ft 变体表按它去重），宿主的选用只看目标格式。
++        /// → (接上 main0_u 的源码, u_mask：位 n = 启发式认为写整数的 color(n))；没有颜色输出 / 认不出 main0 返回 (null, 0)</summary>
++        internal static (string Src, uint UMask) FsUint(string src, string analysis = null, string key = null)
+         {
++            // 幂等：已经接过 main0_u 的源码先截掉那一段（同一个输入被处理两次时不会出现两个 main0_out_u，同 FsTyped 的截断标记）
++            int cut = src.IndexOf("\n// S2A_UMASK_ENTRY\n", StringComparison.Ordinal); if (cut < 0) cut = src.IndexOf("\nstruct main0_out_u\n", StringComparison.Ordinal);
++            if (cut >= 0) src = src[..cut];
+             var m = Search(@"^.*\bfragment\s+main0_out\s+main0\s*\(", src, RegexOptions.Multiline); var st = Search(@"struct main0_out\s*\{(.*?)\};", src, RegexOptions.Singleline);
+             if (!m.Success || !st.Success) return (null, 0);
+             var mem = FsMembers(st);
+@@ -2003,11 +2030,68 @@ namespace S2A.Dsh
+             var pm = Search(@"^.*\bfragment\s+main0_out\s+main0\s*\(", probe, RegexOptions.Multiline);
+             string body = pm.Success ? probe[pm.Index..] : ""; int ret = body.IndexOf("return out;", StringComparison.Ordinal); if (ret >= 0) body = body[..(ret + 1)];
+             var ints = IntOutputs(body, cols.Keys);
+-            if (fromInt.Count == 0 && ints.Count == 0 && !(writes.Count > 0 && writes.All(w => Full(@"-?[0-9.]+f?|float\d\([-0-9., ]*\)", w.Trim()).Success))) return (null, 0);
+             if (ints.Count == 0) ints = fromInt;   // 一个都说不清：照旧，按整数位写出的都算
+             bool U((string Ty, string Nm, string At) x) => cols.ContainsKey(x.Nm) && (ints.Count == 0 || ints.Contains(x.Nm));
+             uint mask = 0; foreach (var x in mem) if (U(x)) mask |= 1u << Int(Search(@"color\((\d+)\)", x.At).Groups[1].Value);
+-            return (src + "\n" + FsRetyped(src, m, mem, x => U(x) ? "u" : null, "_u"), mask);
++            // 猜不出（fromInt / ints 都空、也没有「只写常量」的赋值）也照旧出 main0_u：以前这里 return (null, 0)，那正是绝大多数片元没有整数入口的原因。
++            //   u_mask 只是启发式的诊断值（写进反射给 _ft 变体表去重），宿主不再拿它做精确比较。
++            string entry = FsUintEntry(src, m, mem);
++            if (entry == null) return (null, 0);
++            return (src + "\n" + entry, mask);
++        }
++
++        // 208 + n / 224 + n：颜色槽 n 的**函数常量**（nvn_mtl.m fs_u_fn 按索引设；100 / 101 已给 S2A_AT / S2A_MSOFF，见 FC_DECL）。
++        //   浮点那一份不占常量索引：S2A_UFn = !S2A_UIn && !S2A_SIn（MSL 不允许 function_constant 变量带初值，派生常量既省索引又让「一个都不给」的特化等于 main0）。
++        //   为什么按索引：iPhone 的 metal 把函数常量放进库的命名空间（metallib 里是 <hash>::S2A_UI0），宿主按名字 setConstantValue:…withName: 会被静默忽略。
++        internal const int S2A_UINT_FC = 208, S2A_SINT_FC = 224;
++
++        /// <summary>按管线逐目标定类型的整数输出入口 main0_u（同 nxnative dmsh_entry.py fs_uint）：main0_out 里出现的**每一个**颜色槽都出三条成员
++        /// （floatN / uintN / intN，同位宽、同一 [[color(n)]]），由按索引的函数常量 S2A_UIn（208+n，无符号目标）与 S2A_SIn（224+n，带符号目标）选，
++        /// 两个都假 → float 成员，等于 main0。宿主按管线每个目标的 Metal 格式逐输出设（nvn_mtl.m fs_u_fn），管线说了算。
++        /// 其它成员（sample_mask、认不出的类型如 half / ushort 的颜色）原样复制，同 nxnative。</summary>
++        static string FsUintEntry(string src, Match m, List<(string Ty, string Nm, string At)> mem)
++        {
++            int Loc(string at) { if (string.IsNullOrEmpty(at)) return -1; var c = Search(@"color\((\d+)\)", at); return c.Success ? int.Parse(c.Groups[1].Value) : -1; }
++            // 能分三类写的颜色成员：float / uint / int，宽度 1..4（uint2 之类声明成整数的槽也出全三条——以前只给 float 声明的槽出对，整数槽整支消失）
++            (string K, string W) Col(string ty) { var pm = Search(@"^(float|uint|int)([1-4]?)$", ty); return pm.Success ? (pm.Groups[1].Value, pm.Groups[2].Value) : (null, null); }
++            var cols = new Dictionary<string, (string K, string W)>(StringComparer.Ordinal);
++            foreach (var x in mem) { if (Loc(x.At) < 0) continue; var c = Col(x.Ty); if (c.K != null) cols[x.Nm] = c; }
++            if (cols.Count == 0) return null;
++            var used = mem.Select(x => Loc(x.At)).Where(l => l >= 0).Distinct().OrderBy(l => l).ToList();
++            var sb = new StringBuilder();
++            sb.Append("\n// S2A_UMASK_ENTRY\n");
++            sb.Append("// s2a:typed-outputs uint 208+n / sint 224+n / float = neither (nvn_mtl.m fs_u_fn; one ps entry for every pixel shader)\n");
++            foreach (var n in used)
++                sb.Append($"constant bool S2A_UI{n} [[function_constant({S2A_UINT_FC + n})]];\nconstant bool S2A_SI{n} [[function_constant({S2A_SINT_FC + n})]];\nconstant bool S2A_UF{n} = !S2A_UI{n} && !S2A_SI{n};\n");
++            sb.Append("\nstruct main0_out_u\n{\n");
++            foreach (var x in mem)
++            {
++                int l = Loc(x.At);
++                if (l >= 0 && cols.TryGetValue(x.Nm, out var c))
++                {   // 三条成员按 float → uint → int 印（与 struct 成员的顺序无关，[[color(n)]] 决定落哪个附件；只留常量选中的那条）
++                    sb.Append($"    float{c.W} {x.Nm} [[color({l}), function_constant(S2A_UF{l})]];\n");
++                    sb.Append($"    uint{c.W} {x.Nm}_ui [[color({l}), function_constant(S2A_UI{l})]];\n");
++                    sb.Append($"    int{c.W} {x.Nm}_si [[color({l}), function_constant(S2A_SI{l})]];\n");
++                }
++                else sb.Append(string.IsNullOrEmpty(x.At) ? $"    {x.Ty} {x.Nm};\n" : $"    {x.Ty} {x.Nm} {x.At};\n");
++            }
++            sb.Append("};\n\n");
++            var conv = new StringBuilder($"main0_out_u r = {{}};\n");   // 行首的缩进由被替换的 "return out;" 自带
++            foreach (var x in mem)
++            {
++                int l = Loc(x.At);
++                if (l >= 0 && cols.TryGetValue(x.Nm, out var c))
++                {   // 位拷贝：硬件往画布写的就是输出寄存器的位，as_type 不换算；声明已经是那一类时直接赋
++                    string U = c.K == "uint" ? $"out.{x.Nm}" : $"as_type<uint{c.W}>(out.{x.Nm})";
++                    string S = c.K == "int" ? $"out.{x.Nm}" : $"as_type<int{c.W}>(out.{x.Nm})";
++                    string F = c.K == "float" ? $"out.{x.Nm}" : $"as_type<float{c.W}>(out.{x.Nm})";
++                    conv.Append($"    if (S2A_UI{l}) r.{x.Nm}_ui = {U}; else if (S2A_SI{l}) r.{x.Nm}_si = {S}; else r.{x.Nm} = {F};\n");
++                }
++                else conv.Append($"    r.{x.Nm} = out.{x.Nm};\n");
++            }
++            conv.Append("    return r;");
++            string body = Replace(Sub(@"\bfragment\s+main0_out\s+main0\s*\(", "fragment main0_out_u main0_u(", src[m.Index..], 1), "return out;", conv.ToString());
++            return sb.ToString() + body;
+         }
+ 
+         /// <summary>装整数、不是浮点位型的颜色输出（同上游参考实现（MIT）a4d7bb7b dmsh_build.py int_outputs）。逐个输出写顺着局部量往回追：整数运算算出的、或小整数常量
+@@ -2095,7 +2179,7 @@ namespace S2A.Dsh
+         /// src 是现编出的整份 .metal：先截掉已接的 main0_u（main0 是它前面最后一个函数）。→ 只含 main0 与 main0_t 的源码；认不出 main0 返回 null</summary>
+         internal static string FsTyped(string src, uint umask, uint smask)
+         {
+-            int cut = src.IndexOf("\nstruct main0_out_u\n", StringComparison.Ordinal); if (cut >= 0) src = src[..cut];
++            int cut = src.IndexOf("\n// S2A_UMASK_ENTRY\n", StringComparison.Ordinal); if (cut < 0) cut = src.IndexOf("\nstruct main0_out_u\n", StringComparison.Ordinal); if (cut >= 0) src = src[..cut];
+             var m = Search(@"^.*\bfragment\s+main0_out\s+main0\s*\(", src, RegexOptions.Multiline); var st = Search(@"struct main0_out\s*\{(.*?)\};", src, RegexOptions.Singleline);
+             if (!m.Success || !st.Success) return null;
+             int Loc(string at) { var c = Search(@"color\((\d+)\)", at); return c.Success ? int.Parse(c.Groups[1].Value) : -1; }
+@@ -2114,6 +2198,271 @@ namespace S2A.Dsh
+             return src + "\n" + FsRetyped(src, m, mem, x => pre.GetValueOrDefault(x.Nm), "_t", zero);
+         }
+ 
++        // ---- #427 [uint-read]：整数纹理按 uint 读（源码级保守改写，0.4.3 新写） ----
++
++        /// <summary>[uint-read] 文件头标记（宿主 nvn_mtl.m msl_uint_read_probe 兜底认它）：前缀之后是逗号分隔的纹理槽 reg。
++        /// 没有改写任何槽时**不写**这一行；首行已有它 → 幂等原样返回（槽号从它读回）。</summary>
++        internal const string UINT_READ_BEGIN = "// s2a:uint-read ";
++
++        static readonly object s_urLock = new object();
++        /// <summary>回退清单（整支不改）："&lt;key&gt;: &lt;原因&gt;"，同时往 stderr 打一行 [uint-read] fallback（出包日志里可查）</summary>
++        internal static readonly List<string> UintReadFallbacks = new List<string>();
++        internal static int UintReadDone, UintReadReverted, UintReadIdem;   // 改成功 / 回退 / 幂等返回的支数
++
++        static void UintReadRevert(string key, string why)
++        {
++            lock (s_urLock)
++            {
++                UintReadReverted++;
++                if (UintReadFallbacks.Count < 4096) UintReadFallbacks.Add(key + ": " + why);
++            }
++            Console.Error.WriteLine("[uint-read] fallback " + key + ": " + why);
++        }
++
++        /// <summary>把字符串 / 字符字面量与 // 、/* */ 注释整段换成空格（换行保留、长度不变）。正则匹配与括号计数都在这份「掩码稿」上做：
++        /// 字面量 / 注释里的 as_type 与括号一律不认（旧实现 R2 / R3 的根）。先在 raw 上算偏移，再用同一偏移切 raw</summary>
++        static string MaskCode(string s)
++        {
++            var b = new char[s.Length];
++            int i = 0;
++            while (i < s.Length)
++            {
++                char c = s[i];
++                if (c == '/' && i + 1 < s.Length && s[i + 1] == '/')
++                {   // 行注释：到行尾（换行留着）
++                    while (i < s.Length && s[i] != '\n') { b[i] = ' '; i++; }
++                    continue;
++                }
++                if (c == '/' && i + 1 < s.Length && s[i + 1] == '*')
++                {   // 块注释：到 */（换行留着；没闭合就到文件尾）
++                    b[i] = ' '; if (i + 1 < s.Length) b[i + 1] = ' '; i += 2;
++                    while (i < s.Length && !(s[i] == '*' && i + 1 < s.Length && s[i + 1] == '/'))
++                    {
++                        if (s[i] != '\n') b[i] = ' ';
++                        i++;
++                    }
++                    if (i < s.Length) { b[i] = ' '; i++; if (i < s.Length) { b[i] = ' '; i++; } }
++                    continue;
++                }
++                if (c == '"' || c == '\'')
++                {   // 字符串 / 字符字面量：反斜杠转义跳过两字节，遇换行（未闭合）停
++                    char q = c; b[i] = ' '; i++;
++                    while (i < s.Length)
++                    {
++                        char d = s[i];
++                        if (d == '\\') { b[i] = ' '; i++; if (i < s.Length) { b[i] = ' '; i++; } continue; }
++                        if (d == '\n') break;
++                        b[i] = ' '; i++;
++                        if (d == q) break;
++                    }
++                    continue;
++                }
++                b[i] = c; i++;
++            }
++            return new string(b);
++        }
++
++        /// <summary>open（'(' 的下标）起配对的 ')' 之后；**只数圆括号**，跳过字符串 / 字符字面量与 // 、/* */ 注释。
++        /// 在 depth 0 上遇到 ';'（这条调用没有闭合）或到文件尾 → -1（该候选整个丢弃，不回退整支）</summary>
++        static int AsTypeEnd(string s, int open)
++        {
++            int d = 0;
++            for (int i = open; i < s.Length; i++)
++            {
++                char c = s[i];
++                if (c == '/' && i + 1 < s.Length && s[i + 1] == '/') { while (i < s.Length && s[i] != '\n') i++; continue; }
++                if (c == '/' && i + 1 < s.Length && s[i + 1] == '*')
++                {
++                    i += 2;
++                    while (i < s.Length && !(s[i] == '*' && i + 1 < s.Length && s[i + 1] == '/')) i++;
++                    i++; continue;
++                }
++                if (c == '"' || c == '\'')
++                {
++                    char q = c;
++                    for (i++; i < s.Length; i++)
++                    {
++                        if (s[i] == '\\') { i++; continue; }
++                        if (s[i] == '\n' || s[i] == q) break;
++                    }
++                    continue;
++                }
++                if (c == '(') d++;
++                else if (c == ')') { d--; if (d == 0) return i + 1; }
++                else if (c == ';' && d == 0) return -1;
++            }
++            return -1;
++        }
++
++        /// <summary>pd[i] = 下标 i 之前的圆括号深度（掩码稿上算一次，逐候选 O(1) 查）</summary>
++        static int[] PrefixDepth(string masked)
++        {
++            var pd = new int[masked.Length + 1];
++            int d = 0;
++            for (int i = 0; i < masked.Length; i++)
++            {
++                pd[i] = d;
++                char c = masked[i];
++                if (c == '(') d++;
++                else if (c == ')') d--;
++            }
++            pd[masked.Length] = d;
++            return pd;
++        }
++
++        /// <summary>整条语句内：从 as_type 往前找最近的 ';' / '{' / '}' 得语句起点 st，要求 [st, close] 里圆括号深度始终 ≥ depth(st)
++        /// （不会跨出 st 之前开的那层括号）且 depth(st) 这一层上不出现 ';'（语句没被截断；for(;;) 的分号在更深一层，不算）。
++        /// 允许 as_type 嵌在更外层的调用里（如 float4(as_type&lt;uint&gt;(…))），只要求整条调用落在一条语句里</summary>
++        static bool InOneStatement(string masked, int[] pd, int start, int close)
++        {
++            if (close <= start || close > pd.Length) return false;
++            int st = 0;
++            for (int i = start - 1; i >= 0; i--)
++            {
++                char c = masked[i];
++                if (c == ';' || c == '{' || c == '}') { st = i + 1; break; }
++            }
++            int d0 = pd[st];
++            for (int i = st; i < close; i++)
++            {
++                if (pd[i] < d0) return false;
++                if (masked[i] == ';' && pd[i] == d0) return false;
++            }
++            return pd[close] >= d0;
++        }
++
++        /// <summary>as_type&lt;…&gt;( … ) 里那条约表达式读的是哪张贴图：最后一处 .read( / .sample( 的接收者标识符
++        /// （spvDescriptorSet0.NAME 时取 NAME）。expr 是掩码稿（注释 / 字面量已空）</summary>
++        static string UintReadRecv(string expr)
++        {
++            string name = null;
++            foreach (Match m in All(@"\.\s*(?:read|sample)\s*\(", expr))
++            {
++                int i = m.Index;
++                while (i > 0 && char.IsWhiteSpace(expr[i - 1])) i--;
++                int e = i;
++                while (i > 0 && (char.IsLetterOrDigit(expr[i - 1]) || expr[i - 1] == '_')) i--;
++                if (e > i) name = expr[i..e];
++            }
++            return name;
++        }
++
++        /// <summary>#427 [uint-read]：MSL 里 `as_type&lt;uint|int&gt;(&lt;贴图&gt;.read(…))` 这种「按位取整数」的读法，要的是宿主把整数纹理
++        /// 原样绑上来（apple10 上「整数纹理按 float 声明读」是 UB，读到 0：空之轨迹 the 1st 的 G-buffer 后期光照全黑）。生成 MSL 后做一次
++        /// 源码级改写：把该参数块成员声明成 texture…&lt;uint|int&gt;（访问限定照留），把那处 as_type 的两个定界符删掉（读回已是整数，
++        /// 恒等），文件头写 // s2a:uint-read &lt;reg,…&gt;（宿主 .metal 探测兜底）。reg 由参数名解出（DecodeTex，与反射同一条规则）。
++        ///
++        /// 可证明安全（0.4.3 口径，旧实现 R1–R3 的四个缺陷都不在这里）：
++        ///   1 只在**掩码稿**（字符串 / 注释已换成空格）上找候选，只认 `as_type&lt;uint|int&gt;(&lt;expr 含 .read/.sample&gt;)`；
++        ///   2 AsTypeEnd 只数圆括号、跳过字符串 / 注释，并在 depth 0 上遇 ';' 丢弃；候选必须整条落在**一条语句**内；
++        ///   3 任何两个候选 span 相交 / 嵌套 → 参与的名字整组不动（R1 的根）；
++        ///   4 替换**只删** `as_type<…>(` 与配对 `)` 两个定界符，按原串偏移一次拼装（不 Trim、不补括号、不按降序改同一份串）；
++        ///   5 改完整份 MSL 的 { } ( ) 计数与改前**逐个相等**才交出，否则**整支回退**（返回原文、记回退清单、stderr 一行）；
++        ///   6 首行已是 // s2a:uint-read → 幂等返回（槽号从标记行读回）。
++        /// 另外只用「该成员全文件除参数块声明外都只做 .read / .sample、且每一处都在被删的 as_type 里」的成员（get_* 与元素类型无关，
++        /// 照旧豁免）：被当值传出去、还有 .gather / 普通读之类会让类型对不上的用法，整支保持原样（不静默改变语义）。
++        /// → 改写后的 MSL（未改写 = 原文）；regs = 槽号升序；fallback = 整支回退的原因（null = 没回退）</summary>
++        internal static string UintRead(string msl, string key, out List<long> regs, out string fallback)
++        {
++            regs = new List<long>(); fallback = null;
++            if (string.IsNullOrEmpty(msl)) return msl;
++            if (msl.StartsWith(UINT_READ_BEGIN, StringComparison.Ordinal))
++            {   // 幂等：已经改写过的（重入 / 源文自带）原样返回，槽表从标记行读回
++                int e = msl.IndexOf('\n');
++                foreach (var x in (e < 0 ? msl[UINT_READ_BEGIN.Length..] : msl[UINT_READ_BEGIN.Length..e]).Split(',', StringSplitOptions.RemoveEmptyEntries))
++                    if (long.TryParse(x.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out long a) && a >= 0 && a < 256) regs.Add(a);
++                regs = regs.Distinct().OrderBy(x => x).ToList();
++                lock (s_urLock) UintReadIdem++;
++                return msl;
++            }
++            string masked = MaskCode(msl);
++            int[] pd = PrefixDepth(masked);
++            var cand = new List<(int Start, int Open, int Close, string Inner, string Name, string Elem, long Reg)>();
++            foreach (Match m in All(@"\bas_type<\s*(uint|int)\s*>\s*\(", masked))
++            {
++                int open = m.Index + m.Length - 1;   // '(' 的下标（掩码稿与原文同偏移）
++                int close = AsTypeEnd(msl, open);
++                if (close <= open + 1) continue;
++                string innerMask = masked[(open + 1)..(close - 1)];
++                if (!Has(innerMask, ".read(") && !Has(innerMask, ".sample(")) continue;   // 只认含 .read / .sample 的
++                string name = UintReadRecv(innerMask);
++                if (name == null || DecodeTex(name) is not { T: long reg } || reg < 0 || reg >= 256) continue;
++                if (!InOneStatement(masked, pd, m.Index, close)) continue;
++                cand.Add((m.Index, open, close, msl[(open + 1)..(close - 1)], name, m.Groups[1].Value, reg));
++            }
++            if (cand.Count == 0) return msl;
++            // 3：拒绝相交 / 嵌套的 span
++            var bad = new HashSet<string>(StringComparer.Ordinal);
++            var ord = cand.OrderBy(c => c.Start).ToList();
++            for (int i = 0; i < ord.Count; i++)
++                for (int j = i + 1; j < ord.Count && ord[j].Start < ord[i].Close; j++)
++                    if (ord[i].Start < ord[j].Close && ord[j].Start < ord[i].Close) { bad.Add(ord[i].Name); bad.Add(ord[j].Name); }
++            // 同一成员两种元素类型：说不清，不动它
++            var ok = new Dictionary<string, (string Elem, long Reg)>(StringComparer.Ordinal);
++            foreach (var c in cand)
++            {
++                if (bad.Contains(c.Name)) continue;
++                if (ok.TryGetValue(c.Name, out var had) && had.Elem != c.Elem) { ok.Remove(c.Name); bad.Add(c.Name); continue; }
++                ok[c.Name] = (c.Elem, c.Reg);
++            }
++            // 安全阀：该成员全文件除参数块声明外都只做 .read / .sample，且每一处都落在该成员的候选 span 里
++            foreach (var name in ok.Keys.ToList())
++            {
++                var spans = cand.Where(c => c.Name == name).Select(c => (c.Start, c.Close)).ToList();
++                bool safe = true;
++                foreach (Match u in All(@"\b" + Esc(name) + @"\b", masked))
++                {
++                    int k = u.Index + u.Length;
++                    while (k < masked.Length && char.IsWhiteSpace(masked[k])) k++;
++                    if (k + 1 < masked.Length && masked[k] == '[' && masked[k + 1] == '[') continue;   // 参数块里的声明（后面是 [[id(N)]]）
++                    if (k >= masked.Length || masked[k] != '.') { safe = false; break; }   // 被当值用 / 当参数传出去
++                    int j = k + 1; while (j < masked.Length && char.IsWhiteSpace(masked[j])) j++;
++                    int j0 = j; while (j < masked.Length && (char.IsLetterOrDigit(masked[j]) || masked[j] == '_')) j++;
++                    string meth = masked[j0..j];
++                    if (meth.StartsWith("get_", StringComparison.Ordinal)) continue;   // get_width / get_height…：返回 uint，与元素类型无关
++                    if (meth is not ("read" or "sample")) { safe = false; break; }
++                    if (!spans.Any(x => u.Index >= x.Start && u.Index < x.Close)) { safe = false; break; }   // 还有一处不在 as_type 里的普通读
++                }
++                if (!safe) ok.Remove(name);
++            }
++            var edits = cand.Where(c => ok.ContainsKey(c.Name)).OrderBy(c => c.Start).ToList();
++            if (edits.Count == 0) return msl;
++            // 4：按原串偏移一次拼装，只删 as_type<…>( 与配对 ) 两个定界符
++            var sb = new StringBuilder(msl.Length);
++            int pos = 0;
++            foreach (var c in edits)
++            {
++                if (c.Start < pos) continue;   // 相交已被拒，这里只是保险
++                sb.Append(msl, pos, c.Start - pos);
++                sb.Append(c.Inner);            // 操作数逐字节照留
++                pos = c.Close;                 // 跳过配对的 ')'
++            }
++            sb.Append(msl, pos, msl.Length - pos);
++            string outp = sb.ToString();
++            // 原位只换元素类型，访问限定（, access::sample 之类）照留；声明认不出 → 整支回退（不能只删 as_type 不改类型）
++            foreach (var (name, elem) in ok.Select(kv => (Name: kv.Key, Elem: kv.Value.Elem)).OrderBy(x => x.Name, StringComparer.Ordinal))
++            {
++                var re = R(@"(?<![A-Za-z0-9_])(texture(?:1d|2d|3d|cube)(?:_array)?|texture_buffer)\s*<\s*float\s*((?:,\s*[^>]*)?)>(\s+" + Esc(name) + @"\s*\[\[)");
++                string nb = re.Replace(outp, m => m.Groups[1].Value + "<" + elem + m.Groups[2].Value + ">" + m.Groups[3].Value, 1);
++                if (nb == outp) { UintReadRevert(key, "参数块里认不出 " + name + " 的 texture…<float> 声明，改不了类型"); return msl; }
++                outp = nb;
++            }
++            // 5：整份 MSL 的 { } ( ) 计数逐个与改前相等，否则整支回退
++            string m2 = MaskCode(outp);
++            int c0 = 0, c1 = 0, c2 = 0, c3 = 0, d0 = 0, d1 = 0, d2 = 0, d3 = 0;
++            foreach (char c in masked) { if (c == '{') c0++; else if (c == '}') c1++; else if (c == '(') c2++; else if (c == ')') c3++; }
++            foreach (char c in m2) { if (c == '{') d0++; else if (c == '}') d1++; else if (c == '(') d2++; else if (c == ')') d3++; }
++            int ne = edits.Count;   // 每处改写只删 as_type<…>( 与配对 ) 两个定界符：'(' 与 ')' 各少 1，花括号一个不动
++            if (c0 != d0 || c1 != d1 || c2 - d2 != ne || c3 - d3 != ne)
++            {
++                UintReadRevert(key, $"改写后整份 MSL 的括号计数不对（改 {ne} 处，期望 ( ) 各少 {ne}、花括号不变；实际 {{ {c0}/{d0} }} {c1}/{d1} ( {c2}/{d2} ) {c3}/{d3}）");
++                return msl;
++            }
++            regs = edits.Select(c => c.Reg).Distinct().OrderBy(x => x).ToList();
++            lock (s_urLock) UintReadDone++;
++            return UINT_READ_BEGIN + (regs.Count == 0 ? "-" : string.Join(",", regs)) + "\n" + outp;
++        }
++
+         // ---- dmsh_geometry.capture ----
+         const int WORDS = 144, CAPTURE_SLOT = 13;
+         internal static string GeoCapture(string src)
+diff --git a/graphics/tools/direct/dsh/Ft.cs b/graphics/tools/direct/dsh/Ft.cs
+index 8ec87f3..0fd30a2 100644
+--- a/graphics/tools/direct/dsh/Ft.cs
++++ b/graphics/tools/direct/dsh/Ft.cs
+@@ -33,7 +33,8 @@ namespace S2A.Dsh
+         /// 任一掩码认不出 main0 → null</summary>
+         public static string Msl(string src, IEnumerable<(long U, long S)> want)
+         {
+-            int i = src.IndexOf("\nstruct main0_out_u\n", StringComparison.Ordinal);
++            int i = src.IndexOf("\n// S2A_UMASK_ENTRY\n", StringComparison.Ordinal);
++            if (i < 0) i = src.IndexOf("\nstruct main0_out_u\n", StringComparison.Ordinal);
+             string cut = i >= 0 ? src[..i] : src, msl = cut;
+             foreach (var (u, s) in want)
+             {
+diff --git a/graphics/tools/direct/dsh/batch/Unity.cs b/graphics/tools/direct/dsh/batch/Unity.cs
+index 85ea7c5..3f59dc5 100644
+--- a/graphics/tools/direct/dsh/batch/Unity.cs
++++ b/graphics/tools/direct/dsh/batch/Unity.cs
+@@ -203,13 +203,22 @@ static class Unity
+     }
+ 
+     // ================= unity_src =================
+-    static readonly Regex UG = PyRe(@"^\s*(#\s*include\s*<[^>]+>|#\s*pragma\s+(?:METAL|clang)\b.*|using\s+namespace\s+metal\s*;|constant int S2A_AT \[\[function_constant\(100\)\]\];.*)\s*$", RegexOptions.Multiline);
++    // S2Arm #427: `constant uint S2A_UMASK [[function_constant(110)]];` (Dsh.cs FsUintEntry) goes to the top of the batch unit as well:
++    //   one translation unit holds several keys in their own namespaces, and Metal refuses a second declaration of the same function-constant
++    //   index in one file ("'function_constant' has a duplicate index '110'") — every batch then fell back to key-by-key compiles.
++    //   The per-namespace derived bools (S2A_MSK<n>) stay where they are and read this hoisted constant.
++    // S2Arm #427 arch (2026-11-17): main0_u carries per-colour function constants now — S2A_UI<n> / S2A_SI<n> (208+n / 224+n, no initializer) and the
++    //   derived S2A_UF<n> = !S2A_UI<n> && !S2A_SI<n> (Dsh.cs FsUintEntry, nvn_mtl.m fs_u_fn) — so those lines go to the top too, for the same reason:
++    //   five thousand pixel shaders each declare index 208..215 / 224..231 and a batch unit that holds eight of them would declare them eight times.
++    static readonly Regex UG = PyRe(@"^\s*(#\s*include\s*<[^>]+>|#\s*pragma\s+(?:METAL|clang)\b.*|using\s+namespace\s+metal\s*;|constant int S2A_AT \[\[function_constant\(100\)\]\];.*|constant uint S2A_UMASK \[\[function_constant\(110\)\]\];|constant bool S2A_(?:UI|SI)[0-7] \[\[function_constant\((?:208|209|210|211|212|213|214|215|224|225|226|227|228|229|230|231)\)\]\];|constant bool S2A_UF[0-7] = !S2A_UI[0-7] && !S2A_SI[0-7];)\s*$", RegexOptions.Multiline);
+     // 入口：fragment / vertex / kernel，以及任务 / 网格着色器的 [[object]] void / [[mesh]] void（MeshStage.cs 出的形式；11-05 时之笛第十二版批量合编不认，抛 no entry point）
+     static readonly Regex UE = PyRe(@"^((?:\[\[[^\]]*\]\]\s*)*(?:fragment|vertex|kernel|\[\[(?:object|mesh)\]\])\s+.*?\b)(main0\w*)(\s*\()", RegexOptions.Multiline);
+     static readonly Regex Define = PyRe(@"^\s*#\s*define\s+(\w+)", RegexOptions.Multiline);
+     static readonly Regex SigRe = PyRe(@"^\s*(?:#\s*include\s*<[^>]+>|#\s*pragma\s+METAL\b.*)$", RegexOptions.Multiline);
+ 
+-    static int HeadRank(string l) => l.StartsWith("#pragma", StringComparison.Ordinal) ? 0 : l.StartsWith("#include", StringComparison.Ordinal) ? 1 : l.StartsWith("constant ", StringComparison.Ordinal) ? 3 : 2;
++    // 顶部的全局行排序：先 #pragma、#include、using，再函数常量声明，最后是由它们派生的常量（S2A_UF<n> = !S2A_UI<n> && !S2A_SI<n>，必须排在两者之后）
++    static int HeadRank(string l) => l.StartsWith("#pragma", StringComparison.Ordinal) ? 0 : l.StartsWith("#include", StringComparison.Ordinal) ? 1
++        : l.StartsWith("constant ", StringComparison.Ordinal) ? (l.Contains(" S2A_UF", StringComparison.Ordinal) ? 4 : 3) : 2;
+ 
+     /// <summary>unity_src：[(摘要, MSL)] → 一个翻译单元（各键进自己的 namespace n&lt;摘要&gt;、入口改名 s&lt;摘要&gt;_&lt;入口&gt;，全局行在顶部各一次）。
+     /// shared：其中共用了 main0 函数体的键数（UNITY_STATS['main0_u shared']）。某键没有入口时抛 ArgumentException（消息同 Python ValueError）</summary>
