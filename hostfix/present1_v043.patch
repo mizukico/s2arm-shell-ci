@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index 0a2a86e..1a927e1 100644
+index 0a2a86e..8031fff 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
 @@ -650,8 +650,64 @@ static int present_link_from_env(void) {
@@ -654,17 +654,18 @@ index 0a2a86e..1a927e1 100644
  }
  static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
  #if !TARGET_OS_SIMULATOR
-@@ -17074,6 +17518,60 @@ API_AVAILABLE(macos(26.0), ios(26.0)) static inline void m4_begin_on(id cb, id a
+@@ -17074,6 +17518,61 @@ API_AVAILABLE(macos(26.0), ios(26.0)) static inline void m4_begin_on(id cb, id a
  API_AVAILABLE(macos(26.0), ios(26.0)) static inline id m4_render_on(id cb, id d) { return [(id<MTL4CommandBuffer>)cb renderCommandEncoderWithDescriptor:d]; }
  API_AVAILABLE(macos(26.0), ios(26.0)) static inline void m4_commit_one(id cb, id o) { id<MTL4CommandBuffer> b[] = {cb}; [g_q4 commit:b count:1 options:o]; }
  #include "nvn_present_fi.inc"   // 出图补帧（没有社区帧率补丁的 30 帧款缺省补到 60，开关按游戏）
 +// present1 A：present 出图前的读数 —— 帧号 / 呈现源序列号 / 格式 / 尺寸 / 视口 / 补帧,抗锯齿,MetalFX 是否参与。
-+//   每帧一行会刷屏，所以只在首帧、签名（ser/格式/尺寸/视口/fi,aa,fx）变化、以及每 300 帧时打一行。
++//   每帧一行会刷屏，而且交换链每帧换纹理（ser 一直变）：ser 只打印、不进签名。
++//   只有首帧、格式/尺寸/视口/fi,aa,fx 变化、以及每 300 帧才打一行（与下面 8×8 读回同一节拍）。
 +static void present_log(uint64_t n, uint64_t ser, id<MTLTexture> src, pf_vp vp, int fi, int aa, int fx) {
-+    struct sig { uint64_t ser; uint32_t fmt; unsigned long w, h; double vw, vh; int fi, aa, fx; };
++    struct sig { uint32_t fmt; unsigned long w, h; double vw, vh; int fi, aa, fx; };
 +    static struct sig last;
 +    struct sig cur; memset(&cur, 0, sizeof cur);   // 连同填充字节一起清零，memcmp 才是稳定的签名比较
-+    cur.ser = ser; cur.fmt = (uint32_t)src.pixelFormat; cur.w = (unsigned long)src.width; cur.h = (unsigned long)src.height;
++    cur.fmt = (uint32_t)src.pixelFormat; cur.w = (unsigned long)src.width; cur.h = (unsigned long)src.height;
 +    cur.vw = vp.w; cur.vh = vp.h; cur.fi = fi; cur.aa = aa; cur.fx = fx;
 +    if (n != 1 && n % 300 != 0 && !memcmp(&cur, &last, sizeof cur)) return;
 +    last = cur;
@@ -715,7 +716,7 @@ index 0a2a86e..1a927e1 100644
  static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
      if (mtl_gpu_halted()) { atomic_fetch_add_explicit(&g_gpu_refused, 1, memory_order_relaxed); return 0; }   // GPU 安全停：不取画布、不交上屏（调用方按「没交」把票记完成）
      if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
-@@ -17177,7 +17675,17 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+@@ -17177,7 +17676,17 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
      present_pipeline(layer.pixelFormat);   // Same as the original path: the first frame compiles the pipeline before taking the drawable
      fit_geom(layer.drawableSize.width, layer.drawableSize.height, pcw, pch);   // game units (was the crop / source size read here)
      if (g_grab_cb) grab_present(src, crop, layer.drawableSize, ticket);   // Game picture needed by the whole-window screenshot (peek without the lock first; the real take locks inside the function)
@@ -734,7 +735,7 @@ index 0a2a86e..1a927e1 100644
      uint64_t dt0 = now_ns();
      id<CAMetalDrawable> dr = supplied ? supplied : [layer nextDrawable];
      if (!supplied) g_drawable_ns += now_ns() - dt0;
-@@ -17188,6 +17696,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+@@ -17188,6 +17697,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
  #else
      id<CAMetalDrawable> mdr = nil;
  #endif
@@ -742,7 +743,7 @@ index 0a2a86e..1a927e1 100644
      if (mdr && !g_m3 && g_present_mirror_resident != mdr.layer) { if (@available(macOS 26.0, iOS 26.0, *)) { [g_q4 addResidencySet:((CAMetalLayer *)mdr.layer).residencySet]; g_present_mirror_resident = mdr.layer; } }
      int alloc_i = (int)(ticket % 3);
      present_options();
-@@ -17852,4 +18361,4 @@ void nvn_be_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_a
+@@ -17852,4 +18362,4 @@ void nvn_be_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_a
  // 弱链接[nvntest]：s2a_frame_replay_screen（同上，runtime/src/widen.c）
  // 弱链接[nvntest]：s2a_npdm_program_id_set（同上，runtime/src/gfxmode.c）
  #include "nvn_frame_rec.inc"   // 帧录放（graphics/nvn/docs/frame_replay.md）
