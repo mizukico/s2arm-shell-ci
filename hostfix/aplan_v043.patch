@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index 0a2a86e..7d01fd8 100644
+index 0a2a86e..78e884c 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
 @@ -650,8 +650,85 @@ static int present_link_from_env(void) {
@@ -906,10 +906,10 @@ index 0a2a86e..7d01fd8 100644
 -                if (mtl_fmt_depth(t.pixelFormat) || fmt_compressed(g_treg[tid].t.d.format)) RED_ONCE(32, "texture bound to an image slot is a depth / stencil or compressed format, which takes no shader writes (texture ID %d)", tid);
 -                else { img_wr_note(tid); static int n; if (!n++) MLOG("image slot texture without shader writes (texture ID %d): upgraded before the next pass", tid); }
 -                t = nil; }
-+                if (comp && imglut_on()) {
-+                    // 任务 C：压缩基纹理先看 usage（缺 ShaderWrite 本应 dummy），但要求“建不出视图 → 按原样绑，不是 dummy”。
-+                    ap_img_compressed_bound(sh, nvn_stage, (int)b->reg, tid);
-+                } else {
++                // 任务 C / nxnative 顺序：可写 image 槽（rw / atom）先看 ShaderWrite usage —— 缺就红行 + dummy；
++                //   只读的压缩基纹理没有写要求，留到下面“建不出视图 → 按原样绑”。
++                if (comp && imglut_on() && !(b->rw || b->atomic_image)) ap_img_compressed_bound(sh, nvn_stage, (int)b->reg, tid);
++                else {
 +                    if (mtl_fmt_depth(t.pixelFormat) || (bt && fmt_compressed(bt->d.format))) RED_ONCE(32, "texture bound to an image slot is a depth / stencil or compressed format, which takes no shader writes (texture ID %d)", tid);
 +                    else { img_wr_note(tid); static int n; if (!n++) MLOG("image slot texture without shader writes (texture ID %d): upgraded before the next pass", tid); }
 +                    t = nil;
@@ -922,7 +922,7 @@ index 0a2a86e..7d01fd8 100644
              // An image of another texture type than the shader declares: Ryujinx binds only the same dimensions (Texture.GetTargetTexture); the rest is the dummy image of the declared type
              if (t && t.textureType != (MTLTextureType)b->dtt) { uint64_t r2 = 0; id<MTLTexture> v = tex_fit(tid, t, (MTLTextureType)b->dtt, b->dpf, &r2); if (v && v.textureType == (MTLTextureType)b->dtt && (v.usage & MTLTextureUsageShaderWrite)) { t = v; trid = r2; } }   // the same-dimension views tex_fit makes (2D / 2D array, cube / cube array)
 -            if (t && t.textureType != (MTLTextureType)b->dtt) { RED_ONCE(50, "image slot: shader declares Metal type %lu, texture ID %d is type %lu: the dummy image of the declared type (Ryujinx leaves it unbound)", (unsigned long)b->dtt, tid, (unsigned long)t.textureType); t = nil; }
-+            if (t && t.textureType != (MTLTextureType)b->dtt) { if (comp && imglut_on()) { ap_img_compressed_bound(sh, nvn_stage, (int)b->reg, tid); } else { RED_ONCE(50, "image slot: shader declares Metal type %lu, texture ID %d is type %lu: the dummy image of the declared type (Ryujinx leaves it unbound)", (unsigned long)b->dtt, tid, (unsigned long)t.textureType); t = nil; } }
++            if (t && t.textureType != (MTLTextureType)b->dtt) { if (comp && imglut_on() && !(b->rw || b->atomic_image)) { ap_img_compressed_bound(sh, nvn_stage, (int)b->reg, tid); } else { RED_ONCE(50, "image slot: shader declares Metal type %lu, texture ID %d is type %lu: the dummy image of the declared type (Ryujinx leaves it unbound)", (unsigned long)b->dtt, tid, (unsigned long)t.textureType); t = nil; } }
 +            // 2026-11-19 aplan：[imglut] 每 key 一次（选表结果）+ [imgbind] 每条 image 声明一次（≤32 行）
 +            ap_imglut_line(sh, nvn_stage, b, chose, tid, img_base);
 +            img_probe_bind(sh, nvn_stage, b, tid, chose, img_base, t);
