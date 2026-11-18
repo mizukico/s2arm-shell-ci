@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index 0a2a86e..a9ef68e 100644
+index 0a2a86e..4a4e098 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
 @@ -650,8 +650,70 @@ static int present_link_from_env(void) {
@@ -605,7 +605,7 @@ index 0a2a86e..a9ef68e 100644
              if (t && nvn_stage == 1 && afr_want(sh)) { uint64_t r2 = 0; id<MTLTexture> v = tex_alpha_red(tid, t, &r2); if (v) { t = v; trid = r2; } }   // see tex_alpha_red
              size_abi_texture(sh, nvn_stage, b, tid, size_view, t);
              rs_bind_check(t, sh, nvn_stage, 0);   // S2Arm internal resolution: read where scaling is not supported → back to 1 at the next safe point
-@@ -14440,6 +14886,687 @@ static int gmem_uses(NvShader *s) {
+@@ -14440,6 +14886,730 @@ static int gmem_uses(NvShader *s) {
  }
  static void gmem_count_draw(NvProg *pr) { g_gmem_draws_all++; for (int i = 0; i < 5; i++) if (gmem_uses(pr->sh[i])) { g_gmem_draws++; break; } }
  
@@ -625,7 +625,7 @@ index 0a2a86e..a9ef68e 100644
 +// 判读：in 非 0 而 out 全 0 → 光照计算为 0（常量 / 矩阵 / 光源列表）；cb head 全 0 → 常量缓冲没上传；
 +//   buffers len=0 → 光源列表为空（light_cull 的 key 不匹配）；out mean>0 但屏幕黑 → 问题在更后面的合成。
 +#define LZ_FRAME_LO 300ull
-+#define LZ_FRAME_HI 2000ull
++#define LZ_FRAME_HI 1000000000ull   // 只有下限：诊断局用的帧号（3600 / 7200）也在范围内
 +#define LZ_MAX_IN 4
 +#define LZ_MAX_ATT 4
 +#define LZ_SER_MAX 96
@@ -863,6 +863,41 @@ index 0a2a86e..a9ef68e 100644
 +        if (lz_line_ok()) { MLOG("[fallback] summary: n=%llu keys=%s", (unsigned long long)g_lz_fb_total, b); g_lz_sum_n++; }
 +    }
 +}
++// 追加 4：passdump.tsv —— 每次抓取（链路写 / 光照输入）在内存里攒一行，写 diagrun 图片的同一处（td_dump）
++//   落盘到图片同一个目录（导出诊断包时随目录一起带走）。表头固定；UTF-8 / Tab / LF；最多 200000 行，超出加 "# capped"。
++#define LZ_PD_MAX_LINES 200000
++static char *g_lz_pd; static size_t g_lz_pd_len, g_lz_pd_cap; static int g_lz_pd_lines, g_lz_pd_capped;
++static uint64_t g_lz_pd_frame = ~0ull; static int g_lz_pd_order;
++static void lz_pd_row(uint64_t f, uint64_t pass, const char *key, const char *role, uint64_t ser, uint32_t w, uint32_t h, uint32_t fmt, const char *fmtn, double mean, uint32_t mx) {
++    if (g_lz_pd_lines >= LZ_PD_MAX_LINES) { g_lz_pd_capped = 1; return; }
++    if (f != g_lz_pd_frame) { g_lz_pd_frame = f; g_lz_pd_order = 0; }
++    char line[512];
++    int n = snprintf(line, sizeof line, "%llu\t%d\t%lld\t%s\t%s\t%llu\t%u\t%u\t0x%x(%s)\t%.1f\t%u\t-\n", (unsigned long long)f, g_lz_pd_order++,
++                     (long long)pass, key && key[0] ? key : "-", role, (unsigned long long)ser, w, h, fmt, fmtn ? fmtn : "?", mean, mx);
++    if (n <= 0) return;
++    if (g_lz_pd_len + (size_t)n + 1 > g_lz_pd_cap) {
++        size_t nc = g_lz_pd_cap ? g_lz_pd_cap * 2 : (1u << 20);
++        while (nc < g_lz_pd_len + (size_t)n + 1) nc *= 2;
++        char *p = realloc(g_lz_pd, nc);
++        if (!p) { g_lz_pd_capped = 1; return; }
++        g_lz_pd = p; g_lz_pd_cap = nc;
++    }
++    memcpy(g_lz_pd + g_lz_pd_len, line, (size_t)n); g_lz_pd_len += (size_t)n;
++    g_lz_pd_lines++;
++}
++// 写到 dir/passdump.tsv（与 diagrun 图片同目录）；返回写的行数，-1 = 写失败
++static int lz_pd_flush(const char *dir) {
++    if (!dir || !*dir) return -1;
++    char path[1200]; snprintf(path, sizeof path, "%s/passdump.tsv", dir);
++    FILE *fp = fopen(path, "wb");
++    if (!fp) return -1;
++    fputs("frame\torder\tpass\tkey\trole\tserial\twidth\theight\tfmt\tmean\tmax\tfile\n", fp);
++    if (g_lz_pd_len) fwrite(g_lz_pd, 1, g_lz_pd_len, fp);
++    if (g_lz_pd_capped) fputs("# capped\n", fp);
++    fclose(fp);
++    MLOG("[pdump] wrote %d rows to %s%s", g_lz_pd_lines, path, g_lz_pd_capped ? " (capped)" : "");
++    return g_lz_pd_lines;
++}
 +// 追加 3：compute 的输出是纹理时的读数（纹理是 GPU 私有的，只能 blit + wait；每 60 帧一次、一次一行）
 +typedef struct { uint64_t frame, fence; int tid; char key[24]; } lz_cstrec;
 +static lz_cstrec g_lz_cst[8]; static int g_lz_cst_n;
@@ -959,6 +994,7 @@ index 0a2a86e..a9ef68e 100644
 +        NSUInteger bpp = mtl_pf_bytes((MTLPixelFormat)r->fmt); if (!bpp || bpp > 16) bpp = 4;
 +        NSUInteger cw = MIN((NSUInteger)r->w, (NSUInteger)8), ch = MIN((NSUInteger)r->h, (NSUInteger)8);
 +        lz_stats((MTLPixelFormat)r->fmt, (const uint8_t *)r->buf.contents, cw, ch, cw * bpp, &mean, &mx);
++        lz_pd_row(r->frame, r->pass, r->key, "ATT", r->ser, r->w, r->h, r->fmt, lz_pf_name((MTLPixelFormat)r->fmt), mean, mx);   // 追加 4：passdump.tsv
 +        if (lz_chain_ok()) MLOG("[chain] f=%llu pass=%llu ser=%llu key=%s fmt=0x%x(%s) %ux%u mean=%.1f max=%u", (unsigned long long)r->frame, (unsigned long long)r->pass,
 +                                (unsigned long long)r->ser, r->key, r->fmt, lz_pf_name((MTLPixelFormat)r->fmt), r->w, r->h, mean, mx);
 +        if (r->exp && lz_line_ok()) MLOG("[exp] f=%llu key=%s out ser=%llu %ux%u mean=%.1f", (unsigned long long)r->frame, r->key, (unsigned long long)r->ser, r->w, r->h, mean);
@@ -1116,6 +1152,13 @@ index 0a2a86e..a9ef68e 100644
 +            if (dim) MLOG("[dim] f=%llu pass=%llu in reg=%d ser=%llu fmt=0x%x(%s) %s", (unsigned long long)s->frame, (unsigned long long)s->pass,
 +                          s->in[i].reg, (unsigned long long)s->in[i].ser, s->in[i].nvn_fmt, lz_pf_name((MTLPixelFormat)s->in[i].mtl_fmt), d);
 +            else MLOG("[lit] in reg=%d ser=%llu fmt=0x%x mtl=0x%x %s", s->in[i].reg, (unsigned long long)s->in[i].ser, s->in[i].nvn_fmt, s->in[i].mtl_fmt, d);
++            if (!dim) {   // 追加 4：光照遍的输入也进 passdump.tsv（role=IN）
++                NSUInteger ib = mtl_pf_bytes((MTLPixelFormat)s->in[i].mtl_fmt); if (!ib || ib > 16) ib = 4;
++                double im = 0; uint32_t ix = 0; lz_stats((MTLPixelFormat)s->in[i].mtl_fmt, p + LZ_IN_OFF + (size_t)i * LZ_IN_STRIDE, 1, 1, ib, &im, &ix);
++                id<MTLTexture> it = s->in[i].tex;
++                lz_pd_row(s->frame, s->pass, s->key, "IN", s->in[i].ser, it ? (uint32_t)it.width : 0, it ? (uint32_t)it.height : 0,
++                          s->in[i].nvn_fmt, lz_pf_name((MTLPixelFormat)s->in[i].mtl_fmt), im, ix);
++            }
 +        }
 +        if (p) for (int i = 0; i < s->natt; i++) {
 +            double mean = 0; uint32_t mx = 0;
@@ -1293,7 +1336,7 @@ index 0a2a86e..a9ef68e 100644
  static void draw(const p_draw *dw, const p_draw_idx *di) {
      // internal resolution: textures this draw's program holds in image slots go back to 1 before the draw (nvn_rscale_ops.inc rs_pre_draw; may end the open pass). Not on the
      //   re-entered calls (geometry / mesh inner draws, deferred replays, the on-chip double render): the outer call or the capture already did it, and their pass must stay open
-@@ -14555,6 +15682,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
+@@ -14555,6 +15725,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
      g_rp_layered = pr->sh[0] && pr->sh[0]->layer_out;
      if (g_enc && g_pass.layered != g_rp_layered) rp_end();   // a layered pass only for layer-writing vertex shaders (see rp_begin_ex)
      g_noload_mask = g_enc ? 0 : pass_color_unwritten(pr);   // color attachments proven unwritten to this pass's end are not loaded (see g_noload_mask)
@@ -1301,7 +1344,7 @@ index 0a2a86e..a9ef68e 100644
      id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
      g_noload_mask = 0;
      g_rp_layered = 0;
-@@ -14982,6 +16110,7 @@ static void dispatch(const p_dispatch *dp) {
+@@ -14982,6 +16153,7 @@ static void dispatch(const p_dispatch *dp) {
      g_dispatch_dim[0] = gx; g_dispatch_dim[1] = gy; g_dispatch_dim[2] = (uint32_t)dp->z;   // read back by the driver segment c0 (encode_args_)
      g_c0_dim_buf = nil;
      encode_args(ce, cs, 5, 0);
@@ -1309,7 +1352,20 @@ index 0a2a86e..a9ef68e 100644
      if (fc) se_bind(ce, cs, 5);   // the variant reads its table at RED_SLOT, filled for this dispatch
      // Binding ended the shared encoder (same as draw's retry, 11-02 Need for Speed): an image / texture view that needs a format-view usage upgrades its texture (tex_upgrade), whose copy
      //   goes through blit(). On Metal 3 a copy needs a blit encoder, so blit_open_k ends the shared compute encoder g_blit and ce is an ended encoder; the dispatch below then crashed
-@@ -16865,6 +17994,7 @@ static void present_pipeline(MTLPixelFormat format) {
+@@ -16670,6 +17842,12 @@ static void td_dump(void) {
+     g_td_done = 1;
+     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+     mtl_finish_gpu();
++    lz_chain_drain(); lz_cs_drain();   // 追加 4：先把选中帧的抓取落成 passdump 行，再写 tsv
++    {   // 2026-11-18 litzero 追加 4：passdump.tsv 落到 diagrun 图片同一个目录（导出诊断包随目录带走）
++        const char *p = g_td_path; char dir[1200]; size_t k = 0;
++        if (p) { const char *s = strrchr(p, '/'); k = s ? (size_t)(s - p) : 0; if (k >= sizeof dir) k = sizeof dir - 1; memcpy(dir, p, k); dir[k] = 0; }
++        if (k) lz_pd_flush(dir);
++    }
+     static id<MTLRenderPipelineState> ps, ps_i[2], ps_3d[3]; static id<MTLSamplerState> sp;
+     if (!ps) {
+         static const char *src_msl =
+@@ -16865,6 +18043,7 @@ static void present_pipeline(MTLPixelFormat format) {
          MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
          pd.vertexFunction = [lib newFunctionWithName:@"vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
          pd.colorAttachments[0].pixelFormat = format;
@@ -1317,7 +1373,7 @@ index 0a2a86e..a9ef68e 100644
          g_blit_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
          if (!g_blit_pso) MDIE("present pipeline failed %s", e.localizedDescription.UTF8String);
          g_blit_fmt = format;
-@@ -16890,6 +18020,14 @@ static id<MTLTexture> present_raw_src(id<MTLTexture> src) {
+@@ -16890,6 +18069,14 @@ static id<MTLTexture> present_raw_src(id<MTLTexture> src) {
  }
  __attribute__((weak)) double s2a_cpatch_present_aspect(void) { return 0; }   // native runtime/src/cpatch.c: current aspect while an adaptive community widescreen patch is on; graphics unit tests without the host have none
  #include "nvn_present_fit.h"   // pf_crop_fit (present_now) / pf_viewport (both blits); plain C, tested by graphics/nvn/tests/t_present_fit.c
@@ -1332,7 +1388,7 @@ index 0a2a86e..a9ef68e 100644
  static int present_blit(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], BOOL flip, int screen) {
      NSUInteger cx = 0, cy = 0, cw = src.width, ch = src.height;
      if (crop && (crop[2] || crop[3])) {
-@@ -16909,13 +18047,13 @@ static int present_blit(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTextu
+@@ -16909,13 +18096,13 @@ static int present_blit(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTextu
      // when the ratio difference is < 1% (the remainder from the game width being a multiple of 8 in the full-screen setup, e.g. 1952x900 versus 2868x1320 differs by 0.17%) fill directly, leaving no few-pixel border
      // 自适应画幅补丁开着：游戏按当前画幅画世界，16:9 尺寸的图拉满到这个画幅。只在画进画布（screen）这一次套：
      //   拷进抗锯齿 / 放大器的中间图要原样拷满，中间图里套了画幅就只剩居中一块、四周黑边，最后拉满时黑边跟着留下、画面挤窄（#1169 SMAA 中 / 高左右留黑）
@@ -1349,7 +1405,7 @@ index 0a2a86e..a9ef68e 100644
      rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
      rp.colorAttachments[0].storeAction = MTLStoreActionStore;
      id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
-@@ -16941,12 +18079,12 @@ static int present_blit_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLT
+@@ -16941,12 +18128,12 @@ static int present_blit_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLT
      present_pipeline(dst.pixelFormat);
      // 自适应画幅补丁开着：游戏按当前画幅画世界，16:9 尺寸的图拉满到这个画幅。只在画进画布（screen）这一次套：
      //   拷进抗锯齿 / 放大器的中间图要原样拷满，中间图里套了画幅就只剩居中一块、四周黑边，最后拉满时黑边跟着留下、画面挤窄（#1169 SMAA 中 / 高左右留黑）
@@ -1365,7 +1421,7 @@ index 0a2a86e..a9ef68e 100644
      rp.colorAttachments[0].storeAction = MTLStoreActionStore;
      rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
      id<MTL4RenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
-@@ -16986,10 +18124,14 @@ static const int *rs_aa_crop(id<MTLTexture> src, id<MTLTexture> dst, const int c
+@@ -16986,10 +18173,14 @@ static const int *rs_aa_crop(id<MTLTexture> src, id<MTLTexture> dst, const int c
  static int present_encode_slot(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, id<MTLTexture> mirror, const int crop[4], int slot) {
      present_options();
      BOOL flip = atomic_load_explicit(&g_origin_ll, memory_order_relaxed) != 0;
@@ -1383,7 +1439,7 @@ index 0a2a86e..a9ef68e 100644
          int ac[4]; NvPresentAA *s = present_aa_prepare(slot, src, rs_aa_crop(src, dst, crop, fx, ac));   // rs_aa_crop
          if (!s || !present_blit(cb, src, s->input, crop, flip, 0) || !present_aa_encode(cb, s, NO)) return 0;
          out = s->output;
-@@ -17005,7 +18147,7 @@ static int present_encode_slot(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<M
+@@ -17005,7 +18196,7 @@ static int present_encode_slot(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<M
          present_fx_encode(cb, fx, out);
          out = fx->output;
      }
@@ -1392,7 +1448,7 @@ index 0a2a86e..a9ef68e 100644
  }
  static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4]) {
      return present_encode_slot(cb, src, dst, nil, crop, 3); // synchronous screen captures
-@@ -17014,11 +18156,15 @@ API_AVAILABLE(macos(26.0), ios(26.0))
+@@ -17014,11 +18205,15 @@ API_AVAILABLE(macos(26.0), ios(26.0))
  static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, id<MTLTexture> mirror, const int crop[4], int slot) {
      present_options();
      BOOL flip = atomic_load_explicit(&g_origin_ll, memory_order_relaxed) != 0;
@@ -1411,7 +1467,7 @@ index 0a2a86e..a9ef68e 100644
          int ac[4]; NvPresentAA *s = present_aa_prepare(slot, src, rs_aa_crop(src, dst, crop, fx, ac));   // rs_aa_crop
          if (!s || !present_blit_m4(cb, src, s->input, crop, s->cropUV, s->cropTable, flip, 0) || !present_aa_encode(cb, s, YES)) return 0;
          out = s->output;
-@@ -17035,7 +18181,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
+@@ -17035,7 +18230,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
          present_fx_encode(cb, fx, out);
          out = fx->output;
      }
@@ -1420,7 +1476,7 @@ index 0a2a86e..a9ef68e 100644
  }
  static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
  #if !TARGET_OS_SIMULATOR
-@@ -17074,6 +18220,61 @@ API_AVAILABLE(macos(26.0), ios(26.0)) static inline void m4_begin_on(id cb, id a
+@@ -17074,6 +18269,61 @@ API_AVAILABLE(macos(26.0), ios(26.0)) static inline void m4_begin_on(id cb, id a
  API_AVAILABLE(macos(26.0), ios(26.0)) static inline id m4_render_on(id cb, id d) { return [(id<MTL4CommandBuffer>)cb renderCommandEncoderWithDescriptor:d]; }
  API_AVAILABLE(macos(26.0), ios(26.0)) static inline void m4_commit_one(id cb, id o) { id<MTL4CommandBuffer> b[] = {cb}; [g_q4 commit:b count:1 options:o]; }
  #include "nvn_present_fi.inc"   // 出图补帧（没有社区帧率补丁的 30 帧款缺省补到 60，开关按游戏）
@@ -1482,7 +1538,7 @@ index 0a2a86e..a9ef68e 100644
  static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
      if (mtl_gpu_halted()) { atomic_fetch_add_explicit(&g_gpu_refused, 1, memory_order_relaxed); return 0; }   // GPU 安全停：不取画布、不交上屏（调用方按「没交」把票记完成）
      if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
-@@ -17177,7 +18378,17 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+@@ -17177,7 +18427,17 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
      present_pipeline(layer.pixelFormat);   // Same as the original path: the first frame compiles the pipeline before taking the drawable
      fit_geom(layer.drawableSize.width, layer.drawableSize.height, pcw, pch);   // game units (was the crop / source size read here)
      if (g_grab_cb) grab_present(src, crop, layer.drawableSize, ticket);   // Game picture needed by the whole-window screenshot (peek without the lock first; the real take locks inside the function)
@@ -1501,7 +1557,7 @@ index 0a2a86e..a9ef68e 100644
      uint64_t dt0 = now_ns();
      id<CAMetalDrawable> dr = supplied ? supplied : [layer nextDrawable];
      if (!supplied) g_drawable_ns += now_ns() - dt0;
-@@ -17188,6 +18399,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+@@ -17188,6 +18448,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
  #else
      id<CAMetalDrawable> mdr = nil;
  #endif
@@ -1509,7 +1565,7 @@ index 0a2a86e..a9ef68e 100644
      if (mdr && !g_m3 && g_present_mirror_resident != mdr.layer) { if (@available(macOS 26.0, iOS 26.0, *)) { [g_q4 addResidencySet:((CAMetalLayer *)mdr.layer).residencySet]; g_present_mirror_resident = mdr.layer; } }
      int alloc_i = (int)(ticket % 3);
      present_options();
-@@ -17852,4 +19064,4 @@ void nvn_be_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_a
+@@ -17852,4 +19113,4 @@ void nvn_be_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_a
  // 弱链接[nvntest]：s2a_frame_replay_screen（同上，runtime/src/widen.c）
  // 弱链接[nvntest]：s2a_npdm_program_id_set（同上，runtime/src/gfxmode.c）
  #include "nvn_frame_rec.inc"   // 帧录放（graphics/nvn/docs/frame_replay.md）
