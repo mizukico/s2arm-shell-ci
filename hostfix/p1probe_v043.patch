@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index 0a2a86e..a979cc1 100644
+index 0a2a86e..261b6e7 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
 @@ -650,8 +650,79 @@ static int present_link_from_env(void) {
@@ -799,7 +799,7 @@ index 0a2a86e..a979cc1 100644
              size_abi_texture(sh, nvn_stage, b, tid, size_view, t);
 +            // 2026-11-19 p1probe：[cpuwritten] 消费点（纹理槽）登记 guest vs uploaded；真正的 1 texel 读回统一放到
 +            //   这一遍结束（pass end / dispatch end）时做 —— 绑定时还在渲染遍里面，不能开 copy 编码器。
-+            if (t) cpuw_note(nvn_stage, reg, tid, t);
++            if (t && (nvn_stage == 1 || nvn_stage == 5)) cpuw_note(nvn_stage, reg, tid, t);
 +            // S2Arm 2026-11-17 toggles: S2A_MASK_SER / S2A_MASK_MODE（见 mask_mode）——片元槽绑的纹理 serial 命中就改绑 1×1 替身；
 +            //   S2A_MASK_ALL=1 只统计（绑到片元槽的 800×450 遮罩按 serial 各一行，不碰像素）。两个开关都没设时这一整段不执行。
 +            //   放在 size_abi_texture 之后：get_width / get_height 仍是真纹理的尺寸，只有采样值变常数。
@@ -835,7 +835,7 @@ index 0a2a86e..a979cc1 100644
              if (t && b->rw && tid < g_ntreg && g_treg[tid].ok) wd_flat_written(g_treg[tid].t.serial);   // S2Arm widen: its content changes, so the horizontal-detail measurement no longer holds
              size_abi_texture(sh, nvn_stage, b, tid, size_view, t);
 +            // 2026-11-19 p1probe：[cpuwritten] 消费点（image 槽）登记（读回同样留到 pass / dispatch 末尾）
-+            if (t) cpuw_note(nvn_stage, reg, tid, t);
++            if (t && (nvn_stage == 1 || nvn_stage == 5)) cpuw_note(nvn_stage, reg, tid, t);
              rs_bind_check(t, sh, nvn_stage, 2);   // S2Arm internal resolution
 -            if (!t) { t = dummy_img(b->dtt, b->dpf, b->atomic_image); trid = t.gpuResourceID._impl; }   // Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
 +            if (!t) { t = dummy_img(b->dtt, b->dpf, b->atomic_image); trid = t.gpuResourceID._impl; p3_dummy_note(sh->key, nvn_stage, reg, tid, 1, tv != NULL); }   // Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
