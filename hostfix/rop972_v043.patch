@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index 0a2a86e..1cff7ce 100644
+index 0a2a86e..f53984a 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
 @@ -650,8 +650,54 @@ static int present_link_from_env(void) {
@@ -333,9 +333,9 @@ index 0a2a86e..1cff7ce 100644
 +        int l = merged ? k->lmap[i] : i; if (l < 0 || l > 7) continue;
 +        if (!((k->chmask >> (4 * l)) & 0xf)) continue;   // no channel written: nothing stored
 +        int bits = rop_norm_bits((MTLPixelFormat)k->cfmt[i]); if (!bits) continue;
-+        if ((k->blend_en >> i) & 1) {   // blended: only MIN / MAX, where the stored value is still the source's own conversion
-+            if (bop(k->blend[i].eq_rgb) != MTLBlendOperationMin && bop(k->blend[i].eq_rgb) != MTLBlendOperationMax) continue;
-+            if (bop(k->blend[i].eq_a) != MTLBlendOperationMin && bop(k->blend[i].eq_a) != MTLBlendOperationMax) continue;
++        if ((k->blend_en >> l) & 1) {   // blended: only MIN / MAX, where the stored value is still the source's own conversion (pso_desc reads blend[l] too)
++            if (bop(k->blend[l].eq_rgb) != MTLBlendOperationMin && bop(k->blend[l].eq_rgb) != MTLBlendOperationMax) continue;
++            if (bop(k->blend[l].eq_a) != MTLBlendOperationMin && bop(k->blend[l].eq_a) != MTLBlendOperationMax) continue;
 +        }
 +        *rnd |= 1u << l;
 +        *rsc |= rop_rsc_code(bits) << (2 * l);
