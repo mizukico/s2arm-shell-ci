@@ -84,7 +84,7 @@ jobs:
           set -uo pipefail
           cd s2arm
           # the build deletes its make.log on exit (trap): keep a rolling copy while it runs
-          ( while :; do for f in "${RUNNER_TEMP:-/tmp}"/s2a-shell.*/make.log /tmp/s2a-shell.*/make.log; do [ -f "$f" ] && cp -f "$f" "$GITHUB_WORKSPACE/make.log.last" 2>/dev/null; done; sleep 1; done ) &
+          ( while :; do for f in "${RUNNER_TEMP:-/tmp}"/s2a-shell.*/make.log "${TMPDIR:-/tmp}"/s2a-shell.*/make.log /tmp/s2a-shell.*/make.log /var/folders/*/*/T/s2a-shell.*/make.log; do [ -f "$f" ] && cp -f "$f" "$GITHUB_WORKSPACE/make.log.last" 2>/dev/null; done; sleep 1; done ) &
           WPID=$!
           bash pack/shell_build.sh "$GITHUB_WORKSPACE/out-shell"
           RC=$?
@@ -97,7 +97,7 @@ jobs:
         run: |
           set -uo pipefail
           found=0
-          for f in "$GITHUB_WORKSPACE/make.log.last" "${RUNNER_TEMP:-/tmp}"/s2a-shell.*/make.log "${TMPDIR:-/tmp}"/s2a-shell.*/make.log /tmp/s2a-shell.*/make.log; do
+          for f in "$GITHUB_WORKSPACE/make.log.last" "${RUNNER_TEMP:-/tmp}"/s2a-shell.*/make.log "${TMPDIR:-/tmp}"/s2a-shell.*/make.log /tmp/s2a-shell.*/make.log /var/folders/*/*/T/s2a-shell.*/make.log; do
             [ -f "$f" ] || continue
             found=1
             echo "== $f =="
