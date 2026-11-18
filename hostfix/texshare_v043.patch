@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index 0a2a86e..ba67817 100644
+index 0a2a86e..ee16892 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
 @@ -650,8 +650,91 @@ static int present_link_from_env(void) {
@@ -309,7 +309,7 @@ index 0a2a86e..ba67817 100644
 +// 新建 / 解析出来的纹理登记到这个区间（打包上传的纹理也登记：它的 pk->tex 换了，share_obj 取到的就是新的那张）
 +static void share_register(const tex_t *ct, id<MTLTexture> r) {
 +    if (!share_on() || !ct || !r) return;
-+    if (r.parentTexture || r.textureType == MTLTextureTypeTextureBuffer) return;   // 视图 / 缓冲纹理不是这个区间的对象
++    if (r.parentTexture || r.buffer || r.textureType == MTLTextureTypeTextureBuffer) return;   // 视图 / 缓冲纹理不是这个区间的对象
 +    share_key k; if (!share_span_of(ct, &k)) return;
 +    uint32_t tid = g_share_tid > 0 ? (uint32_t)g_share_tid : 0;
 +    pthread_mutex_lock(&g_shmu);
@@ -574,7 +574,7 @@ index 0a2a86e..ba67817 100644
 +static uint32_t g_imgfit_ok_lines, g_imgfit_bad_lines;
 +static void imgfit_log(const char *why, NvShader *sh, int st, int reg, int tid, const tex_t *ct, id<MTLTexture> t, MTLPixelFormat pf) {
 +    static char seen[8][24]; static unsigned char sst[8]; static short srg[8]; static int n;
-+    if (!sh || n >= 8) return;
++    if (!sh || !sh->key[0] || n >= 8) return;
 +    for (int i = 0; i < n; i++) if (sst[i] == (unsigned char)st && srg[i] == (short)reg && !strncmp(seen[i], sh->key, 23)) return;
 +    snprintf(seen[n], 24, "%.23s", sh->key); sst[n] = (unsigned char)st; srg[n] = (short)reg; n++;
 +    uint64_t ser = ct ? ct->serial : (tid >= 0 && tid < g_ntreg && g_treg[tid].ok ? g_treg[tid].t.serial : 0);
@@ -2429,7 +2429,7 @@ index 0a2a86e..ba67817 100644
 +    MLOG("[sharechk] keys: post_tonemap=%s chr_skin=%s", g_shk_tm[0] ? g_shk_tm : "-", g_shk_skin[0] ? g_shk_skin : "-");
 +}
 +static int shchk_want(NvShader *sh) {
-+    if (!sh || !sh->key) return 0;
++    if (!sh || !sh->key[0]) return 0;
 +    shchk_keys();
 +    return (g_shk_tm[0] && p3_key_prefix(sh->key, g_shk_tm)) || (g_shk_skin[0] && p3_key_prefix(sh->key, g_shk_skin));
 +}
