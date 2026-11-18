@@ -85,6 +85,24 @@ jobs:
           cd s2arm
           bash pack/shell_build.sh "$GITHUB_WORKSPACE/out-shell"
 
+      - name: Dump make log on failure
+        if: failure()
+        shell: bash
+        run: |
+          set -uo pipefail
+          found=0
+          for f in "${RUNNER_TEMP:-/tmp}"/s2a-shell.*/make.log "${TMPDIR:-/tmp}"/s2a-shell.*/make.log /tmp/s2a-shell.*/make.log; do
+            [ -f "$f" ] || continue
+            found=1
+            echo "== $f =="
+            wc -l "$f" || true
+            echo "== error-ish lines =="
+            grep -a -n -E 'error:|fatal error|Undefined symbols|ld: |Error [0-9]|【红】' "$f" | head -80 || true
+            echo "== tail 200 =="
+            tail -200 "$f"
+          done
+          [ "$found" = 1 ] || echo "no make.log found (RUNNER_TEMP=${RUNNER_TEMP:-unset})"
+
       - name: Upload shell artifact
         uses: actions/upload-artifact@v4
         with:
