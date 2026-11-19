@@ -1,0 +1,326 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 64d36fd..e227d9b 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -749,6 +749,7 @@ static int present_link_from_env(void) {
+ #endif
+     return v;
+ }
++static int alias_tiny_bits(void);   // S2Arm 2026-11-19 v058tiny: S2A_ALIAS_TINY 位掩码（定义在 alias_key 旁）
+ void mtl_init(void) {
+     if (g_dev) return;
+     const char *vbc = getenv("DM_NVN_VBUF_CACHE"); g_vbuf_cache = !(vbc && !strcmp(vbc, "0"));
+@@ -759,6 +760,7 @@ void mtl_init(void) {
+     g_dev = MTLCreateSystemDefaultDevice();
+     if (!g_dev) MDIE("no Metal device");
+     if (!g_dev.hasUnifiedMemory) MDIE("needs a unified-memory device (zero-copy memory pools)");
++    { int b = alias_tiny_bits(); MLOG("[v058tiny] tiny/vol/sky alias bits=0x%x (S2A_ALIAS_TINY=%d)", b, b); }   // 2026-11-19 v058tiny: 起局确认壳
+     int os26 = 0, family4 = 0, ios26x = 0; const char *be_why;
+     if (@available(macOS 26.0, iOS 26.0, *)) { os26 = 1; family4 = [g_dev supportsFamily:MTLGPUFamilyMetal4]; }
+ #if TARGET_OS_IPHONE
+@@ -2886,13 +2888,128 @@ typedef struct { uint64_t pool; int64_t off; nvn_texdesc d; } alias_key;
+ // texture lacks is added in place (tex_mtl → tex_upgrade)
+ enum { ALIAS_USE_FLAGS = NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_ADAPTIVE_ZCULL | NVN_TEXTURE_FLAGS_DEPTH16_PREFER_FAST_CLEAR | NVN_TEXTURE_FLAGS_ZCULL_SUPPORT_STENCIL };
+ static int mtl_fmt_depth(MTLPixelFormat f);
+-static void alias_key_of(alias_key *k, const tex_t *t) { memset(k, 0, sizeof *k); k->pool = (uint64_t)(uintptr_t)t->pool; k->off = t->off; k->d = t->d; k->d.flags &= ~(uint32_t)ALIAS_USE_FLAGS; }
++// ---------- S2Arm 2026-11-19 v058tiny: 三类小纹理按语义归一化共享键 ----------
++// 现场（0.5.8 真机）：1x1 RG32F、8x8x64（体积 LUT）、32x32x32（天空 LUT）各有写方 / 读方两个 ID 落在同一段
++// guest 存储、同一 (pool, off) 上，但两个描述符只有不参与存储布局的字段不同（samples 0/1、levels、stride、
++// pkg_layout）→ 整个描述符做键，各建一张 Metal 纹理 → 写一张读另一张（ser 写 = 读 + 1）。
++// 这里只对这三类尺寸把这些字段归一化；format / target / width / height / depth 仍参与键（防误合并）。
++// S2A_ALIAS_TINY 是位掩码（默认 1）：bit0 samples（0→1，nvn_texdesc 注释的"0 or 1 = single-sampled"，纯语义重复，零风险）；
++//   bit1 levels；bit2 stride；bit3 pkg_layout。0 = 完全回到 0.5.8 行为（A/B），15 = 四个字段全归一化。
++enum { ALIAS_TINY_SAMPLES = 1, ALIAS_TINY_LEVELS = 2, ALIAS_TINY_STRIDE = 4, ALIAS_TINY_PKG = 8 };
++static const char S2A_V058TAG[] __attribute__((used)) = "2026-11-19-v058tiny";   // 壳标记（二进制里可 grep；起局行见 mtl_init）
++enum { ALIAS_CLS_NONE = 0, ALIAS_CLS_TINY = 1, ALIAS_CLS_VOL = 2, ALIAS_CLS_SKY = 3 };
++static int alias_tiny_bits(void) {
++    static _Atomic int v = -1;
++    int b = atomic_load_explicit(&v, memory_order_relaxed);
++    if (b < 0) {
++        const char *e = getenv("S2A_ALIAS_TINY");
++        long n = e && *e ? strtol(e, NULL, 0) : 1;
++        if (n < 0) n = 0;
++        if (n > 15) n = 15;
++        b = (int)n;
++        atomic_store_explicit(&v, b, memory_order_relaxed);
++    }
++    return b;
++}
++static int alias_cls_of(const nvn_texdesc *d) {
++    if (!d) return ALIAS_CLS_NONE;
++    if (d->width == 1u && d->height == 1u && d->depth <= 1u) return ALIAS_CLS_TINY;
++    if (d->width == 8u && d->height == 8u && d->depth == 64u) return ALIAS_CLS_VOL;
++    if (d->width == 32u && d->height == 32u && d->depth == 32u) return ALIAS_CLS_SKY;
++    return ALIAS_CLS_NONE;
++}
++static void alias_key_of(alias_key *k, const tex_t *t) {
++    memset(k, 0, sizeof *k); k->pool = (uint64_t)(uintptr_t)t->pool; k->off = t->off; k->d = t->d; k->d.flags &= ~(uint32_t)ALIAS_USE_FLAGS;
++    if (alias_cls_of(&k->d)) {
++        int bits = alias_tiny_bits();
++        if (bits & ALIAS_TINY_SAMPLES) k->d.samples = k->d.samples ? k->d.samples : 1;
++        if (bits & ALIAS_TINY_LEVELS) k->d.levels = 0;
++        if (bits & ALIAS_TINY_STRIDE) k->d.stride = 0;
++        if (bits & ALIAS_TINY_PKG) k->d.pkg_layout = 0;
++    }
++}
+ static nvn_hmap g_alias = {.klen = sizeof(alias_key)};
+ static nvn_hmap g_alias_seen = {.klen = sizeof(alias_key)};   // key → g_fence + 1 at its last lookup or creation (alias_take_over spares entries looked up lately)
+ static nvn_hmap g_alias_wrote = {.klen = sizeof(alias_key)};   // key → g_fence + 1 at its last GPU write (gpw_mark), under g_smu
+ static CFMutableSetRef g_alias_set;   // Textures in the sharing table (non-owning; used to ask "is this shared")
+ static uint64_t g_alias_evicted;   // shared textures evicted on pool Finalize so far (for the memory report)
+ static int alias_has(id o) { return g_alias_set && o && CFSetContainsValue(g_alias_set, (__bridge const void *)o); }
++// ---------- S2Arm 2026-11-19 v058tiny probes: [aliasq] / [pairchk] / [packaged] ----------
++// [aliasq]：三类尺寸首次解析时打归一化前 / 后的键字段和最终 g_alias 命中（≤24 行），退出时每类总计；
++// [pairchk]：同一 (pool, off) 上出现第二个 ID 时一行（≤16 行），same = 归一化后的键相同，mtl_same = Metal 对象指针相同；
++// [packaged]：整局 carry_gpu 次数 / g_alias 表项峰值 / 池收尾驱逐数，退出时一行。
++enum { ALIASQ_MAX = 24, PAIRCHK_MAX = 16, PAIR_TRACK = 32 };
++static _Atomic uint32_t g_aliasq_total[4], g_aliasq_hit[4];
++static uint64_t g_aliasq_ser[ALIASQ_MAX]; static uint32_t g_aliasq_n;
++static pthread_mutex_t g_aliasq_mu = PTHREAD_MUTEX_INITIALIZER;
++typedef struct { uint64_t pool; int64_t off; uint64_t size; uint64_t ser; void *obj; nvn_texdesc d; int paired; } alias_pair_ent;
++static alias_pair_ent g_alias_pair[PAIR_TRACK]; static uint32_t g_alias_pair_n, g_alias_pair_printed;
++static _Atomic uint32_t g_alias_peak;
++static _Atomic uint64_t g_pkg_carry, g_pkg_turned;   // carry_gpu 次数 / 由 GPU-only 纹理转成 packaged 的次数
++static uint64_t alias_ser_of_obj_locked(id o) {   // caller holds g_smu: the serial a Metal texture is named by (0 = none)
++    for (uint32_t i = 0; i < g_by_serial.cap; i++) if (g_by_serial.vals[i] == (__bridge void *)o) {
++        uint64_t s = 0; memcpy(&s, g_by_serial.keys + (size_t)i * g_by_serial.klen, sizeof s); return s; }
++    return 0;
++}
++static void alias_probe_resolve(const tex_t *t, const alias_key *k, __unsafe_unretained id shared, uint64_t shared_ser) {
++    int cls = alias_cls_of(&t->d);
++    if (!cls || !t->serial) return;
++    atomic_fetch_add_explicit(&g_aliasq_total[cls], 1, memory_order_relaxed);
++    if (shared) atomic_fetch_add_explicit(&g_aliasq_hit[cls], 1, memory_order_relaxed);
++    @try {
++        pthread_mutex_lock(&g_aliasq_mu);
++        int seen = 0; for (uint32_t i = 0; i < g_aliasq_n; i++) if (g_aliasq_ser[i] == t->serial) { seen = 1; break; }
++        if (!seen && g_aliasq_n < ALIASQ_MAX) {
++            g_aliasq_ser[g_aliasq_n++] = t->serial;
++            char ss[24]; if (shared_ser) snprintf(ss, sizeof ss, "%llu", (unsigned long long)shared_ser); else snprintf(ss, sizeof ss, "-");
++            MLOG("[aliasq] %ux%ux%u fmt=0x%x tgt=%d ser=%llu pre(lv=%u s=%d stride=%u pkg=%d) key(after strip: lv=%u s=%d stride=%u pkg=%d) hit=%d shared_ser=%s",
++                 t->d.width, t->d.height, t->d.depth, (unsigned)t->d.format, t->d.target, (unsigned long long)t->serial,
++                 t->d.levels, t->d.samples, t->d.stride, t->d.pkg_layout, k->d.levels, k->d.samples, k->d.stride, k->d.pkg_layout, shared ? 1 : 0, ss);
++        }
++        alias_pair_ent *e = NULL;
++        for (uint32_t i = 0; i < g_alias_pair_n; i++) if (g_alias_pair[i].pool == k->pool && g_alias_pair[i].off == k->off) { e = &g_alias_pair[i]; break; }
++        if (!e) {
++            if (g_alias_pair_n < PAIR_TRACK) {
++                e = &g_alias_pair[g_alias_pair_n++]; memset(e, 0, sizeof *e);
++                e->pool = k->pool; e->off = k->off; e->size = t->L.size; e->ser = t->serial; e->d = k->d; e->obj = shared ? (__bridge void *)shared : NULL;
++            }
++        } else {
++            if (!e->obj && shared) e->obj = (__bridge void *)shared;
++            if (!e->paired && e->ser != t->serial && g_alias_pair_printed < PAIRCHK_MAX) {
++                int same = memcmp(&e->d, &k->d, sizeof e->d) == 0;
++                int mtl_same = e->obj && shared && e->obj == (__bridge void *)shared;
++                e->paired = 1; g_alias_pair_printed++;
++                MLOG("[pairchk] span=0x%llx+%llu %ux%ux%u fmt=0x%x id1_ser=%llu id2_ser=%llu same=%d mtl_same=%d",
++                     (unsigned long long)k->off, (unsigned long long)e->size, t->d.width, t->d.height, t->d.depth, (unsigned)t->d.format,
++                     (unsigned long long)e->ser, (unsigned long long)t->serial, same, mtl_same);
++            }
++        }
++        pthread_mutex_unlock(&g_aliasq_mu);
++    } @catch (NSException *ex) { MLOG("[aliasq] probe disabled after exception: %s", ex.reason ? ex.reason.UTF8String : "unknown"); }
++}
++static void alias_probe_created(const alias_key *k, id mt) {
++    if (!mt || !alias_cls_of(&k->d)) return;
++    @try {
++        pthread_mutex_lock(&g_aliasq_mu);
++        for (uint32_t i = 0; i < g_alias_pair_n; i++)
++            if (g_alias_pair[i].pool == k->pool && g_alias_pair[i].off == k->off && !g_alias_pair[i].obj) { g_alias_pair[i].obj = (__bridge void *)mt; break; }
++        pthread_mutex_unlock(&g_aliasq_mu);
++    } @catch (NSException *ex) { MLOG("[pairchk] probe disabled after exception: %s", ex.reason ? ex.reason.UTF8String : "unknown"); }
++}
++static void alias_note_peak_locked(void) {   // caller holds g_smu
++    uint32_t n = g_alias.n, p = atomic_load_explicit(&g_alias_peak, memory_order_relaxed);
++    if (n > p) atomic_store_explicit(&g_alias_peak, n, memory_order_relaxed);
++}
++static void alias_done_report(void) {
++    static _Atomic int once;
++    if (atomic_exchange(&once, 1)) return;
++    uint32_t t1 = atomic_load(&g_aliasq_total[1]), h1 = atomic_load(&g_aliasq_hit[1]);
++    uint32_t t2 = atomic_load(&g_aliasq_total[2]), h2 = atomic_load(&g_aliasq_hit[2]);
++    uint32_t t3 = atomic_load(&g_aliasq_total[3]), h3 = atomic_load(&g_aliasq_hit[3]);
++    MLOG("[aliasq] done class=tiny total=%u hit=%u miss=%u | vol total=%u hit=%u miss=%u | sky total=%u hit=%u miss=%u", t1, h1, t1 - h1, t2, h2, t2 - h2, t3, h3, t3 - h3);
++    MLOG("[packaged] done frames=%llu carry=%llu alias_peak=%u alias_evicted=%llu",
++         (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)atomic_load(&g_pkg_carry), atomic_load(&g_alias_peak), (unsigned long long)g_alias_evicted);
++}
+ // On memory pool Finalize, evict the textures built on that pool from the sharing table (collect the keys first, then delete: deletion shifts entries back). The sharing table used not to evict: Mario's pools stay for good, so entries are bounded;
+ // Engage frees pools on scene changes and rebuilds on new ones, so the old pools' render targets and other private textures stayed in the table forever (about 0.8 GB more GPU memory over 850 s of the title demo), and linear textures built directly on a pool also kept the whole pool buffer alive.
+ // Also, when a pool object's address is reused, old entries would hand a texture on the old storage to the new pool's texture at the same offset and description. Evicted textures go through deferred release; if the serial table still holds one, that is just one more reference
+@@ -5182,6 +5299,7 @@ static void carry_rect(void *u, unsigned level, unsigned layer, uint32_t x, uint
+ }
+ static uint64_t g_carry_tex, g_carry_rects;
+ static void carry_gpu(const tex_t *t, id<MTLTexture> to, id<MTLTexture> from, const uint64_t *runs, int n, uint64_t bytes) {
++    atomic_fetch_add_explicit(&g_pkg_carry, 1, memory_order_relaxed);   // 2026-11-19 v058tiny: [packaged] done carry=
+     if (from.pixelFormat != to.pixelFormat || from.width != to.width || from.height != to.height || from.depth != to.depth || from.arrayLength != to.arrayLength
+         || from.mipmapLevelCount != to.mipmapLevelCount || from.textureType != to.textureType || from.sampleCount != to.sampleCount) {
+         RED_ONCE(166, "texture ser=%llu turned packaged: its old host texture has another shape (format %lu → %lu, %lux%lu → %lux%lu, levels %lu → %lu), the %llu bytes the GPU wrote are not carried over",
+@@ -5444,7 +5562,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+         pk->check_epoch = g_pkg_epoch;
+         pk->sparse = t->pool && nvn_sparse_pool(t->pool); pk->vgen = pk->vseen = nvn_sparse_gen();
+         uint64_t *gr = NULL, gb = 0; int gn = 0; id<MTLTexture> gfrom = nil;   // turning packaged from a GPU-only texture: its texels a GPU write left stale in guest memory (carry_gpu)
+-        if (have && !pk->sparse && [have conformsToProtocol:@protocol(MTLTexture)]) { gfrom = have; gn = gpw_stale(t->mem, t->L.size, &gr, &gb); }
++        if (have && !pk->sparse && [have conformsToProtocol:@protocol(MTLTexture)]) { gfrom = have; gn = gpw_stale(t->mem, t->L.size, &gr, &gb); atomic_fetch_add_explicit(&g_pkg_turned, 1, memory_order_relaxed); }
+         tp_first_upload(t);   // upload ahead: this frame's first-use demand
+         if (!stex_pkg_new(pk, t)) pk->tex = pkg_upload(t, &pk->stamp, nil, &pk->ph, &pk->nph, 1);   // 大稀疏贴图（Switch 2、Metal 4）：放置式块管理（nvn_stex.inc）
+         if (!pk->tex) { free(gr); return nil; }
+@@ -5491,7 +5609,10 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+     //   the game finalizes texture objects and keeps their descriptors registered over live storage, and each resolution went through the ring (an entry evicted, g_ser_gen moved, so
+     //   every texture ID cache resolved again). The sharing table keeps the texture resident; once it leaves the table, the next resolution makes it anew, as for a live object
+     pthread_mutex_lock(&g_smu); __unsafe_unretained id shared = hm_get_id(&g_alias, &ak); if (shared) nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1));
+-    int dead = t->serial < (1ull << 62) && !nvn_hm_get(&g_tex_live, &t->serial); pthread_mutex_unlock(&g_smu);
++    int dead = t->serial < (1ull << 62) && !nvn_hm_get(&g_tex_live, &t->serial);
++    uint64_t shared_ser = shared ? alias_ser_of_obj_locked((id)shared) : 0;
++    pthread_mutex_unlock(&g_smu);
++    alias_probe_resolve(t, &ak, shared, shared_ser);   // 2026-11-19 v058tiny: [aliasq] / [pairchk]
+     if (shared && dead && !((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !(((id<MTLTexture>)shared).usage & MTLTextureUsageShaderWrite))) { g_ghost_shared++; return shared; }
+     if (shared) {
+         if (g_tex_peek && (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !(((id<MTLTexture>)shared).usage & MTLTextureUsageShaderWrite) && !mtl_fmt_depth(((id<MTLTexture>)shared).pixelFormat))
+@@ -5544,6 +5665,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+     if (!g_alias_set) g_alias_set = CFSetCreateMutable(NULL, 0, NULL);
+     alias_take_over(&ak);
+     hm_put_id(&g_alias, &ak, mt); CFSetAddValue(g_alias_set, (__bridge const void *)mt); nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1));
++    alias_note_peak_locked(); alias_probe_created(&ak, mt);   // 2026-11-19 v058tiny: [packaged] alias_peak, [pairchk] mtl_same
+     pthread_mutex_unlock(&g_smu);
+     tex_put(t->serial, mt);
+     return mt;
+@@ -6037,6 +6159,7 @@ static int g_el_w, g_el_h, g_el_draws; static char g_el_key[12];
+ static int enc_label_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_ENC_LABEL"); v = e && atoi(e); } return v; }
+ static int g_nbcrt; static void bcrt_flush(void);   // shadows of block-compressed render targets used by the open pass (see bcrt_attach)
+ static int g_unb; static p_set_rt g_unb_rt; static uint64_t g_unb_n, g_unb_land;   // a held empty binding (see unb_on)
++static void tm_pass_end(void);   // S2Arm 2026-11-19 v058tiny: [tonemapin] 读回（定义在 ubo / img 助手之后）
+ static void rp_end(void) { if (!g_rlane) geo_run_flush(); if (g_enc) { AP_B;
+     if (enc_label_on()) { static uint64_t lf = ~0ull, base; uint64_t f = atomic_load(&g_cur_frame); if (f != lf) { lf = f; base = g_stat_pass - 1; }   // Intra-frame serial: the same pass has the same name every frame, so the table can aggregate by name
+         [(id)g_enc setLabel:[NSString stringWithFormat:@"p%02llu %dx%d %s d%d", (unsigned long long)(g_stat_pass - base), g_el_w, g_el_h, g_el_key[0] ? g_el_key : "-", g_el_draws]]; }
+@@ -6044,6 +6167,7 @@ static void rp_end(void) { if (!g_rlane) geo_run_flush(); if (g_enc) { AP_B;
+     int ranged=g_rt_range_active && !g_rt_range_pending;
+ #endif
+     sd_finish(); enc_r_end_pass(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
++    tm_pass_end();   // 2026-11-19 v058tiny: [tonemapin] 这一遍排队的 1×1 读回
+     if (g_nubd && g_nubd >= ubd_lazy()) ubd_flush();   // the inline updates deferred in this pass, in order (see mtl_sub_update); across passes they wait for the next copy or dispatch (blit_raw)
+     if (g_nbcrt) bcrt_flush();   // blocks drawn into shadows go back into their compressed textures
+ #ifdef NVN_RT_RANGE_TEST
+@@ -11239,6 +11363,102 @@ static int fold_samp_tid(const nvn_rbind *b, int st) {
+     if (b->kind == NVN_RB_SAMPU && !b->n && (!b->sid || b->pair)) return fold_tid_ok(ubo_tex_id(ubo_packed(st, b)));
+     return -1;
+ }
++// ---------- S2Arm 2026-11-19 v058tiny: [tonemapin] post_tonemap 读的 1×1 ----------
++// 从 shader_map.tsv 认 post_tonemap 的 key（不写死 serial / key）：绘制绑定时找它读的 1×1，每 600 帧排 1 个 texel，
++// pass 结束用 blit 拷进 shared 缓冲，提交完成回调里打 f / ser / fmt / val / zero（≤4 次）。@try/@catch，异常只关探针。
++enum { TM_MAX = 4 };
++static int g_tm_state;   // 0 = 未加载, 1 = 有 key, -1 = 关闭
++static char g_tm_key[17]; static NSMutableArray *g_tm_pend; static int g_tm_queued, g_tm_off;
++static void tm_load_key(void) {
++    if (g_tm_state) return;
++    g_tm_state = -1;
++    @try {
++        shmap_load();
++        const char *path = g_shmap_path ? g_shmap_path.UTF8String : NULL;
++        if (!path || !*path) { MLOG("[tonemapin] no shader map path: off"); return; }
++        FILE *fp = fopen(path, "r");
++        if (!fp) { MLOG("[tonemapin] shader map %s unreadable: off", path); return; }
++        char *ln = malloc(4096);   // 栈数组 ≤256 B
++        if (!ln) { fclose(fp); return; }
++        while (fgets(ln, 4096, fp)) {
++            if (ln[0] == '#' || ln[0] == '\n') continue;
++            char *c[5]; int n = 0; char *q = ln; c[n++] = q;
++            while (n < 5) { char *t = strchr(q, '\t'); if (!t) break; *t = 0; q = t + 1; c[n++] = q; }
++            if (n < 5 || !strstr(c[4], "post_tonemap") || strstr(c[4], "post_tonemap_update")) continue;
++            if (strlen(c[3]) >= 8) { snprintf(g_tm_key, sizeof g_tm_key, "%.8s", c[3]); MLOG("[tonemapin] key %s = %s", g_tm_key, c[4]); }
++            break;
++        }
++        free(ln); fclose(fp);
++        g_tm_state = g_tm_key[0] ? 1 : -1;
++        if (!g_tm_key[0]) MLOG("[tonemapin] post_tonemap not named in %s: off", path);
++    } @catch (NSException *e) { g_tm_off = 1; g_tm_state = -1; MLOG("[tonemapin] disabled after exception: %s", e.reason ? e.reason.UTF8String : "unknown"); }
++}
++static int tm_tex_tid(const nvn_rbind *b, int st) {
++    switch (b->kind) {
++        case NVN_RB_TEX: case NVN_RB_TBUF: return (int)(tex_slot_h(S.tex[st], S.img[st], b->reg) & 0xfffff);
++        case NVN_RB_TEXU: case NVN_RB_TBUFU: return ubo_tex_id(ubo_packed(st, b));
++        case NVN_RB_IMG: case NVN_RB_IMGU: return img_tid(b, st);
++        default: return -1;
++    }
++}
++static void tm_note(NvProg *pr) {
++    if (g_tm_off || g_tm_queued >= TM_MAX || !pr || !pr->sh[1]) return;
++    long f = (long)atomic_load(&g_cur_frame);
++    if (f <= 0 || (f % 600) != 0) return;
++    @try {
++        tm_load_key();
++        if (g_tm_off || g_tm_state <= 0 || !g_tm_key[0]) return;
++        NvShader *sh = pr->sh[1];
++        if (!sh->key || strncmp(sh->key, g_tm_key, 8)) return;
++        for (int i = 0; i < sh->rf.nb; i++) {
++            const nvn_rbind *b = &sh->rf.b[i];
++            int tid = tm_tex_tid(b, 1);
++            if (tid <= 0 || tid >= g_ntreg || !g_treg[tid].ok) continue;
++            const tex_t *ct = &g_treg[tid].t;
++            if (ct->d.width != 1u || ct->d.height != 1u || ct->d.depth > 1u) continue;   // post_tonemap 读的 1×1
++            id<MTLTexture> t = tex_mtl(ct);
++            if (!t || t.width != 1 || t.height != 1) continue;
++            if (!g_tm_pend) g_tm_pend = [NSMutableArray array];
++            for (NSArray *e in g_tm_pend) if ([e[1] unsignedLongLongValue] == (unsigned long long)ct->serial && [e[4] longValue] == f) return;   // one per frame
++            [g_tm_pend addObject:@[t, @((unsigned long long)ct->serial), @((unsigned)ct->d.format), @((int)t.pixelFormat), @(f)]];
++            g_tm_queued++;
++            break;
++        }
++    } @catch (NSException *e) { g_tm_off = 1; MLOG("[tonemapin] disabled after exception: %s", e.reason ? e.reason.UTF8String : "unknown"); }
++}
++static void tm_job(NSDictionary *j) {
++    if (g_tm_off) return;
++    @try {
++        id<MTLBuffer> b = j[@"buf"]; if (!b) return;
++        const uint8_t *p = (const uint8_t *)b.contents; if (!p) return;
++        long f = (long)[j[@"f"] longValue]; unsigned long long ser = [j[@"ser"] unsignedLongLongValue];
++        unsigned fmt = (unsigned)[j[@"fmt"] unsignedIntValue], bpp = (unsigned)[j[@"bpp"] unsignedIntValue];
++        float v[4] = {0, 0, 0, 0}; int zero = 1;
++        for (unsigned i = 0; i < bpp && i < 16; i++) if (p[i]) zero = 0;
++        memcpy(v, p, bpp < 16 ? bpp : 16);
++        MLOG("[tonemapin] f=%ld ser=%llu fmt=0x%x val=(%g,%g,%g,%g) zero=%d", f, ser, fmt, v[0], v[1], v[2], v[3], zero);
++    } @catch (NSException *e) { g_tm_off = 1; MLOG("[tonemapin] disabled after exception: %s", e.reason ? e.reason.UTF8String : "unknown"); }
++}
++static void tm_pass_end(void) {
++    if (g_tm_off || !g_tm_pend.count || !g_commit_blocks) return;
++    @try {
++        NSArray *jobs = [g_tm_pend copy]; [g_tm_pend removeAllObjects];
++        for (NSArray *e in jobs) {
++            id<MTLTexture> t = e[0]; if (!t) continue;
++            size_t bpp = mtl_pf_bytes(t.pixelFormat);
++            if (!bpp || bpp > 16) { MLOG("[tonemapin] ser=%llu skip: texel size %lu", (unsigned long long)[e[1] unsignedLongLongValue], (unsigned long)bpp); continue; }
++            id<MTLBuffer> rb = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
++            if (!rb) { MLOG("[tonemapin] skip: newBufferWithLength(16) nil"); continue; }
++            id<MTL4ComputeCommandEncoder> enc = blit();
++            if (!enc) { MLOG("[tonemapin] skip: blitCommandEncoder nil"); continue; }
++            [enc copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(1, 1, 1)
++                        toBuffer:rb destinationOffset:0 destinationBytesPerRow:bpp destinationBytesPerImage:bpp];
++            res_add(rb);
++            NSDictionary *j = @{@"buf": rb, @"f": e[4], @"ser": e[1], @"fmt": e[2], @"bpp": @(bpp)};
++            [g_commit_blocks addObject:^{ tm_job(j); }];
++        }
++    } @catch (NSException *e) { g_tm_off = 1; MLOG("[tonemapin] disabled after exception: %s", e.reason ? e.reason.UTF8String : "unknown"); }
++}
+ static int se_need_(NvShader *sh, int nvn_stage, int *fold) {
+     *fold = 0;
+     if ((!g_se_any && !g_fold_any) || !sh) return 0;
+@@ -15402,6 +15622,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
+     //   draw below crashed inside the driver (11-02 Need for Speed: Hot Pursuit Remastered, SIGSEGV at 0x7bc in drawIndexedPrimitives, right after "texture upgraded to allow format views").
+     //   Draw again in a new pass: the texture is upgraded now, so the second binding does not copy (the depth guard stops a binding that would end every pass)
+     if (g_enc != en) { static int again; if (again < 2) { again++; draw(dw, di); again--; return; } RED_ONCE(136, "a draw's binding ended its render pass again on the retry; the draw is skipped"); return; }
++    tm_note(pr);   // 2026-11-19 v058tiny: [tonemapin] post_tonemap 读的 1×1 排队
+     // Parameter binding captures the actual resources under the registry lock; if the version changed between the eligibility check and the binding, split and retry before any GPU draw.
+     if (g_rt_range_active && (g_pass.reg_gen != g_reg_gen || g_pass.ser_gen != g_ser_gen || g_pass.range_dirty != nvn_dirty_now())) { rp_end(); draw(dw, di); return; }
+     int prim = dw ? dw->prim : di->prim;
+diff --git a/graphics/nvn/gfx/nvn/nvn_session.inc b/graphics/nvn/gfx/nvn/nvn_session.inc
+index 6dbc92a..65e04ec 100644
+--- a/graphics/nvn/gfx/nvn/nvn_session.inc
++++ b/graphics/nvn/gfx/nvn/nvn_session.inc
+@@ -86,6 +86,7 @@ static void session_resource_release(void *v) {
+ int nvn_be_drain_session(void) { return session_wait_backend(); }
+ int nvn_be_shutdown_session(void) {
+     int e = session_wait_backend(); if (e) { MLOG("【红】重启：Metal 工作仍持有旧会话 (%d)", e); return e; }
++    alias_done_report();   // 2026-11-19 v058tiny: [aliasq] done / [packaged] done（整局一行，内部只打一次）
+     // Keep completed immutable shader loads in the device cache. This also
+     // consumes the old prefetch handoff before its pipeline maps are cleared.
+     warm_claim();
