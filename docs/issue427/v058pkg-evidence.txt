@@ -1,0 +1,23 @@
+mtl] [pkgshare] alias_pkg=1 (S2A_ALIAS_PKG, default 1)
+mtl] texture upgraded to allow render-target use ser=1 base format 70 → view format 70 (upgrades=1)
+mtl] texture upgraded to allow render-target use ser=2 base format 70 → view format 70 (upgrades=2)
+mtl] texture upgraded to allow render-target use ser=3 base format 70 → view format 70 (upgrades=3)
+mtl] [pkgshare] reg ser=259 mtl=0x126fe2300 (8x8x64)
+mtl] [pkgshare] reg ser=261 mtl=0x126fe2580 (8x8x64)
+mtl] [pkgshare] reg ser=263 mtl=0x126fe2800 (32x32x32)
+mtl] [pairchk] span=0x2bc2c00+32768 8x8x64 fmt=0x3f id1_ser=261 id2_ser=260 same=1 mtl_same=1
+mtl] [pkgshare] hit ser=260 <- shared(8x8x64) ser=0 mtl=0x126fe2580
+mtl] [pairchk] span=0x2bba800+32768 8x8x64 fmt=0x3f id1_ser=259 id2_ser=258 same=1 mtl_same=1
+mtl] [pkgshare] hit ser=258 <- shared(8x8x64) ser=0 mtl=0x126fe2300
+mtl] [pkgshare] reg ser=257 mtl=0x17b50c280 (1x1)
+mtl] texture upgraded to allow format views ser=257 base format 105 → view format 53 (upgrades=4)
+mtl] [pairchk] span=0x2bba400+512 1x1x1 fmt=0x16 id1_ser=257 id2_ser=256 same=1 mtl_same=0
+mtl] [pkgshare] hit ser=256 <- shared(1x1) ser=0 mtl=0x17b50c780
+mtl] [pairchk] span=0xfcf8e00+262144 32x32x32 fmt=0x29 id1_ser=263 id2_ser=262 same=1 mtl_same=1
+mtl] [pkgshare] hit ser=262 <- shared(32x32x32) ser=0 mtl=0x126fe2800
+mtl] [pairchk] span=0xfd3ae00+131072 32x32x32 fmt=0x11 id1_ser=265 id2_ser=264 same=1 mtl_same=1
+mtl] [tonemapin] key f9791dd3 = /asset/nx/shader/post_tonemap.nvn#GLSLC@0x0
+mtl] [tonemapin] f=600 ser=256 fmt=0x16 val=(1.17688,0.879766,0,0) zero=0
+mtl] [tonemapin] f=1200 ser=256 fmt=0x16 val=(1.17688,0.879766,0,0) zero=0
+mtl] [tonemapin] f=1800 ser=256 fmt=0x16 val=(1.17688,0.879766,0,0) zero=0
+mtl] [tonemapin] f=2400 ser=256 fmt=0x16 val=(1.17688,0.879766,0,0) zero=0
