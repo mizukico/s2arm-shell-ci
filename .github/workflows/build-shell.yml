@@ -101,6 +101,7 @@ jobs:
           for X in $(ls -d /Applications/Xcode*.app 2>/dev/null | sort -Vr); do
             if DEVELOPER_DIR="$X/Contents/Developer" xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
               export DEVELOPER_DIR="$X/Contents/Developer"
+              export S2A_DEVELOPER_DIR="$X/Contents/Developer"   # toolchain.sh 的第一优先级
               echo "使用带 Metal Toolchain 的 Xcode：$X"
               break
             fi
