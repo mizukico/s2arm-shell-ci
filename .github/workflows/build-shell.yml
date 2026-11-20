@@ -100,7 +100,8 @@ jobs:
           # 镜像里的增量构建按 mtime 判新旧；补丁改过的文件若 mtime 不新于既有 .o，改动就不会被编译（S6~S8 疑似踩过）
           git show --name-only --pretty=format: HEAD | while read -r f; do [ -n "$f" ] && [ -f "$f" ] && touch "$f" && echo "touched $f"; done
 
-      - name: Build shell        shell: bash
+      - name: Build shell
+        shell: bash
         run: |
           set -uo pipefail
           # 挑一个装了 Metal Toolchain 的 Xcode：runner 镜像里可能有更新的 Xcode 但没装 Metal（27.3.0 就是），
