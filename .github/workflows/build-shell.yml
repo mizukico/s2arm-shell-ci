@@ -78,6 +78,20 @@ jobs:
           git add -A
           git -c user.name=s2arm-ci -c user.email=ci@local commit -m "ci: host patch + iOS SDK pin ($SDK_MAJOR)" || echo "nothing to commit"
 
+      - name: Regenerate the translation chain header
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd s2arm
+          # 改了翻译器（Program.cs / S2A.Dsh 等）就必须重生成链号头：指纹 V 是逐着色器缓存键的一部分，
+          # 头不更新则 V 不变、旧译文被复用，改动不生效。
+          python3 translator/dmsh_chain.py --header
+          git add -A
+          if ! git diff --cached --quiet; then
+            git -c user.name=s2arm-ci -c user.email=ci@local commit -m "ci: regenerate translation chain header"
+          fi
+          git show --stat --oneline HEAD | head -20
+
       - name: Build shell
         shell: bash
         run: |
