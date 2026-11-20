@@ -96,6 +96,16 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          # 挑一个装了 Metal Toolchain 的 Xcode：runner 镜像里可能有更新的 Xcode 但没装 Metal（27.3.0 就是），
+          # shell_build.sh 取"装着的 Xcode 里最新的"会直接报红。
+          for X in $(ls -d /Applications/Xcode*.app 2>/dev/null | sort -Vr); do
+            if DEVELOPER_DIR="$X/Contents/Developer" xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
+              export DEVELOPER_DIR="$X/Contents/Developer"
+              echo "使用带 Metal Toolchain 的 Xcode：$X"
+              break
+            fi
+          done
+          xcrun -sdk iphoneos metal --version 2>&1 | head -2 || true
           cd s2arm
           # the build deletes its make.log on exit (trap): keep a rolling copy while it runs
           ( while :; do for f in "${RUNNER_TEMP:-/tmp}"/s2a-shell.*/make.log "${TMPDIR:-/tmp}"/s2a-shell.*/make.log /tmp/s2a-shell.*/make.log /var/folders/*/*/T/s2a-shell.*/make.log; do [ -f "$f" ] && cp -f "$f" "$GITHUB_WORKSPACE/make.log.last" 2>/dev/null; done; sleep 1; done ) &
