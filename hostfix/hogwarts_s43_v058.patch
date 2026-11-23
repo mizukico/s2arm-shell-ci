@@ -1,7 +1,7 @@
-diff --git a/pristine/graphics/nvn/gfx/nvn/nvn_mtl.m b/verify43/graphics/nvn/gfx/nvn/nvn_mtl.m
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
 index 64d36fd..156ad09 100644
---- a/pristine/graphics/nvn/gfx/nvn/nvn_mtl.m
-+++ b/verify43/graphics/nvn/gfx/nvn/nvn_mtl.m
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
 @@ -749,6 +749,8 @@ static int present_link_from_env(void) {
  #endif
      return v;
