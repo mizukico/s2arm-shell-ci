@@ -1,0 +1,1236 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 64d36fd..3a20208 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -749,6 +749,8 @@ static int present_link_from_env(void) {
+ #endif
+     return v;
+ }
++static int alias_tiny_bits(void);   // S2Arm 2026-11-19 v058tiny: S2A_ALIAS_TINY 位掩码（定义在 alias_key 旁）
++static int alias_pkg_on(void);      // S2Arm 2026-11-19 v058pkg: S2A_ALIAS_PKG（默认 1，定义在 alias_key 旁）
+ void mtl_init(void) {
+     if (g_dev) return;
+     const char *vbc = getenv("DM_NVN_VBUF_CACHE"); g_vbuf_cache = !(vbc && !strcmp(vbc, "0"));
+@@ -759,6 +761,8 @@ void mtl_init(void) {
+     g_dev = MTLCreateSystemDefaultDevice();
+     if (!g_dev) MDIE("no Metal device");
+     if (!g_dev.hasUnifiedMemory) MDIE("needs a unified-memory device (zero-copy memory pools)");
++    { int b = alias_tiny_bits(); MLOG("[v058tiny] tiny/vol/sky alias bits=0x%x (S2A_ALIAS_TINY=%d)", b, b); }   // 2026-11-19 v058tiny: 起局确认壳
++    { int p = alias_pkg_on(); MLOG("[pkgshare] alias_pkg=%d (S2A_ALIAS_PKG, default 1)", p); }   // 2026-11-19 v058pkg: 起局确认壳
+     int os26 = 0, family4 = 0, ios26x = 0; const char *be_why;
+     if (@available(macOS 26.0, iOS 26.0, *)) { os26 = 1; family4 = [g_dev supportsFamily:MTLGPUFamilyMetal4]; }
+ #if TARGET_OS_IPHONE
+@@ -2886,13 +2890,177 @@ typedef struct { uint64_t pool; int64_t off; nvn_texdesc d; } alias_key;
+ // texture lacks is added in place (tex_mtl → tex_upgrade)
+ enum { ALIAS_USE_FLAGS = NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_ADAPTIVE_ZCULL | NVN_TEXTURE_FLAGS_DEPTH16_PREFER_FAST_CLEAR | NVN_TEXTURE_FLAGS_ZCULL_SUPPORT_STENCIL };
+ static int mtl_fmt_depth(MTLPixelFormat f);
+-static void alias_key_of(alias_key *k, const tex_t *t) { memset(k, 0, sizeof *k); k->pool = (uint64_t)(uintptr_t)t->pool; k->off = t->off; k->d = t->d; k->d.flags &= ~(uint32_t)ALIAS_USE_FLAGS; }
++// ---------- S2Arm 2026-11-19 v058tiny: 三类小纹理按语义归一化共享键 ----------
++// 现场（0.5.8 真机）：1x1 RG32F、8x8x64（体积 LUT）、32x32x32（天空 LUT）各有写方 / 读方两个 ID 落在同一段
++// guest 存储、同一 (pool, off) 上，但两个描述符只有不参与存储布局的字段不同（samples 0/1、levels、stride、
++// pkg_layout）→ 整个描述符做键，各建一张 Metal 纹理 → 写一张读另一张（ser 写 = 读 + 1）。
++// 这里只对这三类尺寸把这些字段归一化；format / target / width / height / depth 仍参与键（防误合并）。
++// S2A_ALIAS_TINY 是位掩码（默认 1）：bit0 samples（0→1，nvn_texdesc 注释的"0 or 1 = single-sampled"，纯语义重复，零风险）；
++//   bit1 levels；bit2 stride；bit3 pkg_layout。0 = 完全回到 0.5.8 行为（A/B），15 = 四个字段全归一化。
++enum { ALIAS_TINY_SAMPLES = 1, ALIAS_TINY_LEVELS = 2, ALIAS_TINY_STRIDE = 4, ALIAS_TINY_PKG = 8 };
++static const char S2A_V058TAG[] __attribute__((used)) = "2026-11-19-v058pkg";   // 壳标记（二进制里可 grep；起局行见 mtl_init）
++enum { ALIAS_CLS_NONE = 0, ALIAS_CLS_TINY = 1, ALIAS_CLS_VOL = 2, ALIAS_CLS_SKY = 3 };
++static int alias_tiny_bits(void) {
++    static _Atomic int v = -1;
++    int b = atomic_load_explicit(&v, memory_order_relaxed);
++    if (b < 0) {
++        const char *e = getenv("S2A_ALIAS_TINY");
++        long n = e && *e ? strtol(e, NULL, 0) : 1;
++        if (n < 0) n = 0;
++        if (n > 15) n = 15;
++        b = (int)n;
++        atomic_store_explicit(&v, b, memory_order_relaxed);
++    }
++    return b;
++}
++static int alias_cls_of(const nvn_texdesc *d) {
++    if (!d) return ALIAS_CLS_NONE;
++    if (d->width == 1u && d->height == 1u && d->depth <= 1u) return ALIAS_CLS_TINY;
++    if (d->width == 8u && d->height == 8u && d->depth == 64u) return ALIAS_CLS_VOL;
++    if (d->width == 32u && d->height == 32u && d->depth == 32u) return ALIAS_CLS_SKY;
++    return ALIAS_CLS_NONE;
++}
++// ---------- S2Arm 2026-11-19 v058pkg: packaged（CPU 写入）纹理也参与这三类小纹理的别名共享 ----------
++// 0.5.8 真机（诊断 1119-1144）：1×1 / 8×8×64 / 32×32×32 的别名对子是 CPU-written（packaged），而 tex_mtl_ 在
++// 查 g_alias 之前就走 packaged 分支（上传自己的那份）→ 写方 ser 与读方 ser 各拿一张，[tonemapin] 读到全 0。
++// S2A_ALIAS_PKG=1（默认）：packaged 分支进入时先查共享、建完自己后登记；=0 完全回到 0.5.8 的 packaged 行为。
++static int alias_pkg_on(void) {
++    static _Atomic int v = -1;
++    int b = atomic_load_explicit(&v, memory_order_relaxed);
++    if (b < 0) {
++        const char *e = getenv("S2A_ALIAS_PKG");
++        long n = e && *e ? strtol(e, NULL, 0) : 1;
++        b = n != 0;
++        atomic_store_explicit(&v, b, memory_order_relaxed);
++    }
++    return b;
++}
++static void alias_key_of(alias_key *k, const tex_t *t) {
++    memset(k, 0, sizeof *k); k->pool = (uint64_t)(uintptr_t)t->pool; k->off = t->off; k->d = t->d; k->d.flags &= ~(uint32_t)ALIAS_USE_FLAGS;
++    if (alias_cls_of(&k->d)) {
++        int bits = alias_tiny_bits();
++        if (bits & ALIAS_TINY_SAMPLES) k->d.samples = k->d.samples ? k->d.samples : 1;
++        if (bits & ALIAS_TINY_LEVELS) k->d.levels = 0;
++        if (bits & ALIAS_TINY_STRIDE) k->d.stride = 0;
++        if (bits & ALIAS_TINY_PKG) k->d.pkg_layout = 0;
++    }
++}
+ static nvn_hmap g_alias = {.klen = sizeof(alias_key)};
+ static nvn_hmap g_alias_seen = {.klen = sizeof(alias_key)};   // key → g_fence + 1 at its last lookup or creation (alias_take_over spares entries looked up lately)
+ static nvn_hmap g_alias_wrote = {.klen = sizeof(alias_key)};   // key → g_fence + 1 at its last GPU write (gpw_mark), under g_smu
+ static CFMutableSetRef g_alias_set;   // Textures in the sharing table (non-owning; used to ask "is this shared")
+ static uint64_t g_alias_evicted;   // shared textures evicted on pool Finalize so far (for the memory report)
+ static int alias_has(id o) { return g_alias_set && o && CFSetContainsValue(g_alias_set, (__bridge const void *)o); }
++// ---------- S2Arm 2026-11-19 v058tiny probes: [aliasq] / [pairchk] / [packaged] ----------
++// [aliasq]：三类尺寸首次解析时打归一化前 / 后的键字段和最终 g_alias 命中（≤24 行），退出时每类总计；
++// [pairchk]：同一 (pool, off) 上出现第二个 ID 时一行（≤16 行），same = 归一化后的键相同，mtl_same = Metal 对象指针相同；
++// [packaged]：整局 carry_gpu 次数 / g_alias 表项峰值 / 池收尾驱逐数，退出时一行。
++enum { ALIASQ_MAX = 24, PAIRCHK_MAX = 16, PAIR_TRACK = 32 };
++static _Atomic uint32_t g_aliasq_total[4], g_aliasq_hit[4];
++static uint64_t g_aliasq_ser[ALIASQ_MAX]; static uint32_t g_aliasq_n;
++static pthread_mutex_t g_aliasq_mu = PTHREAD_MUTEX_INITIALIZER;
++typedef struct { uint64_t pool; int64_t off; uint64_t size; uint64_t ser; void *obj; nvn_texdesc d; int paired; } alias_pair_ent;
++static alias_pair_ent g_alias_pair[PAIR_TRACK]; static uint32_t g_alias_pair_n, g_alias_pair_printed;
++static _Atomic uint32_t g_alias_peak;
++static _Atomic uint64_t g_pkg_carry, g_pkg_turned;   // carry_gpu 次数 / 由 GPU-only 纹理转成 packaged 的次数
++static uint64_t alias_ser_of_obj_locked(id o) {   // caller holds g_smu: the serial a Metal texture is named by (0 = none)
++    for (uint32_t i = 0; i < g_by_serial.cap; i++) if (g_by_serial.vals[i] == (__bridge void *)o) {
++        uint64_t s = 0; memcpy(&s, g_by_serial.keys + (size_t)i * g_by_serial.klen, sizeof s); return s; }
++    return 0;
++}
++static void alias_probe_resolve(const tex_t *t, const alias_key *k, __unsafe_unretained id shared, uint64_t shared_ser) {
++    int cls = alias_cls_of(&t->d);
++    if (!cls || !t->serial) return;
++    atomic_fetch_add_explicit(&g_aliasq_total[cls], 1, memory_order_relaxed);
++    if (shared) atomic_fetch_add_explicit(&g_aliasq_hit[cls], 1, memory_order_relaxed);
++    @try {
++        pthread_mutex_lock(&g_aliasq_mu);
++        int seen = 0; for (uint32_t i = 0; i < g_aliasq_n; i++) if (g_aliasq_ser[i] == t->serial) { seen = 1; break; }
++        if (!seen && g_aliasq_n < ALIASQ_MAX) {
++            g_aliasq_ser[g_aliasq_n++] = t->serial;
++            char ss[24]; if (shared_ser) snprintf(ss, sizeof ss, "%llu", (unsigned long long)shared_ser); else snprintf(ss, sizeof ss, "-");
++            MLOG("[aliasq] %ux%ux%u fmt=0x%x tgt=%d ser=%llu pre(lv=%u s=%d stride=%u pkg=%d) key(after strip: lv=%u s=%d stride=%u pkg=%d) hit=%d shared_ser=%s",
++                 t->d.width, t->d.height, t->d.depth, (unsigned)t->d.format, t->d.target, (unsigned long long)t->serial,
++                 t->d.levels, t->d.samples, t->d.stride, t->d.pkg_layout, k->d.levels, k->d.samples, k->d.stride, k->d.pkg_layout, shared ? 1 : 0, ss);
++        }
++        alias_pair_ent *e = NULL;
++        for (uint32_t i = 0; i < g_alias_pair_n; i++) if (g_alias_pair[i].pool == k->pool && g_alias_pair[i].off == k->off) { e = &g_alias_pair[i]; break; }
++        if (!e) {
++            if (g_alias_pair_n < PAIR_TRACK) {
++                e = &g_alias_pair[g_alias_pair_n++]; memset(e, 0, sizeof *e);
++                e->pool = k->pool; e->off = k->off; e->size = t->L.size; e->ser = t->serial; e->d = k->d; e->obj = shared ? (__bridge void *)shared : NULL;
++            }
++        } else {
++            if (!e->obj && shared) e->obj = (__bridge void *)shared;
++            if (!e->paired && e->ser != t->serial && g_alias_pair_printed < PAIRCHK_MAX) {
++                int same = memcmp(&e->d, &k->d, sizeof e->d) == 0;
++                int mtl_same = e->obj && shared && e->obj == (__bridge void *)shared;
++                e->paired = 1; g_alias_pair_printed++;
++                MLOG("[pairchk] span=0x%llx+%llu %ux%ux%u fmt=0x%x id1_ser=%llu id2_ser=%llu same=%d mtl_same=%d",
++                     (unsigned long long)k->off, (unsigned long long)e->size, t->d.width, t->d.height, t->d.depth, (unsigned)t->d.format,
++                     (unsigned long long)e->ser, (unsigned long long)t->serial, same, mtl_same);
++            }
++        }
++        pthread_mutex_unlock(&g_aliasq_mu);
++    } @catch (NSException *ex) { MLOG("[aliasq] probe disabled after exception: %s", ex.reason ? ex.reason.UTF8String : "unknown"); }
++}
++static void alias_probe_created(const alias_key *k, id mt) {
++    if (!mt || !alias_cls_of(&k->d)) return;
++    @try {
++        pthread_mutex_lock(&g_aliasq_mu);
++        for (uint32_t i = 0; i < g_alias_pair_n; i++)
++            if (g_alias_pair[i].pool == k->pool && g_alias_pair[i].off == k->off && !g_alias_pair[i].obj) { g_alias_pair[i].obj = (__bridge void *)mt; break; }
++        pthread_mutex_unlock(&g_aliasq_mu);
++    } @catch (NSException *ex) { MLOG("[pairchk] probe disabled after exception: %s", ex.reason ? ex.reason.UTF8String : "unknown"); }
++}
++// ---------- S2Arm 2026-11-19 v058pkg probes: [pkgshare] hit / reg / done ----------
++// [pkgshare] hit：packaged 纹理在三类小纹理上命中了共享对象（每个 serial 一行，hit+reg 合计 ≤16 行）；
++// [pkgshare] reg：packaged 纹理上传完自己后登记进 g_alias（同样每 serial 一行）；
++// [pkgshare] done：退出时 hits / regs 总数与按类命中数（tiny=1×1、vol=8×8×64、sky=32×32×32）。
++static _Atomic uint32_t g_pkgshare_hit[4], g_pkgshare_reg[4];
++static uint64_t g_pkgshare_ser[16]; static uint32_t g_pkgshare_n;
++static pthread_mutex_t g_pkgshare_mu = PTHREAD_MUTEX_INITIALIZER;
++static const char *alias_cls_name(int c) { return c == ALIAS_CLS_TINY ? "1x1" : c == ALIAS_CLS_VOL ? "8x8x64" : c == ALIAS_CLS_SKY ? "32x32x32" : "?"; }
++static void pkgshare_probe(int reg, const tex_t *t, uint64_t shared_ser, id mt) {
++    int cls = alias_cls_of(&t->d);
++    if (!cls || !t->serial) return;
++    @try {
++        pthread_mutex_lock(&g_pkgshare_mu);
++        int seen = 0; for (uint32_t i = 0; i < g_pkgshare_n; i++) if (g_pkgshare_ser[i] == t->serial) { seen = 1; break; }
++        if (!seen) {   // 计数与行都按 serial 一次（分辨率每帧都会进来，不按帧累计）
++            atomic_fetch_add_explicit(reg ? &g_pkgshare_reg[cls] : &g_pkgshare_hit[cls], 1, memory_order_relaxed);
++            if (g_pkgshare_n < 16) {
++                g_pkgshare_ser[g_pkgshare_n++] = t->serial;
++                if (reg) MLOG("[pkgshare] reg ser=%llu mtl=%p (%s)", (unsigned long long)t->serial, (__bridge void *)mt, alias_cls_name(cls));
++                else MLOG("[pkgshare] hit ser=%llu <- shared(%s) ser=%llu mtl=%p", (unsigned long long)t->serial, alias_cls_name(cls), (unsigned long long)shared_ser, (__bridge void *)mt);
++            }
++        }
++        pthread_mutex_unlock(&g_pkgshare_mu);
++    } @catch (NSException *ex) { MLOG("[pkgshare] probe disabled after exception: %s", ex.reason ? ex.reason.UTF8String : "unknown"); }
++}
++static void pkgshare_done_report(void) {
++    uint32_t h = 0, r = 0; int c;
++    for (c = 1; c < 4; c++) h += atomic_load(&g_pkgshare_hit[c]);
++    for (c = 1; c < 4; c++) r += atomic_load(&g_pkgshare_reg[c]);
++    MLOG("[pkgshare] done frames=%llu hits=%u regs=%u tiny=%u vol=%u sky=%u alias_pkg=%d",
++         (unsigned long long)atomic_load(&g_cur_frame), h, r,
++         atomic_load(&g_pkgshare_hit[ALIAS_CLS_TINY]), atomic_load(&g_pkgshare_hit[ALIAS_CLS_VOL]), atomic_load(&g_pkgshare_hit[ALIAS_CLS_SKY]), alias_pkg_on());
++}
++static void alias_note_peak_locked(void) {   // caller holds g_smu
++    uint32_t n = g_alias.n, p = atomic_load_explicit(&g_alias_peak, memory_order_relaxed);
++    if (n > p) atomic_store_explicit(&g_alias_peak, n, memory_order_relaxed);
++}
++static void alias_done_report(void) {
++    static _Atomic int once;
++    if (atomic_exchange(&once, 1)) return;
++    uint32_t t1 = atomic_load(&g_aliasq_total[1]), h1 = atomic_load(&g_aliasq_hit[1]);
++    uint32_t t2 = atomic_load(&g_aliasq_total[2]), h2 = atomic_load(&g_aliasq_hit[2]);
++    uint32_t t3 = atomic_load(&g_aliasq_total[3]), h3 = atomic_load(&g_aliasq_hit[3]);
++    MLOG("[aliasq] done class=tiny total=%u hit=%u miss=%u | vol total=%u hit=%u miss=%u | sky total=%u hit=%u miss=%u", t1, h1, t1 - h1, t2, h2, t2 - h2, t3, h3, t3 - h3);
++    MLOG("[packaged] done frames=%llu carry=%llu alias_peak=%u alias_evicted=%llu",
++         (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)atomic_load(&g_pkg_carry), atomic_load(&g_alias_peak), (unsigned long long)g_alias_evicted);
++    pkgshare_done_report();   // 2026-11-19 v058pkg: [pkgshare] done
++}
+ // On memory pool Finalize, evict the textures built on that pool from the sharing table (collect the keys first, then delete: deletion shifts entries back). The sharing table used not to evict: Mario's pools stay for good, so entries are bounded;
+ // Engage frees pools on scene changes and rebuilds on new ones, so the old pools' render targets and other private textures stayed in the table forever (about 0.8 GB more GPU memory over 850 s of the title demo), and linear textures built directly on a pool also kept the whole pool buffer alive.
+ // Also, when a pool object's address is reused, old entries would hand a texture on the old storage to the new pool's texture at the same offset and description. Evicted textures go through deferred release; if the serial table still holds one, that is just one more reference
+@@ -3358,6 +3526,23 @@ static int pf_r32i(MTLPixelFormat pf) { return pf == MTLPixelFormatR32Uint || pf
+ static void srgb_twin_mark(id<MTLTexture> v) { if (v) objc_setAssociatedObject(v, &g_twin_view_key, (__bridge id)kCFBooleanTrue, OBJC_ASSOCIATION_ASSIGN); }
+ static int srgb_twin_view(id o) { return o && objc_getAssociatedObject(o, &g_twin_view_key) != nil; }
+ static int stex_backed(id<MTLTexture> t);   // 放置式 / 稀疏贴图（nvn_stex.inc 胶水）
++// S2Arm 2026-11-19 v058pkg: a packaged texture's Metal texture was replaced (a re-upload fitted another one, or tex_upgrade made one with more usage):
++// every name of the old texture moves to the new one — the sharing table and the serials that resolved to it, as tex_upgrade does for a plain texture.
++static void alias_pkg_retarget(id o, id ni) {
++    if (!o || !ni || o == ni) return;
++    pthread_mutex_lock(&g_smu);
++    nvn_hmap *tables[] = {&g_by_serial, &g_ghost, &g_ghost_active}; int shared = 0;
++    for (unsigned j = 0; j < sizeof tables / sizeof *tables; j++) for (uint32_t i = 0; i < tables[j]->cap; i++) {
++        if (tables[j]->vals[i] != (__bridge void *)o) continue;
++        void *old = tables[j]->vals[i]; tables[j]->vals[i] = (void *)CFBridgingRetain(ni); CFRelease(old);
++    }
++    for (uint32_t i = 0; i < g_alias.cap; i++) {
++        if (g_alias.vals[i] != (__bridge void *)o) continue;
++        void *old = g_alias.vals[i]; g_alias.vals[i] = (void *)CFBridgingRetain(ni); CFRelease(old); shared = 1;
++    }
++    if (shared) { if (g_alias_set) { CFSetRemoveValue(g_alias_set, (__bridge const void *)o); CFSetAddValue(g_alias_set, (__bridge const void *)ni); } g_ser_gen++; }
++    pthread_mutex_unlock(&g_smu);
++}
+ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextureUsage add, MTLPixelFormat view_pf) {
+     id holder = tex_get(t->serial);
+     // The serial holds an sRGB / linear view of the asked texture, or the asked texture is that view (upstream reference implementation, MIT, 92f223a7): the parent is upgraded and the
+@@ -3397,6 +3582,7 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextu
+     }
+     id<MTLTexture> upgraded_view = nil;
+     if ([holder isKindOfClass:[NvPkg class]]) { id<MTLTexture> old = ((NvPkg *)holder)->tex; ((NvPkg *)holder)->tex = upgraded; defer_obj_release(old); g_ser_gen++;
++        alias_pkg_retarget(old, upgraded);   // 2026-11-19 v058pkg: 共享表里登记的这张也跟着改指（收 pass → 升级 → 重开是调用方既有路径）
+         if (((NvPkg *)holder)->view) { defer_obj_unref(((NvPkg *)holder)->view); ((NvPkg *)holder)->view = nil; ((NvPkg *)holder)->vbase = 0; } }   // a sparse texture's view of the old one: bound whole until its next upload
+     else {
+         // Every name of the old texture moves to the upgraded one (upstream reference implementation, MIT, PR #107, with 92f223a7): other serials over the same storage (live in g_by_serial,
+@@ -4856,6 +5042,27 @@ static int fill_nonfinite(const tex_t *t, const uint8_t *p, id<MTLTexture> mt) {
+     else if (pf == MTLPixelFormatRGBA32Float || pf == MTLPixelFormatRG32Float || pf == MTLPixelFormatR32Float) { n = t->L.size / 4; for (uint64_t i = 0; i < n; i++) { uint32_t v; memcpy(&v, p + i * 4, 4); if (((v >> 23) & 255) == 255) return 1; } }
+     return 0;
+ }
++// S2Arm hogwarts-s1 (diagnostic, off by default): one line per distinct texture that lost initial content to the stale ledger, with the
++//   frame, size, format and pool, so an in-game patch of black can be tied to a serial. DM_NVN_ZEROLOG=1 turns it on; unset = one static read.
++static int zero_log_on(void) { static int v = -1; if (v < 0) v = getenv("DM_NVN_ZEROLOG") != NULL; return v; }
++static void zero_log_note(const tex_t *t, uint64_t bytes, int runs, int can) {
++    enum { ZL_SLOTS = 8192 };
++    static uint64_t seen[ZL_SLOTS]; static int lines;
++    if (!zero_log_on()) return;
++    uint64_t h = (t->serial * 0x9E3779B97F4A7C15ull) >> 51;
++    for (unsigned i = 0; i < 32; i++) {
++        uint64_t at = (h + i) & (ZL_SLOTS - 1);
++        if (seen[at] == t->serial) return;
++        if (!seen[at]) {
++            seen[at] = t->serial;
++            if (lines++ < 4000) MLOG("[zero] frame %llu ser=%llu %ux%ux%u format %#x levels %u lost %llu of %llu bytes %d runs %s pool %#lx",
++                (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)t->serial, (unsigned)t->d.width, (unsigned)t->d.height, (unsigned)t->d.depth,
++                (unsigned)t->d.format, (unsigned)t->d.levels, (unsigned long long)bytes, (unsigned long long)t->L.size, runs, can ? "zero there" : "zero instead",
++                (unsigned long)(uintptr_t)t->pool);
++            return;
++        }
++    }
++}
+ static int tex_init_fill(const tex_t *t, id<MTLTexture> mt) {
+     if (!t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->has_layout) return 0;
+     if (t->d.samples > 1 || ((int)mt.pixelFormat >= 250 && (int)mt.pixelFormat <= 262)) return 0;   // 250..262: Depth16Unorm … X24_Stencil8 (some names are macOS-only)
+@@ -4881,6 +5088,7 @@ static int tex_init_fill(const tex_t *t, id<MTLTexture> mt) {
+         uint64_t k = ++g_gpw_skips;
+         if (k <= 4 || !(k & (k - 1)) || t->L.size >= (1u << 20)) MLOG("initial content: ser=%llu %ux%ux%u format %#x: %llu of its %llu bytes (%d runs) not taken from its storage: an earlier GPU write covered them (stale in guest memory), %s (%llu so far)",
+             (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, (unsigned long long)sb, (unsigned long long)t->L.size, nr, can ? "zero there" : "zero instead (all of it, or a format the zeroing cannot copy into)", (unsigned long long)k);
++        zero_log_note(t, sb, nr, can);   // hogwarts-s1: full per-serial ledger under DM_NVN_ZEROLOG=1 (off by default)
+         if (!can) { free(runs); return 0; }
+         if (!(masked = malloc(t->L.size))) MDIE("initial content check copy of %llu bytes failed", (unsigned long long)t->L.size);
+         { uint8_t *pp; const uint8_t *ss = tex_src(t, t->L.size, &pp); memcpy(masked, ss, t->L.size); free(pp); }   // 诊断#f83b30：按可读截短
+@@ -5182,6 +5390,7 @@ static void carry_rect(void *u, unsigned level, unsigned layer, uint32_t x, uint
+ }
+ static uint64_t g_carry_tex, g_carry_rects;
+ static void carry_gpu(const tex_t *t, id<MTLTexture> to, id<MTLTexture> from, const uint64_t *runs, int n, uint64_t bytes) {
++    atomic_fetch_add_explicit(&g_pkg_carry, 1, memory_order_relaxed);   // 2026-11-19 v058tiny: [packaged] done carry=
+     if (from.pixelFormat != to.pixelFormat || from.width != to.width || from.height != to.height || from.depth != to.depth || from.arrayLength != to.arrayLength
+         || from.mipmapLevelCount != to.mipmapLevelCount || from.textureType != to.textureType || from.sampleCount != to.sampleCount) {
+         RED_ONCE(166, "texture ser=%llu turned packaged: its old host texture has another shape (format %lu → %lu, %lux%lu → %lux%lu, levels %lu → %lu), the %llu bytes the GPU wrote are not carried over",
+@@ -5364,6 +5573,35 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+         packaged = 0;
+     }
+     if (packaged) {
++        if (alias_pkg_on() && alias_cls_of(&t->d)) {   // S2Arm 2026-11-19 v058pkg: ① 进入 packaged 先查共享（只对 1×1 / 8×8×64 / 32×32×32）
++            alias_key ak; alias_key_of(&ak, t);   // 与上一版 alias_key_of 的归一化同一份判据（alias_cls_of）
++            pthread_mutex_lock(&g_smu);
++            __unsafe_unretained id shared = hm_get_id(&g_alias, &ak);
++            if (shared) nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1));
++            uint64_t shared_ser = shared ? alias_ser_of_obj_locked((id)shared) : 0;
++            pthread_mutex_unlock(&g_smu);
++            if (shared) {
++                id<MTLTexture> mt = [shared isKindOfClass:[NvPkg class]] ? ((NvPkg *)shared)->tex : (id<MTLTexture>)shared;
++                // 共享的是自己那张 NvPkg 的贴图（还没被别人升级替换）：仍走原 packaged 路径——脏页重传 / 改指都在那边
++                int own = [have isKindOfClass:[NvPkg class]] && ((NvPkg *)have)->tex == mt;
++                if (!own) {
++                    // 写方（IMAGE）要 ShaderWrite 而共享对象没有：走既有 tex_upgrade（收 pass → 升级 → 重开），失败回落原路
++                    if (mt && (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !(mt.usage & MTLTextureUsageShaderWrite) && !mtl_fmt_depth(mt.pixelFormat)) {
++                        id<MTLTexture> up = tex_upgrade(t, mt, MTLTextureUsageShaderWrite, mt.pixelFormat);
++                        if (up && up != mt) mt = up;
++                        else { static int nup; if (nup++ < 4) MLOG("[pkgshare] upgrade refused ser=%llu: fallen back to the packaged path", (unsigned long long)t->serial); mt = nil; }
++                    }
++                    if (mt) {   // 共享成功：不再上传第二份（两张描述符同 (pool, off)，存储本就一样）
++                        if (have != mt) {   // 第一次指向它：登记探针并改序号表（已是它就不再动，g_ser_gen 一帧一涨会拖慢贴图 ID 缓存）
++                            alias_probe_resolve(t, &ak, mt, shared_ser);   // 也让 [aliasq] / [pairchk] 看到 packaged 这一方
++                            tex_put(t->serial, mt);
++                            pkgshare_probe(0, t, shared_ser, mt);
++                        }
++                        return mt;
++                    }
++                }
++            } else alias_probe_resolve(t, &ak, nil, 0);   // [aliasq] 里 packaged 的未命中（每 serial 一行）
++        }
+         NvPkg *pk = [have isKindOfClass:[NvPkg class]] ? have : nil;   // resolved as GPU-only before the CPU wrote it: dropped and rebuilt as packaged
+         if (pk && pk->pre == 1 && !g_tp_active) tp_hit(t, pk);   // first real use of a texture uploaded ahead (tp_tick)
+         if (pk) {   // Already uploaded: check the covered pages only if there has been a guest write since the last check
+@@ -5437,14 +5675,15 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+                 if (pk->spare && pk->spare != nt) defer_obj_release(pk->spare);   // still in use, or of another shape: retired as before
+                 if (pk->sparse) sparse_view(pk, t);
+                 zb_report(t, pk->sparse ? (unsigned)pk->vbase : 0, "re-upload");
+-                pk->spare = old; pk->spare_fence = g_fence + 1; g_ser_gen++; pk->stamp = st; pk->vgen = pk->vseen = vg; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = nvn_dirty_now(); g_pkg_reuploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size); }
++                pk->spare = old; pk->spare_fence = g_fence + 1; g_ser_gen++; pk->stamp = st; pk->vgen = pk->vseen = vg; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = nvn_dirty_now(); g_pkg_reuploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size);
++                if (alias_pkg_on() && alias_cls_of(&t->d)) alias_pkg_retarget(old, nt); }   // 2026-11-19 v058pkg: 换了新上传，共享表与其它 ser 跟着改指
+             return pk->view ? pk->view : pk->tex;
+         }
+         pk = [NvPkg new];
+         pk->check_epoch = g_pkg_epoch;
+         pk->sparse = t->pool && nvn_sparse_pool(t->pool); pk->vgen = pk->vseen = nvn_sparse_gen();
+         uint64_t *gr = NULL, gb = 0; int gn = 0; id<MTLTexture> gfrom = nil;   // turning packaged from a GPU-only texture: its texels a GPU write left stale in guest memory (carry_gpu)
+-        if (have && !pk->sparse && [have conformsToProtocol:@protocol(MTLTexture)]) { gfrom = have; gn = gpw_stale(t->mem, t->L.size, &gr, &gb); }
++        if (have && !pk->sparse && [have conformsToProtocol:@protocol(MTLTexture)]) { gfrom = have; gn = gpw_stale(t->mem, t->L.size, &gr, &gb); atomic_fetch_add_explicit(&g_pkg_turned, 1, memory_order_relaxed); }
+         tp_first_upload(t);   // upload ahead: this frame's first-use demand
+         if (!stex_pkg_new(pk, t)) pk->tex = pkg_upload(t, &pk->stamp, nil, &pk->ph, &pk->nph, 1);   // 大稀疏贴图（Switch 2、Metal 4）：放置式块管理（nvn_stex.inc）
+         if (!pk->tex) { free(gr); return nil; }
+@@ -5455,6 +5694,17 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+         tex_put(t->serial, pk);
+         if (gn) carry_gpu(t, pk->tex, gfrom, gr, gn, gb);   // after tex_put: pkg_gpu_wrote notes the pages on this NvPkg
+         free(gr);
++        if (alias_pkg_on() && alias_cls_of(&t->d)) {   // S2Arm 2026-11-19 v058pkg: ② 建完自己之后登记（同一存储的其它 ID 从 g_alias 取这张）
++            alias_key ak; alias_key_of(&ak, t); int fresh = 0;
++            pthread_mutex_lock(&g_smu);
++            if (!nvn_hm_get(&g_alias, &ak)) {
++                if (!g_alias_set) g_alias_set = CFSetCreateMutable(NULL, 0, NULL);
++                hm_put_id(&g_alias, &ak, pk->tex); CFSetAddValue(g_alias_set, (__bridge const void *)pk->tex);
++                nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1)); alias_note_peak_locked(); fresh = 1;
++            }
++            pthread_mutex_unlock(&g_smu);
++            if (fresh) { alias_probe_created(&ak, pk->tex); pkgshare_probe(1, t, 0, pk->tex); }   // [pairchk] mtl_same / [pkgshare] reg
++        }
+         return pk->view ? pk->view : pk->tex;
+     }
+     if (srgb_twin_view(have)) {   // an sRGB / linear view whose parent left the sharing table (taken over, evicted, or upgraded under another name) no longer shares the storage's
+@@ -5491,7 +5741,10 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+     //   the game finalizes texture objects and keeps their descriptors registered over live storage, and each resolution went through the ring (an entry evicted, g_ser_gen moved, so
+     //   every texture ID cache resolved again). The sharing table keeps the texture resident; once it leaves the table, the next resolution makes it anew, as for a live object
+     pthread_mutex_lock(&g_smu); __unsafe_unretained id shared = hm_get_id(&g_alias, &ak); if (shared) nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1));
+-    int dead = t->serial < (1ull << 62) && !nvn_hm_get(&g_tex_live, &t->serial); pthread_mutex_unlock(&g_smu);
++    int dead = t->serial < (1ull << 62) && !nvn_hm_get(&g_tex_live, &t->serial);
++    uint64_t shared_ser = shared ? alias_ser_of_obj_locked((id)shared) : 0;
++    pthread_mutex_unlock(&g_smu);
++    alias_probe_resolve(t, &ak, shared, shared_ser);   // 2026-11-19 v058tiny: [aliasq] / [pairchk]
+     if (shared && dead && !((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !(((id<MTLTexture>)shared).usage & MTLTextureUsageShaderWrite))) { g_ghost_shared++; return shared; }
+     if (shared) {
+         if (g_tex_peek && (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !(((id<MTLTexture>)shared).usage & MTLTextureUsageShaderWrite) && !mtl_fmt_depth(((id<MTLTexture>)shared).pixelFormat))
+@@ -5544,6 +5797,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+     if (!g_alias_set) g_alias_set = CFSetCreateMutable(NULL, 0, NULL);
+     alias_take_over(&ak);
+     hm_put_id(&g_alias, &ak, mt); CFSetAddValue(g_alias_set, (__bridge const void *)mt); nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1));
++    alias_note_peak_locked(); alias_probe_created(&ak, mt);   // 2026-11-19 v058tiny: [packaged] alias_peak, [pairchk] mtl_same
+     pthread_mutex_unlock(&g_smu);
+     tex_put(t->serial, mt);
+     return mt;
+@@ -6037,6 +6291,10 @@ static int g_el_w, g_el_h, g_el_draws; static char g_el_key[12];
+ static int enc_label_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_ENC_LABEL"); v = e && atoi(e); } return v; }
+ static int g_nbcrt; static void bcrt_flush(void);   // shadows of block-compressed render targets used by the open pass (see bcrt_attach)
+ static int g_unb; static p_set_rt g_unb_rt; static uint64_t g_unb_n, g_unb_land;   // a held empty binding (see unb_on)
++static void tm_pass_end(void);   // S2Arm 2026-11-19 v058tiny: [tonemapin] 读回（定义在 ubo / img 助手之后）
++static id g_pp_col; static void pp_capture(id t); static void pp_pass_end(void);   // hogwarts-s10 像素探针
++static void pg_pass_end(void);   // hogwarts-s12 绿扫描
++static void nan_pass_end(void);    // hogwarts-s27 非有限值统计（S2A_NAN_SCAN）
+ static void rp_end(void) { if (!g_rlane) geo_run_flush(); if (g_enc) { AP_B;
+     if (enc_label_on()) { static uint64_t lf = ~0ull, base; uint64_t f = atomic_load(&g_cur_frame); if (f != lf) { lf = f; base = g_stat_pass - 1; }   // Intra-frame serial: the same pass has the same name every frame, so the table can aggregate by name
+         [(id)g_enc setLabel:[NSString stringWithFormat:@"p%02llu %dx%d %s d%d", (unsigned long long)(g_stat_pass - base), g_el_w, g_el_h, g_el_key[0] ? g_el_key : "-", g_el_draws]]; }
+@@ -6044,6 +6302,10 @@ static void rp_end(void) { if (!g_rlane) geo_run_flush(); if (g_enc) { AP_B;
+     int ranged=g_rt_range_active && !g_rt_range_pending;
+ #endif
+     sd_finish(); enc_r_end_pass(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_range_active = g_rt_range_pending = 0; ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
++    tm_pass_end();   // 2026-11-19 v058tiny: [tonemapin] 这一遍排队的 1×1 读回
++    pp_pass_end();   // hogwarts-s10 像素探针：这一遍的颜色目标读回 (x,y)
++    pg_pass_end();   // hogwarts-s12 整幅绿扫描（不需要坐标）
++    nan_pass_end();  // hogwarts-s27 非有限值统计（S2A_NAN_SCAN）
+     if (g_nubd && g_nubd >= ubd_lazy()) ubd_flush();   // the inline updates deferred in this pass, in order (see mtl_sub_update); across passes they wait for the next copy or dispatch (blit_raw)
+     if (g_nbcrt) bcrt_flush();   // blocks drawn into shadows go back into their compressed textures
+ #ifdef NVN_RT_RANGE_TEST
+@@ -6596,6 +6858,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
+     g_enc = enc_r_begin_pass(pd);
+     args_dirty_all();
+     g_stat_pass++;
++    pp_capture(pd.colorAttachments[0].texture);   // hogwarts-s10
+     { id<MTLTexture> lt = pd.colorAttachments[0].texture ?: pd.depthAttachment.texture;   // 本窗口画过的最大渲染目标（11-02 塞尔达户外落 30：看动态分辨率有没有把渲染尺寸抬上去）
+       if (lt && (uint64_t)lt.width * lt.height > (uint64_t)g_rtw_w * g_rtw_h) { g_rtw_w = (uint32_t)lt.width; g_rtw_h = (uint32_t)lt.height; g_rtw_fmt = (uint32_t)lt.pixelFormat; } }
+     if (enc_label_on()) { id<MTLTexture> lt = pd.colorAttachments[0].texture ?: pd.depthAttachment.texture ?: pd.stencilAttachment.texture; g_el_w = (int)lt.width; g_el_h = (int)lt.height; g_el_draws = 0; g_el_key[0] = 0; }
+@@ -7141,8 +7404,142 @@ static NSString *msl_note(NSString *pc, NSString *src) {
+     return helpers ? [NSString stringWithFormat:@"%@ fallback translation, %ld lines, fnv %016llx, main0 body %ld lines, split into %d helpers%s", pc, lines, (unsigned long long)h, body, helpers, optnone ? ", optnone" : ""]
+                    : [NSString stringWithFormat:@"%@ fallback translation, %ld lines, fnv %016llx, main0 body %ld lines, %s%s", pc, lines, (unsigned long long)h, body, v, optnone ? ", optnone" : ""];
+ }
++// S2Arm hogwarts-s4b (S2A_TEXARR_BUF=<33..1000>, default 0 = unchanged): a bindless handle table read through Ryujinx's
++//   BindlessToArray was expanded to a fixed 32 entries (Program.cs QueryTextureArrayLengthFromBuffer answered 32), while this
++//   title's tables hold 512 / 640 / 784 handles: every index past 31 read the dummy (wrong material texture, wrong reflection
++//   capture, wrong shadow map). The translator is a prebuilt assembly here, so the fix is applied to its output: the fallback
++//   .metal text is rewritten (only members named *_40000000, i.e. the bindless tables) and the reflection length is raised to
++//   match before the library is compiled. An entry whose handle names no registered texture stays the dummy.
++static int g_texarr_ov;   // hogwarts-s23: per-attempt width (the ladder in shader_build); 0 = the env value
++static int texarr_len(void) {
++    if (g_texarr_ov > 0) return g_texarr_ov;
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("S2A_TEXARR_BUF"); v = e && *e ? atoi(e) : 0; if (v && v < 33) v = 0; if (v > 1000) v = 1000;
++        if (v) MLOG("S2A_TEXARR_BUF=%d: bindless handle tables are expanded to %d entries at compile time (was 32)", v, v); }
++    return v;
++}
++// hogwarts-s7: raise the odne texture array and shift every [[id]] after it (the sampler array and the buffers follow it in
++//   the same argument buffer; expanding in place without the shift would make the two arrays overlap). Returns the new text,
++//   the array's first id and the shift, so the reflection's argument ids can be moved by the same amount.
++static NSString *texarr_rewrite(NSString *src, int *changed, int *arr_id, int *shift) {
++    *changed = 0; *arr_id = -1; if (shift) *shift = 0;
++    int n = texarr_len();
++    if (!src || n <= 0) return src;
++    int delta = n - 32;
++    NSRegularExpression *reDecl = [NSRegularExpression regularExpressionWithPattern:
++        @"array<((?:texture|depth)[A-Za-z0-9_]*(?:<[^<>]*>)?),\\s*32\\s*>(\\s+[A-Za-z_][A-Za-z0-9_]*\\s*\\[\\[id\\()(\\d+)(\\)\\]\\])" options:0 error:nil];
++    if (!reDecl) return src;
++    NSArray *ms = [reDecl matchesInString:src options:0 range:NSMakeRange(0, src.length)];
++    if (!ms.count) return src;
++    {   // the argument buffer has NVN_REFL_MAXARG entries: an expansion that pushes the ids past it would make the shader
++        //   unusable (the host rejects it), so cap the length here instead (the 32 shaders of this title with a small array
++        //   but many later bindings keep the array at 32 and are simply left as they were)
++        int mx = 0;
++        if (reDecl) { NSRegularExpression *reAny = [NSRegularExpression regularExpressionWithPattern:@"\\[\\[id\\((\\d+)\\)\\]\\]" options:0 error:nil];
++            for (NSTextCheckingResult *m2 in [reAny matchesInString:src options:0 range:NSMakeRange(0, src.length)]) {
++                int v = (int)[[src substringWithRange:[m2 rangeAtIndex:1]] intValue]; if (v > mx) mx = v; } }
++        // hogwarts-s22: cap by Metal's REAL argument-buffer id ceiling (~1024 slots), not by our own NVN_REFL_MAXARG
++        //   (2048). With the 2048 bound the width was over-estimated and the rewritten text failed to compile with
++        //   "cannot assign resource locations to spvDescriptorSet0", so 148 shaders silently fell back to the text with
++        //   the 32-entry table and its min(index, 31) clamp - i.e. they sampled the wrong texture.
++        enum { METAL_ARG_ID_MAX = 1000 };
++        int fit = 32 + (METAL_ARG_ID_MAX - mx);
++        if (fit > NVN_REFL_MAXARG - 1) fit = NVN_REFL_MAXARG - 1;
++        if (fit < 33) return src;                 // no room for anything larger: leave the shader untouched
++        if (n > fit) { n = fit; MLOG("[texarr] %s: argument buffer would overflow (max id %d), the texture array stays at %d entries instead of %d", "", mx, n, texarr_len()); }
++        delta = n - 32;
++    }
++    NSMutableString *out = [NSMutableString stringWithCapacity:src.length + 64];
++    NSUInteger cur = 0; int arrId = -1;
++    for (NSTextCheckingResult *m in ms) {
++        [out appendString:[src substringWithRange:NSMakeRange(cur, m.range.location - cur)]];
++        int a = (int)[[src substringWithRange:[m rangeAtIndex:3]] intValue];
++        [out appendFormat:@"array<%@, %d>%@%d%@", [src substringWithRange:[m rangeAtIndex:1]], n,
++             [src substringWithRange:[m rangeAtIndex:2]], a, [src substringWithRange:[m rangeAtIndex:4]]];
++        if (arrId < 0 || a < arrId) arrId = a;
++        cur = m.range.location + m.range.length;
++    }
++    [out appendString:[src substringWithRange:NSMakeRange(cur, src.length - cur)]];
++    NSString *pass1 = out;
++    NSRegularExpression *reId = [NSRegularExpression regularExpressionWithPattern:@"\\[\\[id\\((\\d+)\\)\\]\\]" options:0 error:nil];
++    NSArray *ims = reId ? [reId matchesInString:pass1 options:0 range:NSMakeRange(0, pass1.length)] : nil;
++    if (ims.count) {
++        NSMutableString *o2 = [NSMutableString stringWithCapacity:pass1.length + 32];
++        NSUInteger c2 = 0;
++        for (NSTextCheckingResult *m in ims) {
++            int k = (int)[[pass1 substringWithRange:[m rangeAtIndex:1]] intValue];
++            if (k <= arrId) continue;   // the array and everything before it keeps its id
++            [o2 appendString:[pass1 substringWithRange:NSMakeRange(c2, m.range.location - c2)]];
++            [o2 appendFormat:@"[[id(%d)]]", k + delta];
++            c2 = m.range.location + m.range.length;
++        }
++        [o2 appendString:[pass1 substringWithRange:NSMakeRange(c2, pass1.length - c2)]];
++        pass1 = o2;
++    }
++    *changed = (int)ms.count; *arr_id = arrId; if (shift) *shift = delta;
++    return pass1;
++}
++// hogwarts-s18: the translator emits a 32-entry handle table and its index clamp together (Ryujinx BindlessToArray:
++//   length = QueryTextureArrayLengthFromBuffer() = the hardcoded 32, then MinimumU32(index, length - 1)). Raising the
++//   declaration alone therefore changes nothing: the shader can never name an entry past 31. This widens exactly the clamps
++//   whose variable is used as an index into a handle-table member (name containing "_cb1"), plus one alias level
++//   (int V = int(W) with uint W = min(...)). The shift masks that also read 31u are a different shape and are left alone.
++static NSString *texarr_widen_clamps(NSString *s, const char *member, int lim) {
++    if (!s || lim <= 31) return s;
++    @try {
++        NSMutableSet *targets = [NSMutableSet set];
++        NSString *pat = nil;
++        if (member && *member) {
++            pat = [NSString stringWithFormat:@"%@\\[(\\w+)\\]", [NSRegularExpression escapedPatternForString:@(member)]];
++        } else {
++            pat = @"(\\w*_cb1\\w*)\\s*\\[(\\w+)\\]";
++        }
++        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
++        if (!re) return s;
++        NSUInteger gi = (member && *member) ? 1 : 2;
++        for (NSTextCheckingResult *m in [re matchesInString:s options:0 range:NSMakeRange(0, s.length)])
++            [targets addObject:[s substringWithRange:[m rangeAtIndex:gi]]];
++        for (NSString *v in [targets allObjects]) {
++            NSString *ev = [NSRegularExpression escapedPatternForString:v];
++            NSString *ap = [NSString stringWithFormat:@"int\\s+%@\\s*=\\s*int\\((\\w+)\\);", ev];
++            NSRegularExpression *reA = [NSRegularExpression regularExpressionWithPattern:ap options:0 error:nil];
++            NSTextCheckingResult *am = reA ? [reA firstMatchInString:s options:0 range:NSMakeRange(0, s.length)] : nil;
++            if (am) [targets addObject:[s substringWithRange:[am rangeAtIndex:1]]];
++        }
++        NSString *cur = s; int widened = 0;
++        for (NSString *v in targets) {
++            NSString *ev = [NSRegularExpression escapedPatternForString:v];
++            NSArray *ps = [NSArray arrayWithObjects:
++                [NSString stringWithFormat:@"(int\\s+%@\\s*=\\s*int\\(min\\(uint\\([^\\n]*?\\), )31u(\\)\\);)", ev],
++                [NSString stringWithFormat:@"(uint\\s+%@\\s*=\\s*min\\(uint\\([^\\n]*?\\), )31u(;)", ev], nil];
++            for (NSString *p in ps) {
++                NSRegularExpression *reC = [NSRegularExpression regularExpressionWithPattern:p options:0 error:nil];
++                if (!reC) continue;
++                NSString *rep = [NSString stringWithFormat:@"$1%du$2", lim];
++                NSString *nxt = [reC stringByReplacingMatchesInString:cur options:0 range:NSMakeRange(0, cur.length) withTemplate:rep];
++                if (nxt.length && ![nxt isEqualToString:cur]) { cur = nxt; widened++; }
++            }
++        }
++        if (widened) MLOG("[texarr] : %d index clamp(s) widened from 31 to %d (the translator paired the 32-entry table with min(index, 31))", widened, lim);
++        return cur;
++    } @catch (NSException *e) { MLOG("[texarr] clamp widening skipped: %s", e.reason ? e.reason.UTF8String : "unknown"); return s; }
++}
++// hogwarts-s19: the texture array is widened but its companion sampler array (<member>Smplr) stays at 32 entries, and the
++//   shader indexes both with the same variable. Clamp only the sampler access to 31: without this the widened index read
++//   past the sampler array and the GPU faulted (MTL4CommandQueueErrorDomain 1, GPU hang safe stop).
++static NSString *texarr_clamp_samplers(NSString *s) {
++    if (!s) return s;
++    @try {
++        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"(\\w+Smplr)\\[(\\w+)\\]" options:0 error:nil];
++        if (!re) return s;
++        NSString *out = [re stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"$1[min(uint($2), 31u)]"];
++        if (out.length && ![out isEqualToString:s]) MLOG("[texarr] sampler array index clamped to 31 in %lu place(s) (its array stays 32 entries)", (unsigned long)[re numberOfMatchesInString:s options:0 range:NSMakeRange(0, s.length)]);
++        return out;
++    } @catch (NSException *e) { return s; }
++}
+ static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero) {
+     NSError *e = nil; NSString *mnote = nil, *msrc = nil;   // #065090 msl_note
++    int arr_n = 0, arr_id = -1, arr_shift = 0;   // hogwarts-s7: texture array raised / its first id / the id shift
+     // S2Arm: a key missing from the library is looked up in DM_MSL_FALLBACK (the on-device fallback translation writes <key>_b.metal + .json there; iOS cannot store a metallib built at runtime)
+     NSString *dir = g_msl_dir;
+     NSData *jd = json_from_pack(pc.UTF8String);   // S2Arm: from the library container, or its file without one (lib_pack.inc)
+@@ -7168,6 +7565,7 @@ static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero
+         static _Atomic int n; if (atomic_fetch_add(&n, 1) < 16) MLOG("compute shader %s: tensor-core network, reflection only (its library is not loaded: it is never dispatched)", pc.UTF8String);
+         return o;
+     }
++
+     NSString *lp = [NSString stringWithFormat:@"%@/%@.metallib", dir, pc];
+     // a batched library (json fn_lib, dmsh_build.py unity_flush): every key of the batch has the same library, built once and kept (by its name; in the container all those keys' records are one slice)
+     static NSMutableDictionary<NSString *, id<MTLLibrary>> *ulibs; static os_unfair_lock ulock = OS_UNFAIR_LOCK_INIT;
+@@ -7177,8 +7575,40 @@ static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero
+     if (!lib) lib = dir == g_msl_dir ? lib_from_pack(pc.UTF8String, &e) : [NSFileManager.defaultManager fileExistsAtPath:lp] ? lib_from_file(lp, &e) : nil;
+     if (lib && ul) { os_unfair_lock_lock(&ulock); if (!ulibs) ulibs = [NSMutableDictionary dictionary]; if (!ulibs[ul]) ulibs[ul] = lib; else lib = ulibs[ul]; os_unfair_lock_unlock(&ulock); }
+     if (!lib && dir != g_msl_dir) {   // S2Arm fallback: MSL source compiled here, same options as the offline chain (dm_msl_opts)
+-        NSString *sp = [NSString stringWithFormat:@"%@/%@.metal", dir, pc], *src = [NSString stringWithContentsOfFile:sp encoding:NSUTF8StringEncoding error:&e];
+-        if (src) { MTLCompileOptions *co = dm_msl_opts(); t_lib_layer = [src containsString:@"render_target_array_index"]; lib = [g_dev newLibraryWithSource:src options:co error:&e]; mnote = msl_note(pc, src); msrc = sp; }
++        NSString *sp = [NSString stringWithFormat:@"%@/%@.metal", dir, pc];
++        NSString *src_orig = [NSString stringWithContentsOfFile:sp encoding:NSUTF8StringEncoding error:&e];   // hogwarts-s9
++        NSString *src = src_orig;
++        if (src_orig && texarr_len() > 0) {
++            // hogwarts-s23: Metal refuses an argument buffer with too many resources ("cannot assign resource locations
++            //   to 'spvDescriptorSet0'"). The ceiling is not one number - it depends on what else the shader binds - and
++            //   144 shaders of this title failed at the full width and silently fell back to the 32-entry table with its
++            //   min(index, 31) clamp, i.e. they sampled the wrong texture. Try the requested width, then smaller ones; the
++            //   first that compiles keeps the entries it can hold.
++            static const int ladder[] = {0, 400, 200, 100, 64, 33};   // 0 = the requested width
++            for (int li = 0; li < (int)(sizeof ladder / sizeof ladder[0]) && !lib; li++) {
++                g_texarr_ov = ladder[li];
++                arr_n = 0; arr_id = -1; arr_shift = 0;
++                NSString *cand = texarr_rewrite(src_orig, &arr_n, &arr_id, &arr_shift);
++                if (!cand) continue;
++                if (arr_n > 0) {
++                    int eff = arr_shift + 32;
++                    if (eff > 32) cand = texarr_widen_clamps(cand, NULL, eff - 1);
++                    cand = texarr_clamp_samplers(cand);
++                }
++                MTLCompileOptions *co = dm_msl_opts();
++                t_lib_layer = [cand containsString:@"render_target_array_index"];
++                lib = [g_dev newLibraryWithSource:cand options:co error:&e];
++                if (lib) { src = cand; if (li) MLOG("shader %s: the argument buffer compiles with %d entries (the requested %d did not)", pc.UTF8String, arr_shift + 32, texarr_len()); }
++            }
++            g_texarr_ov = 0;
++        }
++        if (!lib && src_orig) {   // every width failed: the translation as it came
++            MLOG("shader %s: the rewritten argument buffer did not compile (%s); the translation as it came is used instead", pc.UTF8String, e ? e.localizedDescription.UTF8String : "no reason");
++            MTLCompileOptions *co = dm_msl_opts();
++            lib = [g_dev newLibraryWithSource:src_orig options:co error:&e]; mnote = msl_note(pc, src_orig);
++            src = src_orig; arr_n = 0; arr_id = -1; arr_shift = 0;
++        }
++        if (lib && src) { msrc = sp; if (!mnote) mnote = msl_note(pc, src); }
+         if (lib) MLOG("shader %s loaded from the fallback translation (%s)", pc.UTF8String, fb);
+     }
+     if (!lib || !j) { MLOG("【红】 failed to load shader %s: %s", pc.UTF8String, e ? e.localizedDescription.UTF8String : "no reflection json"); return nil; }
+@@ -7192,7 +7622,15 @@ static NvShader *shader_build(NSString *pc, int stage, int layer, int depth_zero
+     o->fnpfx = [j[@"fn_prefix"] isKindOfClass:[NSString class]] ? j[@"fn_prefix"] : @"";
+     if (stage == 0 && [j[@"layer_from"] isKindOfClass:[NSDictionary class]]) { o->lay_loc = [j[@"layer_from"][@"loc"] intValue]; o->lay_comp = [[j[@"layer_from"][@"comp"] description] UTF8String][0]; }
+     char err[160];
+-    if (nvn_refl_from_json(j, &o->rf, err, sizeof err)) { MLOG("【红】 shader %s reflection conversion failed: %s", pc.UTF8String, err); return nil; }
++    if (nvn_refl_from_json(j, &o->rf, err, sizeof err)) { MLOG("【红】 shader %s reflection conversion failed: %s", pc.UTF8String, err); return nil; }    if (arr_n > 0) {   // the rewritten text: bind as many texture entries as the shader now reads, and move every later
++        int n = arr_shift + 32, hit = 0;   // hogwarts-s22: bind the width the TEXT got (env value when it fit; the fitted width otherwise - binding the env length would write slots past the array, over whatever follows it in the argument buffer)
++        if (n < 32) n = 32;
++        for (int i = 0; i < o->rf.nb; i++) {
++            if (arr_id >= 0 && o->rf.b[i].aid > arr_id) o->rf.b[i].aid = (uint16_t)(o->rf.b[i].aid + arr_shift);
++            if (o->rf.b[i].kind == NVN_RB_TEXU && o->rf.b[i].n == 32) { o->rf.b[i].n = (uint16_t)n; hit++; }
++        }
++        if (hit) MLOG("shader %s: %d texture array(s) raised from 32 to %d entries, argument ids after %d shifted by %d (S2A_TEXARR_BUF)", pc.UTF8String, hit, n, arr_id, arr_shift);
++    }
+     if (o->rf.dyn && !DM_GAME_TEX_DYN_SLOTS) {   // dynamic texture handles (TEXD / SAMPD) only where the profile says the game picks them from c2's tables, as before otherwise
+         // (rf.c1 is freed by dealloc when o goes: freeing it here too was a double free, which aborted FINAL FANTASY RESONANCE at its first such shader)
+         MLOG("【红】 shader %s reflection conversion failed: a texture handle the translator could not trace to one slot (profile key tex_dyn_slots off)", pc.UTF8String); return nil; }
+@@ -8438,11 +8876,42 @@ static MTLSamplerDescriptor *samp_desc(samp_par p) {
+     // DM_NVN_SAMP_LOD0=1 (diagnostic): every sampler's minimum LOD and bias at 0, to tell a too-high LOD from the sampler state from one the shader computes
+     static int lod0 = -1; if (lod0 < 0) lod0 = getenv("DM_NVN_SAMP_LOD0") != NULL;
+     if (lod0) { p.lod_min = 0; p.lod_bias = 0; }
++    // S2Arm hogwarts-s3 (all read once; unset leaves the game's sampler exactly as it was):
++    //   DM_NVN_SAMP_ANISO=2..16  anisotropy as a FLOOR, only on samplers that already pick a mip with linear filtering in both
++    //     directions (nxnative #2418's rule), so a nearest lookup table keeps its steps;
++    //   DM_NVN_SAMP_LODBIAS / DM_NVN_SAMP_LODMIN / DM_NVN_SAMP_LODMAX, decimal (e.g. -4 / 0 / 0): negative values work.
++    { static int o_an = -1, o_lb = -2, o_lo = -2, o_hi = -2; enum { UNSET = 1 << 30 };
++      if (o_an < 0) { const char *e = getenv("DM_NVN_SAMP_ANISO"); o_an = e && *e ? atoi(e) : 0; }
++      if (o_lb == -2) { const char *e = getenv("DM_NVN_SAMP_LODBIAS"); o_lb = e && *e ? (int)(atof(e) * 1000.0) : UNSET; }
++      if (o_lo == -2) { const char *e = getenv("DM_NVN_SAMP_LODMIN"); o_lo = e && *e ? (int)(atof(e) * 100.0) : UNSET; }
++      if (o_hi == -2) { const char *e = getenv("DM_NVN_SAMP_LODMAX"); o_hi = e && *e ? (int)(atof(e) * 100.0) : UNSET;
++          // hogwarts-s21: print the real numbers (an A/B needs an auditable value; "set" is not one)
++          if (o_an > 0 || o_lb != UNSET || o_lo != UNSET || o_hi != UNSET)
++              MLOG("DM_NVN_SAMP_* values: aniso=%d lodBias=%g lodMin=%g lodMax=%g", o_an,
++                   o_lb == UNSET ? 0.0f : (float)o_lb / 1000.0f,
++                   o_lo == UNSET ? 0.0f : (float)o_lo / 100.0f,
++                   o_hi == UNSET ? 0.0f : (float)o_hi / 100.0f);
++          if (o_an > 0 || o_lb != UNSET || o_lo != UNSET || o_hi != UNSET) MLOG("DM_NVN_SAMP_*: aniso floor %d, lod bias %s, min %s, max %s", o_an,
++              o_lb == UNSET ? "-" : "set", o_lo == UNSET ? "-" : "set", o_hi == UNSET ? "-" : "set"); }
++      if (o_an > 0 && p.magf && p.minf >= 2 && (float)o_an > p.aniso) p.aniso = (float)o_an;
++      if (o_lb != UNSET) p.lod_bias = (float)o_lb / 1000.0f;
++      if (o_lo != UNSET) p.lod_min = (float)o_lo / 100.0f;
++      if (o_hi != UNSET) p.lod_max = (float)o_hi / 100.0f; }
+     MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
+     d.magFilter = p.magf ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+     d.minFilter = (p.minf == 1 || p.minf == 3 || p.minf == 5) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+     d.mipFilter = p.minf <= 1 ? MTLSamplerMipFilterNotMipmapped : (p.minf == 2 || p.minf == 3) ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterLinear;
+-    d.sAddressMode = wrapm(p.ws); d.tAddressMode = wrapm(p.wt); d.rAddressMode = wrapm(p.wr);
++    {   // hogwarts-s20/s21: trilinear mip filter + a sampler census, one scope (no cross-scope reads)
++        static int tri = -1;
++        static long n_samp, n_mip_near, n_mip_lin;
++        if (tri < 0) { const char *e = getenv("DM_NVN_SAMP_TRILINEAR"); tri = e && *e && atoi(e) > 0;
++            if (tri) MLOG("DM_NVN_SAMP_TRILINEAR=1: every mipmapped sampler blends mip levels (linear mip filter)"); }
++        n_samp++;
++        int mipnear = (p.minf == 2 || p.minf == 3);
++        if (mipnear) n_mip_near++; else if (p.minf >= 4) n_mip_lin++;
++        if (n_samp % 64 == 0) MLOG("sampler census: %ld samplers, mipFilter nearest %ld, linear %ld", n_samp, n_mip_near, n_mip_lin);
++        if (tri && mipnear && d.mipFilter != MTLSamplerMipFilterNotMipmapped) d.mipFilter = MTLSamplerMipFilterLinear;
++    }    d.sAddressMode = wrapm(p.ws); d.tAddressMode = wrapm(p.wt); d.rAddressMode = wrapm(p.wr);
+     d.lodMinClamp = p.lod_min < 0 ? 0 : p.lod_min; d.lodMaxClamp = p.lod_max;
+     d.maxAnisotropy = p.aniso < 1 ? 1 : p.aniso > 16 ? 16 : (NSUInteger)p.aniso;
+     if (p.cmp_mode) d.compareFunction = (MTLCompareFunction)(p.cmp_func - 1);
+@@ -11239,6 +11708,272 @@ static int fold_samp_tid(const nvn_rbind *b, int st) {
+     if (b->kind == NVN_RB_SAMPU && !b->n && (!b->sid || b->pair)) return fold_tid_ok(ubo_tex_id(ubo_packed(st, b)));
+     return -1;
+ }
++// ---------- S2Arm 2026-11-19 v058tiny: [tonemapin] post_tonemap 读的 1×1 ----------
++// 从 shader_map.tsv 认 post_tonemap 的 key（不写死 serial / key）：绘制绑定时找它读的 1×1，每 600 帧排 1 个 texel，
++// pass 结束用 blit 拷进 shared 缓冲，提交完成回调里打 f / ser / fmt / val / zero（≤4 次）。@try/@catch，异常只关探针。
++enum { TM_MAX = 4 };
++static int g_tm_state;   // 0 = 未加载, 1 = 有 key, -1 = 关闭
++static char g_tm_key[17]; static NSMutableArray *g_tm_pend; static int g_tm_queued, g_tm_off;
++static void tm_load_key(void) {
++    if (g_tm_state) return;
++    g_tm_state = -1;
++    @try {
++        shmap_load();
++        const char *path = g_shmap_path ? g_shmap_path.UTF8String : NULL;
++        if (!path || !*path) { MLOG("[tonemapin] no shader map path: off"); return; }
++        FILE *fp = fopen(path, "r");
++        if (!fp) { MLOG("[tonemapin] shader map %s unreadable: off", path); return; }
++        char *ln = malloc(4096);   // 栈数组 ≤256 B
++        if (!ln) { fclose(fp); return; }
++        while (fgets(ln, 4096, fp)) {
++            if (ln[0] == '#' || ln[0] == '\n') continue;
++            char *c[5]; int n = 0; char *q = ln; c[n++] = q;
++            while (n < 5) { char *t = strchr(q, '\t'); if (!t) break; *t = 0; q = t + 1; c[n++] = q; }
++            if (n < 5 || !strstr(c[4], "post_tonemap") || strstr(c[4], "post_tonemap_update")) continue;
++            if (strlen(c[3]) >= 8) { snprintf(g_tm_key, sizeof g_tm_key, "%.8s", c[3]); MLOG("[tonemapin] key %s = %s", g_tm_key, c[4]); }
++            break;
++        }
++        free(ln); fclose(fp);
++        g_tm_state = g_tm_key[0] ? 1 : -1;
++        if (!g_tm_key[0]) MLOG("[tonemapin] post_tonemap not named in %s: off", path);
++    } @catch (NSException *e) { g_tm_off = 1; g_tm_state = -1; MLOG("[tonemapin] disabled after exception: %s", e.reason ? e.reason.UTF8String : "unknown"); }
++}
++static int tm_tex_tid(const nvn_rbind *b, int st) {
++    switch (b->kind) {
++        case NVN_RB_TEX: case NVN_RB_TBUF: return (int)(tex_slot_h(S.tex[st], S.img[st], b->reg) & 0xfffff);
++        case NVN_RB_TEXU: case NVN_RB_TBUFU: return ubo_tex_id(ubo_packed(st, b));
++        case NVN_RB_IMG: case NVN_RB_IMGU: return img_tid(b, st);
++        default: return -1;
++    }
++}
++static void tm_note(NvProg *pr) {
++    if (g_tm_off || g_tm_queued >= TM_MAX || !pr || !pr->sh[1]) return;
++    long f = (long)atomic_load(&g_cur_frame);
++    if (f <= 0 || (f % 600) != 0) return;
++    @try {
++        tm_load_key();
++        if (g_tm_off || g_tm_state <= 0 || !g_tm_key[0]) return;
++        NvShader *sh = pr->sh[1];
++        if (!sh->key || strncmp(sh->key, g_tm_key, 8)) return;
++        for (int i = 0; i < sh->rf.nb; i++) {
++            const nvn_rbind *b = &sh->rf.b[i];
++            int tid = tm_tex_tid(b, 1);
++            if (tid <= 0 || tid >= g_ntreg || !g_treg[tid].ok) continue;
++            const tex_t *ct = &g_treg[tid].t;
++            if (ct->d.width != 1u || ct->d.height != 1u || ct->d.depth > 1u) continue;   // post_tonemap 读的 1×1
++            id<MTLTexture> t = tex_mtl(ct);
++            if (!t || t.width != 1 || t.height != 1) continue;
++            if (!g_tm_pend) g_tm_pend = [NSMutableArray array];
++            for (NSArray *e in g_tm_pend) if ([e[1] unsignedLongLongValue] == (unsigned long long)ct->serial && [e[4] longValue] == f) return;   // one per frame
++            [g_tm_pend addObject:@[t, @((unsigned long long)ct->serial), @((unsigned)ct->d.format), @((int)t.pixelFormat), @(f)]];
++            g_tm_queued++;
++            break;
++        }
++    } @catch (NSException *e) { g_tm_off = 1; MLOG("[tonemapin] disabled after exception: %s", e.reason ? e.reason.UTF8String : "unknown"); }
++}
++static void tm_job(NSDictionary *j) {
++    if (g_tm_off) return;
++    @try {
++        id<MTLBuffer> b = j[@"buf"]; if (!b) return;
++        const uint8_t *p = (const uint8_t *)b.contents; if (!p) return;
++        long f = (long)[j[@"f"] longValue]; unsigned long long ser = [j[@"ser"] unsignedLongLongValue];
++        unsigned fmt = (unsigned)[j[@"fmt"] unsignedIntValue], bpp = (unsigned)[j[@"bpp"] unsignedIntValue];
++        float v[4] = {0, 0, 0, 0}; int zero = 1;
++        for (unsigned i = 0; i < bpp && i < 16; i++) if (p[i]) zero = 0;
++        memcpy(v, p, bpp < 16 ? bpp : 16);
++        MLOG("[tonemapin] f=%ld ser=%llu fmt=0x%x val=(%g,%g,%g,%g) zero=%d", f, ser, fmt, v[0], v[1], v[2], v[3], zero);
++    } @catch (NSException *e) { g_tm_off = 1; MLOG("[tonemapin] disabled after exception: %s", e.reason ? e.reason.UTF8String : "unknown"); }
++}
++static void tm_pass_end(void) {
++    if (g_tm_off || !g_tm_pend.count || !g_commit_blocks) return;
++    @try {
++        NSArray *jobs = [g_tm_pend copy]; [g_tm_pend removeAllObjects];
++        for (NSArray *e in jobs) {
++            id<MTLTexture> t = e[0]; if (!t) continue;
++            size_t bpp = mtl_pf_bytes(t.pixelFormat);
++            if (!bpp || bpp > 16) { MLOG("[tonemapin] ser=%llu skip: texel size %lu", (unsigned long long)[e[1] unsignedLongLongValue], (unsigned long)bpp); continue; }
++            id<MTLBuffer> rb = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
++            if (!rb) { MLOG("[tonemapin] skip: newBufferWithLength(16) nil"); continue; }
++            id<MTL4ComputeCommandEncoder> enc = blit();
++            if (!enc) { MLOG("[tonemapin] skip: blitCommandEncoder nil"); continue; }
++            [enc copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(1, 1, 1)
++                        toBuffer:rb destinationOffset:0 destinationBytesPerRow:bpp destinationBytesPerImage:bpp];
++            res_add(rb);
++            NSDictionary *j = @{@"buf": rb, @"f": e[4], @"ser": e[1], @"fmt": e[2], @"bpp": @(bpp)};
++            [g_commit_blocks addObject:^{ tm_job(j); }];
++        }
++    } @catch (NSException *e) { g_tm_off = 1; MLOG("[tonemapin] disabled after exception: %s", e.reason ? e.reason.UTF8String : "unknown"); }
++}
++// hogwarts-s10 pixel probe (S2A_PROBE_PX="x,y,frame", render-target pixels): after every pass of that frame the one texel at
++//   (x,y) is copied back and logged. The first pass whose texel comes out green is the draw that paints it; the PASSDUMP K
++//   line of that pass names its shaders (DM_NVN_PASSDUMP=<same frame>). Off unless the variable is set.
++static long g_pp_x = -1, g_pp_y = -1, g_pp_frame = -2; static int g_pp_off;
++// hogwarts-s12 green scan (S2A_PROBE_GREEN=<frame>): after every pass on a 1280x720 target of that frame the whole target is
++//   copied back and the callback counts pure-green texels (R<0.05, G>0.15, B<0.05 in the target's own encoding) and logs the
++//   pass numbers that have any. No coordinates: the camera position does not matter, only that the green is on screen.
++static int g_pg_on = -2, g_pg_off, g_pg_done, g_pg_busy, g_pg_sz[4][2]; static id<MTLBuffer> g_pg_buf; static size_t g_pg_cap;
++
++// hogwarts-s27 (S2A_NAN_SCAN=1): non-finite statistics of this pass's first float colour target, read back WITHOUT going through
++//   an 8-bit texture (a PNG dump clamps or maps NaN away - that is why searching the dumps found nothing). Runs at the dump frame;
++//   with no DM_NVN_TEXDUMP set, every 600th frame. Emits one [fp] line per pass, [fp-first] for the first pass that is almost
++//   entirely non-finite after a clean one of the same size, and [fp-roi] when the picture is wide enough to look at the character box.
++static int g_nan_on = -2, g_nan_off, g_nan_busy;
++static id<MTLBuffer> g_nan_buf; static size_t g_nan_cap;
++static int g_nan_prev_w, g_nan_prev_h; static float g_nan_prev_pct; static int g_nan_first_done;
++static void nan_pass_end(void) {
++    if (g_nan_off || g_nan_busy) return;
++    if (g_nan_on == -2) { g_nan_on = 0; const char *e = getenv("S2A_NAN_SCAN");
++        if (e && *e && atoi(e)) { g_nan_on = 1;
++            MLOG("S2A_NAN_SCAN=1: non-finite statistics of the first float colour target of every pass (at the dump frame)"); } }
++    if (!g_nan_on || !g_commit_blocks) return;
++    long cur = (long)atomic_load(&g_cur_frame);
++    if (g_td_frame >= 0) { if (cur != g_td_frame) return; }
++    else if (cur % 600) return;
++    @try {
++        id<MTLTexture> t = nil; uint64_t ser = 0;
++        for (int i = 0; i < R.rt.n; i++) {
++            tex_t *tt = R.rt.color[i]; if (!tt) continue;
++            id<MTLTexture> c = tex_mtl(tt); if (!c || c.sampleCount > 1) continue;
++            int f = (int)c.pixelFormat;
++            if (f == MTLPixelFormatRGBA16Float || f == MTLPixelFormatRGBA32Float ||
++                f == MTLPixelFormatRG11B10Float || f == MTLPixelFormatDepth32Float) { t = c; ser = tt->serial; break; }
++        }
++        if (!t) return;
++        int fmt = (int)t.pixelFormat, kind = 0; size_t bpp = 0;
++        if (fmt == MTLPixelFormatRGBA16Float) { kind = 1; bpp = 8; }
++        else if (fmt == MTLPixelFormatRGBA32Float) { kind = 2; bpp = 16; }
++        else if (fmt == MTLPixelFormatRG11B10Float) { kind = 3; bpp = 4; }
++        else if (fmt == MTLPixelFormatDepth32Float) { kind = 4; bpp = 4; }
++        else return;
++        int w = (int)t.width, h = (int)t.height;
++        if (w < 8 || h < 8) return;
++        size_t row = (size_t)w * bpp, total = row * (size_t)h;
++        if (!g_nan_buf || g_nan_cap < total) { g_nan_buf = [g_dev newBufferWithLength:(NSUInteger)total options:MTLResourceStorageModeShared]; g_nan_cap = total; }
++        id<MTLBuffer> rb = g_nan_buf; if (!rb) { g_nan_off = 1; return; }
++        id<MTL4ComputeCommandEncoder> enc = blit(); if (!enc) return;
++        g_nan_busy = 1;
++        [enc copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake((NSUInteger)w, (NSUInteger)h, 1)
++                    toBuffer:rb destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:total];
++        unsigned long long pass = (unsigned long long)g_stat_pass;
++        [g_commit_blocks addObject:^{
++            @try {
++                const uint8_t *p = (const uint8_t *)rb.contents;
++                long nan = 0, inf = 0, den = 0, fin = 0, roi_nan = 0, roi_n = 0;
++                float mn = 0, mx = 0; int have = 0;
++                int rx0 = w * 42 / 100, rx1 = w * 58 / 100, ry0 = h * 28 / 100, ry1 = h * 72 / 100;
++                for (int y = 0; y < h; y++) {
++                    const uint8_t *lp = p + (size_t)y * row;
++                    int inroi = (y >= ry0 && y < ry1);
++                    for (int x = 0; x < w; x++) {
++                        const uint8_t *q = lp + (size_t)x * bpp;
++                        int isbad = 0, isinf_ = 0;
++                        if (kind == 1) {
++                            for (int c = 0; c < 4; c++) { unsigned short hs; memcpy(&hs, q + c * 2, 2);
++                                if ((hs & 0x7c00) == 0x7c00) { if (hs & 0x03ff) isbad = 1; else isinf_ = 1; }
++                                else if (!(hs & 0x7c00)) { if (!isbad) den++; } }
++                            float v0 = (float)*(__fp16 *)q;
++                            if (!isbad && !isinf_) { if (!have) { mn = mx = v0; have = 1; } else { if (v0 < mn) mn = v0; if (v0 > mx) mx = v0; } }
++                        } else if (kind == 2 || kind == 4) {
++                            for (int c = 0; c < (kind == 2 ? 4 : 1); c++) { float v; memcpy(&v, q + c * 4, 4);
++                                if (isnan(v)) isbad = 1; else if (isinf(v)) isinf_ = 1; }
++                            float v0; memcpy(&v0, q, 4);
++                            if (!isbad && !isinf_) { if (!have) { mn = mx = v0; have = 1; } else { if (v0 < mn) mn = v0; if (v0 > mx) mx = v0; } }
++                        } else { uint32_t v; memcpy(&v, q, 4);
++                            if ((v & 0x7ff) == 0x7ff || ((v >> 11) & 0x7ff) == 0x7ff || ((v >> 22) & 0x3ff) == 0x3ff) isinf_ = 1; }
++                        if (isbad) nan++; else if (isinf_) inf++; else fin++;
++                        if (inroi && x >= rx0 && x < rx1) { roi_n++; if (isbad || isinf_) roi_nan++; }
++                    }
++                }
++                long n = (long)w * h;
++                float pct = n ? (float)(nan + inf) * 100.0f / (float)n : 0.0f;
++                float roip = roi_n ? (float)roi_nan * 100.0f / (float)roi_n : 0.0f;
++                MLOG("[fp] f=%ld pass=%llu ser=%llu fmt=%d %dx%d nan=%.3f%% inf=%.3f%% denorm=%.3f%% finite=%.3f%% min=%g max=%g",
++                     cur, pass, (unsigned long long)ser, fmt, w, h,
++                     n ? (float)nan * 100.0f / (float)n : 0.0f, n ? (float)inf * 100.0f / (float)n : 0.0f,
++                     n ? (float)den * 100.0f / (float)n : 0.0f, n ? (float)fin * 100.0f / (float)n : 0.0f, mn, mx);
++                if (!g_nan_first_done && pct > 90.0f && g_nan_prev_w == w && g_nan_prev_h == h && g_nan_prev_pct < 0.1f) {
++                    g_nan_first_done = 1;
++                    MLOG("[fp-first] f=%ld first_nonfinite_pass=%llu ser=%llu nonfinite=%.1f%% prev_clean=%.3f%%", cur, pass, (unsigned long long)ser, pct, g_nan_prev_pct);
++                }
++                if (w >= 1280) MLOG("[fp-roi] f=%ld pass=%llu ser=%llu roi=0.42,0.28,0.58,0.72 nonfinite_in_roi=%.3f%% nonfinite_all=%.3f%%", cur, pass, (unsigned long long)ser, roip, pct);
++                g_nan_prev_w = w; g_nan_prev_h = h; g_nan_prev_pct = pct;
++                g_nan_busy = 0;
++            } @catch (NSException *e) { g_nan_busy = 0; }
++        }];
++    } @catch (NSException *e) { g_nan_off = 1; }
++}
++static void pg_pass_end(void) {
++    if (g_pg_off || g_pg_done) return;
++    if (g_pg_on == -2) { g_pg_on = 0; const char *e = getenv("S2A_PROBE_GREEN");
++        if (e && atoi(e)) { g_pg_on = 1; MLOG("S2A_PROBE_GREEN: every 15th frame, every 1280x720 pass, stride 16, one reused buffer, stops at the first green texel"); } }
++    if (!g_pg_on || !g_pp_col || !g_commit_blocks) return;
++    if (g_pg_busy) return;                                  // the previous readback has not run yet: skip, do not queue
++    if (((int)atomic_load(&g_cur_frame)) % 8) return;      // the green stays on screen for many frames: sampling is enough
++    @try {
++        id<MTLTexture> t = g_pp_col;
++        if (!t || t.width < 320 || t.height < 180) return;
++        { static int seen; if (seen < 4 && g_pg_on) { int dup = 0; for (int q = 0; q < seen; q++) if (g_pg_sz[q][0] == (int)t.width && g_pg_sz[q][1] == (int)t.height) dup = 1;
++            if (!dup) { g_pg_sz[seen][0] = (int)t.width; g_pg_sz[seen][1] = (int)t.height; seen++; MLOG("S2A_PROBE_GREEN: scanning target %lux%lu", (unsigned long)t.width, (unsigned long)t.height); } } }
++        int fmt = (int)t.pixelFormat; int kind = 0;            // 1 RG11B10F, 2 BGRA8, 3 RGBA8, 4 RGBA16F
++        if (fmt == MTLPixelFormatRG11B10Float) kind = 1;
++        else if (fmt == MTLPixelFormatBGRA8Unorm || fmt == MTLPixelFormatBGRA8Unorm_sRGB) kind = 2;
++        else if (fmt == MTLPixelFormatRGBA8Unorm || fmt == MTLPixelFormatRGBA8Unorm_sRGB) kind = 3;
++        else if (fmt == MTLPixelFormatRGBA16Float) kind = 4;
++        else return;
++        int ww0 = (int)t.width, hh0 = (int)t.height;
++        size_t bpp = kind == 4 ? 8 : 4, row = (size_t)ww0 * bpp, total = row * (size_t)hh0;
++        if (!g_pg_buf || g_pg_cap < total) { g_pg_buf = [g_dev newBufferWithLength:(NSUInteger)total options:MTLResourceStorageModeShared]; g_pg_cap = total; }
++        id<MTLBuffer> rb = g_pg_buf; if (!rb) { g_pg_off = 1; return; }
++        id<MTL4ComputeCommandEncoder> enc = blit(); if (!enc) return;
++        g_pg_busy = 1;
++        [enc copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake((NSUInteger)ww0, (NSUInteger)hh0, 1)
++                    toBuffer:rb destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:total];
++        unsigned long long pass = (unsigned long long)g_stat_pass;
++        [g_commit_blocks addObject:^{
++            @try {
++                const uint8_t *p = (const uint8_t *)rb.contents; int n = 0, fx = -1, fy = -1; int ww = (int)ww0, hh = (int)hh0;
++                for (int y = 0; y < hh; y += 16) { const uint8_t *lp = p + (size_t)y * row;
++                    for (int x = 0; x < ww; x += 16) { const uint8_t *q = lp + (size_t)x * bpp; float r = 0, g = 0, b = 0;
++                        if (kind == 1) { uint32_t v; memcpy(&v, q, 4); r = (float)(v & 0x7ff) / 2048.0f; g = (float)((v >> 11) & 0x7ff) / 2048.0f; b = (float)((v >> 22) & 0x3ff) / 1024.0f; }
++                        else if (kind == 2) { r = q[2] / 255.0f; g = q[1] / 255.0f; b = q[0] / 255.0f; }
++                        else if (kind == 3) { r = q[0] / 255.0f; g = q[1] / 255.0f; b = q[2] / 255.0f; }
++                        else { unsigned h0, h1, h2; memcpy(&h0, q, 2); memcpy(&h1, q + 2, 2); memcpy(&h2, q + 4, 2);
++                               r = (float)*(__fp16 *)&h0; g = (float)*(__fp16 *)&h1; b = (float)*(__fp16 *)&h2; }
++                        if (g > 0.15f && r < 0.05f && b < 0.05f) { n++; if (fx < 0) { fx = x; fy = y; } } } }
++                g_pg_busy = 0;
++                if (n > 0 && !g_pg_done) { g_pg_done = 1; g_pp_x = fx; g_pp_y = fy; g_pp_frame = (long)atomic_load(&g_cur_frame) + 1; dm_gfx_passdump_next(2);   // hogwarts-s16: record every draw of the armed frame too   // hogwarts-s15: arm the per-pass pixel probe at that pixel for the next frame
++                    MLOG("[green] f=%d pass=%llu prev_pass=%llu samples=%d (stride 16) pixel=(%d,%d) fmt=%d armed_frame=%ld", (int)atomic_load(&g_cur_frame), pass, pass - 1, n, fx, fy, fmt, g_pp_frame); }
++            } @catch (NSException *e) { }
++        }];
++    } @catch (NSException *e) { g_pg_off = 1; MLOG("S2A_PROBE_GREEN disabled after exception: %s", e.reason ? e.reason.UTF8String : "unknown"); }
++}
++static void pp_capture(id t) { if (!g_pp_off) g_pp_col = t; }
++static void pp_pass_end(void) {
++    if (g_pp_off) return;
++    if (g_pp_frame == -2) { g_pp_frame = -1; const char *e = getenv("S2A_PROBE_PX");
++        if (e && *e) { int x = 0, y = 0, f = 0; if (sscanf(e, "%d,%d,%d", &x, &y, &f) == 3) { g_pp_x = x; g_pp_y = y; g_pp_frame = f;
++            MLOG("S2A_PROBE_PX: reading (%d,%d) after every pass of frame %d", x, y, f); } } }
++    if (g_pp_frame < 0 || !g_pp_col || !g_commit_blocks) return;
++    if ((long)atomic_load(&g_cur_frame) != g_pp_frame) return;
++    @try {
++        id<MTLTexture> t = g_pp_col;
++        if (!t || (NSUInteger)g_pp_x >= t.width || (NSUInteger)g_pp_y >= t.height) return;
++        size_t bpp = mtl_pf_bytes(t.pixelFormat); if (!bpp || bpp > 16) return;
++        id<MTLBuffer> rb = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared]; if (!rb) return;
++        id<MTL4ComputeCommandEncoder> enc = blit(); if (!enc) return;
++        [enc copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(g_pp_x, g_pp_y, 0) sourceSize:MTLSizeMake(1, 1, 1)
++                    toBuffer:rb destinationOffset:0 destinationBytesPerRow:bpp destinationBytesPerImage:bpp];
++        res_add(rb);
++        if (t.width != 1280 || t.height != 720) return;   // the scene target only (other passes have their own small targets)
++        unsigned long long pass = (unsigned long long)g_stat_pass, fmt = (unsigned long long)t.pixelFormat;
++        [g_commit_blocks addObject:^{
++            @try { const uint8_t *p = (const uint8_t *)rb.contents; char hex[40] = ""; int nb = (int)(bpp < 16 ? bpp : 16);
++                for (int i = 0; i < nb; i++) snprintf(hex + i * 2, 3, "%02x", p[i]);
++                MLOG("[probe] pass %llu fmt %llu bytes %s", pass, fmt, hex);   // raw bytes: decode offline per format (80 BGRA8, 70 RGBA8, 92 RG11B10F, 115 RGBA16F)
++            } @catch (NSException *e) { }
++        }];
++    } @catch (NSException *e) { g_pp_off = 1; MLOG("S2A_PROBE_PX disabled after exception: %s", e.reason ? e.reason.UTF8String : "unknown"); }
++}
+ static int se_need_(NvShader *sh, int nvn_stage, int *fold) {
+     *fold = 0;
+     if ((!g_se_any && !g_fold_any) || !sh) return 0;
+@@ -11358,6 +12093,7 @@ static __attribute__((noinline, cold)) void p20_note(NvShader *sh, int st, const
+ }
+ static long g_td_frame;   // DM_NVN_TEXDUMP selected frame (defined with the TEXDUMP code below; < 0 = off): the bind site checks it before noting 3D textures
+ static void td_note_3d(id<MTLTexture> t, uint64_t ser);
++static void td_note_2d(id<MTLTexture> t, uint64_t ser);   // hogwarts-s2: 2D textures the dump frame samples (DM_NVN_TEXSAMP, off by default)
+ static inline void p20_check(NvShader *sh, int st, const nvn_rbind *b, int tid, void *tv) {
+     g_p20_checked++;
+     unsigned tt, pf;
+@@ -11638,6 +12374,23 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
+                 USE(t, MTLResourceUsageRead);
+             }
+             if (!(sh->logged & 4)) { sh->logged |= 4; static int nlog; if (nlog++ < 32) MLOG("shader %s (stage %d): an array of %d handles in uniform slot %d, elements %#llx hold textures", sh->key, nvn_stage, b->n, reg, (unsigned long long)real); }
++            {   // S2Arm hogwarts-s3 (DM_NVN_TEXU_SCAN=N, read-only): how far the game's handle table really goes past the declared
++                //   array length. If valid handles keep appearing beyond it, this draw's index can name a texture the host never bound
++                //   (eden-duo #25 / peanuts-native #95: this title's tables reach up to 1024 entries; a 32-entry array clamped at 31 read
++                //   the wrong material). Nothing is bound differently here.
++                static int scan_n = -1, scan_logged;
++                if (scan_n < 0) { const char *e = getenv("DM_NVN_TEXU_SCAN"); scan_n = e && *e ? atoi(e) : 0;
++                    if (scan_n < 0) scan_n = 0; if (scan_n > 1024) scan_n = 1024; if (scan_n) MLOG("DM_NVN_TEXU_SCAN=%d: handle tables scanned past the declared array (read only)", scan_n); }
++                if (scan_n > 0 && scan_logged < 64) {
++                    int valid = 0, beyond = 0, first_beyond = -1;
++                    for (int k = 0; k < scan_n; k++) {
++                        int st = ubo_tex_id(ubo_handle(nvn_stage, reg, 8 * k));
++                        if (st > 0 && st < g_ntreg && g_treg[st].ok) { valid++; if (k >= b->n) { beyond++; if (first_beyond < 0) first_beyond = k; } }
++                    }
++                    scan_logged++;
++                    MLOG("[texu] %s st%d slot %d: declared %d, scanned %d, valid %d, valid past the array %d (first at %d)", sh->key, nvn_stage, reg,
++                         b->n, scan_n, valid, beyond, first_beyond);
++                } }
+         } else if (b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT || b->kind == NVN_RB_SAMPU || b->kind == NVN_RB_SAMPI) {   // SAMPT: the sampler part of a combined handle (texture ID | sampler ID << 20); SAMPU: the same, with the handle in a uniform buffer
+             int sid = bind_sid(b, nvn_stage);
+             __unsafe_unretained id<MTLSamplerState> ss = sid ? (__bridge id<MTLSamplerState>)samp_fast(sid) : nil;
+@@ -11665,7 +12418,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
+             __unsafe_unretained id<MTLTexture> size_view = t;
+             if (t && g_fb_n && g_fb_seq == g_draw_seq && nvn_stage == 1) for (int q = 0; q < g_fb_n; q++) if (t == g_fb_src[q]) { t = g_fb_use[q]; trid = g_fb_rid[q]; break; }   // same-pass feedback sampling: read the snapshot instead (see fb_prepare)
+             if (t && passdump() && tid < g_ntreg) PD("R %llu st%d ser=%llu", g_stat_pass, nvn_stage, g_treg[tid].t.serial);
+-            if (__builtin_expect(g_td_frame >= 0, 0) && t && tid < g_ntreg && t.textureType == MTLTextureType3D) td_note_3d(t, g_treg[tid].t.serial);   // TEXDUMP: 3D textures the frame samples (td_dump saves them as slice atlases)
++            if (__builtin_expect(g_td_frame >= 0, 0) && t && tid < g_ntreg) { if (t.textureType == MTLTextureType3D) td_note_3d(t, g_treg[tid].t.serial); else td_note_2d(t, g_treg[tid].t.serial); }   // TEXDUMP: textures the frame samples (td_dump saves 3D as slice atlases, 2D under DM_NVN_TEXSAMP)
+             if (bl) PD("B %llu st%d tex reg%d tid=%d %s ser=%llu fmt=%lu %lux%lux%lu view_lv=%lu+%lu view_sl=%lu array=%lu target=%lu swz=%d%d%d%d mtl=%p", g_stat_pass, nvn_stage, reg, tid, t ? "real" : "dummy", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull,
+                        (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth,
+                        (unsigned long)(t.parentTexture ? t.parentRelativeLevel : 0), (unsigned long)t.mipmapLevelCount,
+@@ -15254,6 +16007,38 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
+     g_mdxc.next = NULL;
+     if (!S.prog) { BAD_ERR(); RED_ONCE(18, "no program bound before the draw"); PD("Z %llu draw skipped: no program bound", g_stat_pass + !g_enc); return; }
+     __unsafe_unretained NvProg *pr = g_geo_program ? g_geo_program : prog_get(S.prog);
++    {   // hogwarts-s26 (DM_NVN_CB_LOG="<fs key>:<reg>:<vec4>:<comp>[;...]"): print named constant-buffer components of
++        //   the draws whose fragment shader is listed, once per frame. The values a shader acts on (a fog density, a
++        //   specular scale) are otherwise invisible: a term that is 0 because its uniform never arrived looks exactly like
++        //   a missing feature.
++        static const char *spec; static int init;
++        if (__builtin_expect(!init, 0)) { init = 1; spec = getenv("DM_NVN_CB_LOG");
++            if (spec && *spec) MLOG("DM_NVN_CB_LOG: reading [%s]", spec); }
++        if (__builtin_expect(spec && *spec && pr->sh[1] && pr->sh[1]->key, 0)) {
++            int pub_ = (int)atomic_load(&g_cur_frame);
++            static int last_frame = -1; static const char *last_key;
++            if (pub_ != last_frame || pr->sh[1]->key != last_key) {
++                const char *q = spec; char out[512]; size_t on = 0;
++                while (*q) {
++                    size_t n = strcspn(q, ";");
++                    char item[96]; size_t c = n < sizeof item ? n : sizeof item - 1; memcpy(item, q, c); item[c] = 0;
++                    const char *c1 = strchr(item, ':');
++                    if (c1 && !strncmp(item, pr->sh[1]->key, (size_t)(c1 - item))) {
++                        int reg = atoi(c1 + 1); const char *c2 = strchr(c1 + 1, ':');
++                        int vec = c2 ? atoi(c2 + 1) : 0; const char *c3 = c2 ? strchr(c2 + 1, ':') : NULL;
++                        int cmp = c3 ? atoi(c3 + 1) : 0; float v = 0;
++                        int ok = ubo_float(1, (uint32_t)((reg << 16) | ((vec & 4095) << 2) | (cmp & 3)), &v);
++                        on += snprintf(out + on, sizeof out - on, "%s%s[%d].%d=%g", on ? " " : "", c1 + 1, vec, cmp, ok ? v : 0.0f);
++                        if (!ok) on += snprintf(out + on, sizeof out - on, "(unbound)");
++                        if (on > sizeof out - 48) break;
++                    }
++                    q += n; if (*q == ';') q++;
++                }
++                if (on) { last_frame = pub_; last_key = pr->sh[1]->key;
++                    MLOG("DM_NVN_CB_LOG: %s frame %d: %s", pr->sh[1]->key, pub_, out); }
++            }
++        }
++    }
+     for (int stage = 0; stage < 5; stage++) if (!img_atomic_prepare(pr->sh[stage], stage)) return;
+     draw_gs_check(pr);   // a geometry stage left with no function (see prog_fold_gs)
+     if (S.rast_discard) { if (!S.tf_on && sx_draw(pr, dw, di)) return; tf_draw(pr, dw, di); return; }   // the vertex stage only: transform feedback capture, a vertex shader's storage writes (sx_draw), or nothing (tf_draw)
+@@ -15280,7 +16065,10 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
+       if (nsk < 0) { nsk = 0; for (const char *q = getenv("DM_NVN_SKIP_FS"); q && *q && nsk < 16; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 16) n = 16; memcpy(sk[nsk], q, n); sk[nsk++][n] = 0; }
+                      if (nsk) MLOG("DM_NVN_SKIP_FS: dropping the draws of %d fragment shaders (diagnostic; the picture is wrong)", nsk); }
+       if (g_ub_n > 0 && pr->sh[1] && !g_defer_replaying && ub_skip(pr->sh[1]->key)) return;   // In-process alternating measurement: this phase drops this class
+-      if (nsk && pr->sh[1] && !g_defer_replaying) for (int i = 0; i < nsk; i++) if (!strncmp(pr->sh[1]->key, sk[i], strlen(sk[i]))) return;
++      if (nsk && pr->sh[1] && !g_defer_replaying) for (int i = 0; i < nsk; i++)
++          if (!strncmp(pr->sh[1]->key, sk[i], strlen(sk[i]))) {   // hogwarts-s25: count them, so an A/B can prove the pass ran
++              static uint64_t ndrop; if ((++ndrop & 511) == 1) MLOG("DM_NVN_SKIP_FS: %llu draws dropped so far (fragment %s)", (unsigned long long)ndrop, pr->sh[1]->key);
++              return; }
+       if (ms_draw(pr)) return; }
+     // Diagnostic DM_NVN_DRAW_MAX=<n> (frame replay, graphics/nvn/docs/frame_replay.md): draws past the n-th of a frame are dropped, and the n-th logs its program, blend state and targets
+     //   (DM_NVN_DRAWLOG=1: every draw up to the n-th logs it; DM_NVN_DRAW_SKIP=a-b drops the a-th to b-th draws of a frame) --
+@@ -15402,6 +16190,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
+     //   draw below crashed inside the driver (11-02 Need for Speed: Hot Pursuit Remastered, SIGSEGV at 0x7bc in drawIndexedPrimitives, right after "texture upgraded to allow format views").
+     //   Draw again in a new pass: the texture is upgraded now, so the second binding does not copy (the depth guard stops a binding that would end every pass)
+     if (g_enc != en) { static int again; if (again < 2) { again++; draw(dw, di); again--; return; } RED_ONCE(136, "a draw's binding ended its render pass again on the retry; the draw is skipped"); return; }
++    tm_note(pr);   // 2026-11-19 v058tiny: [tonemapin] post_tonemap 读的 1×1 排队
+     // Parameter binding captures the actual resources under the registry lock; if the version changed between the eligibility check and the binding, split and retry before any GPU draw.
+     if (g_rt_range_active && (g_pass.reg_gen != g_reg_gen || g_pass.ser_gen != g_ser_gen || g_pass.range_dirty != nvn_dirty_now())) { rp_end(); draw(dw, di); return; }
+     int prim = dw ? dw->prim : di->prim;
+@@ -17415,6 +18204,38 @@ static long g_td_frame = -2; static const char *g_td_path; static NSMutableArray
+ static char *g_td_owned_path;
+ static NSIndexSet *g_td_frames;   // only the explicit comma-list mode; sorted and deduplicated
+ static NSMutableArray *g_td_3d;   // 3D textures sampled in the selected frame: @[texture, serial] (at most 16; saved by td_dump as slice atlases)
++// S2Arm hogwarts-s2 (diagnostic, off by default): DM_NVN_TEXSAMP=<max, 1..64> also saves the 2D textures the selected frame samples,
++//   deduplicated by serial, 256..2048 on each side, single-sample, no depth (a material texture, not a 1x1 table): <TEXDUMP path>_ts_<serial>.png.
++//   Unset: one static read at bind time on the dump frame only, nothing else. Saving happens inside td_dump, after its GPU wait, through the same
++//   [view -> RGBA8 -> shot()] path the color targets already use, one output at a time (freed before the next).
++static NSMutableArray *g_td_2d; static int g_tsamp_max = -2, g_tsamp_min = -2, g_tsamp_lv = -2;
++static int g_tsamp_nlv = 1, g_tsamp_lvs[4] = {0, 0, 0, 0};   // hogwarts-s25: the levels TEXSAMP_LV asks for
++static void td_note_2d(id<MTLTexture> t, uint64_t ser) {
++    if (g_td_done || (long)atomic_load(&g_cur_frame) != g_td_frame) return;
++    if (g_tsamp_max == -2) { const char *e = getenv("DM_NVN_TEXSAMP"); g_tsamp_max = e && *e ? atoi(e) : 0;
++        if (g_tsamp_max < 0) g_tsamp_max = 0; if (g_tsamp_max > 64) g_tsamp_max = 64; }
++    if (g_tsamp_min == -2) { const char *e = getenv("DM_NVN_TEXSAMP_MIN"); g_tsamp_min = e && *e ? atoi(e) : 256;
++        if (g_tsamp_min < 1) g_tsamp_min = 1; if (g_tsamp_min > 2048) g_tsamp_min = 2048; }
++    // hogwarts-s24 (DM_NVN_TEXSAMP_LV=n): dump mip level n of the sampled 2D textures instead of level 0, so a mip chain
++    //   whose upper levels were never uploaded shows up (a garbled level 1 next to a clean level 0 is a mip upload defect,
++    //   not a sampling one).
++    if (g_tsamp_lv == -2) { const char *e = getenv("DM_NVN_TEXSAMP_LV"); g_tsamp_lv = e && *e ? atoi(e) : 0;
++        if (g_tsamp_lv < 0) g_tsamp_lv = 0; if (g_tsamp_lv > 12) g_tsamp_lv = 12;
++        // hogwarts-s25: a list ("0,1") dumps the same texture at several levels in one run, which is what a mip chain has
++        //   to be judged by - comparing level 0 of one session with level 1 of another compares two different textures.
++        g_tsamp_nlv = 1; const char *q = e ? strchr(e, ',') : NULL;
++        while (q && g_tsamp_nlv < 4) { int v2 = atoi(q + 1); if (v2 < 0) v2 = 0; if (v2 > 12) v2 = 12;
++            g_tsamp_lvs[g_tsamp_nlv++] = v2; q = strchr(q + 1, ','); } }
++    if (!g_tsamp_max || !t || (int)g_td_2d.count >= g_tsamp_max) return;
++    if (t.textureType != MTLTextureType2D || t.sampleCount > 1 || (int)t.pixelFormat >= 250) return;
++    if (!(t.usage & MTLTextureUsageShaderRead)) return;   // never make a view of a texture Metal was not told is readable
++    NSUInteger w = t.width, h = t.height;
++    if (w < (NSUInteger)g_tsamp_min || h < (NSUInteger)g_tsamp_min || w > 2048 || h > 2048) return;   // bounded on purpose: one 2048x2048 RGBA8 copy is 16 MB
++    for (NSArray *e in g_td_2d) if ([e[1] unsignedLongLongValue] == ser) return;
++    if (!g_td_2d) { g_td_2d = [NSMutableArray array];
++        MLOG("DM_NVN_TEXSAMP: saving up to %d sampled 2D textures (level 0, %d..2048, rgb + alpha) at frame %ld", g_tsamp_max, g_tsamp_min, g_td_frame); }
++    [g_td_2d addObject:@[t, @(ser)]];
++}
+ static void td_note_3d(id<MTLTexture> t, uint64_t ser) {
+     if (g_td_done || (long)atomic_load(&g_cur_frame) != g_td_frame) return;
+     if (!g_td_3d) g_td_3d = [NSMutableArray array];
+@@ -17436,6 +18257,7 @@ static void td_clear(int pending_gpu) {
+     for (NSArray *e in g_td_list) if (e.count > 4) { if (pending_gpu) defer_obj_release(e[0]); else res_remove(e[0]); }
+     [g_td_list removeAllObjects];
+     [g_td_3d removeAllObjects];   // 3D textures are the game's own (no copy): just forget them
++    [g_td_2d removeAllObjects];   // hogwarts-s2: the sampled 2D textures are the game's own too
+ }
+ // DM_NVN_TEXDUMP=size=WxH:path instead picks the frame by content: the first frame that opens a render pass whose first color attachment level is WxH (for one-off work whose frame differs between runs)
+ static unsigned g_td_w, g_td_h;
+@@ -17484,18 +18306,21 @@ static void td_dump(void) {
+     g_td_done = 1;
+     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+     mtl_finish_gpu();
+-    static id<MTLRenderPipelineState> ps, ps_i[2], ps_3d[3]; static id<MTLSamplerState> sp;
++    static id<MTLRenderPipelineState> ps, ps_a, ps_i[2], ps_3d[3]; static id<MTLSamplerState> sp;
+     if (!ps) {
+         static const char *src_msl =
+             "#include <metal_stdlib>\nusing namespace metal;\n"
+             "struct V { float4 p [[position]]; float2 uv; };\n"
+             "vertex V vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); V o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = uv; return o; }\n"
+-            "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) { float4 c = t.sample(s, in.uv); return float4(c.rgb, 1); }\n";
++            "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) { float4 c = t.sample(s, in.uv); return float4(c.rgb, 1); }\n"
++            "fragment float4 fa(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) { float4 c = t.sample(s, in.uv); return float4(c.aaa, 1); }\n";
+         NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src_msl) options:nil error:&e];
+         MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+         d.vertexFunction = [lib newFunctionWithName:@"vs"]; d.fragmentFunction = [lib newFunctionWithName:@"fs"];
+         d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+         ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
++        d.fragmentFunction = [lib newFunctionWithName:@"fa"];   // hogwarts-s3: the same texture, alpha only
++        ps_a = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+         MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sp = [g_dev newSamplerStateWithDescriptor:sd];
+         if (!ps) { MLOG("【红】 TEXDUMP pipeline failed %s", e.localizedDescription.UTF8String); td_clear(0); return; }
+         // Integer targets (G-buffer normals / material IDs): a float view reads them as undefined (shows black); read the integer and show 0-255 per channel (signed: +128)
+@@ -17603,6 +18428,53 @@ static void td_dump(void) {
+             shot(o, path, 0, NULL);
+         }
+     }
++    // hogwarts-s2: the 2D textures the frame sampled (td_note_2d, DM_NVN_TEXSAMP): level 0, <TEXDUMP path with %d = 0>_ts_<serial>.png
++    for (NSArray *e in g_td_2d) {
++        for (int li_ = 0; li_ < g_tsamp_nlv; li_++) {   // hogwarts-s25: one dump per requested level
++        id<MTLTexture> t = e[0]; uint64_t ser = [e[1] unsignedLongLongValue];
++        unsigned lv = (unsigned)MAX(0, g_tsamp_lvs[li_ < g_tsamp_nlv ? li_ : 0]);
++        if (lv >= t.mipmapLevelCount) lv = t.mipmapLevelCount ? (unsigned)(t.mipmapLevelCount - 1) : 0;
++        NSUInteger w = t.width >> lv, h = t.height >> lv;
++        if (w < 1) w = 1; if (h < 1) h = 1;
++        if (w < 1 || h < 1 || w > 2048 || h > 2048 || !(t.usage & MTLTextureUsageShaderRead)) continue;
++        int cls = mtl_pf_dpf(t.pixelFormat);
++        id<MTLRenderPipelineState> use = cls == NVN_DPF_UINT && ps_i[0] ? ps_i[0] : cls == NVN_DPF_SINT && ps_i[1] ? ps_i[1] : ps;
++        id<MTLTexture> v = t.mipmapLevelCount > lv ? [t newTextureViewWithPixelFormat:t.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(lv, 1) slices:NSMakeRange(0, 1)] : nil;
++        if (!use || !v) { MLOG("[texdump] 2D ser=%llu %lux%lu format %lu: not saved (%s)", ser, (unsigned long)w, (unsigned long)h, (unsigned long)t.pixelFormat, v ? "no pipeline" : "no view"); continue; }
++        MTLTextureDescriptor *od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
++        od.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; od.storageMode = MTLStorageModePrivate;
++        id<MTLTexture> o = [g_dev newTextureWithDescriptor:od];
++        if (!o) continue;
++        id<MTLCommandBuffer> cb = q_cb();
++        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
++        rp.colorAttachments[0].texture = o; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
++        id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
++        [en setRenderPipelineState:use]; [en setFragmentTexture:v atIndex:0]; [en setFragmentSamplerState:sp atIndex:0];
++        [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding]; if (!cb_run(cb)) continue;
++        char path[1024]; td_path(path, sizeof path, 0); char *dot = strrchr(path, '.'), *slash = strrchr(path, '/'); char ext[16] = "";
++        if (dot && slash && dot < slash) dot = NULL;
++        if (dot) { strlcpy(ext, dot, sizeof ext); *dot = 0; }
++        char tail[80]; if (lv) snprintf(tail, sizeof tail, "_ts_%llu_l%u%s", (unsigned long long)ser, lv, ext); else snprintf(tail, sizeof tail, "_ts_%llu%s", (unsigned long long)ser, ext); strlcat(path, tail, sizeof path);
++        MLOG("[texdump] 2D ser=%llu %lux%lu level %u format %lu → %s", ser, (unsigned long)w, (unsigned long)h, lv, (unsigned long)t.pixelFormat, path);
++        shot(o, path, 0, NULL);
++        if (ps_a) {   // hogwarts-s3: the same texel set, alpha only (a marker's shape lives in alpha)
++            id<MTLCommandBuffer> cb2 = q_cb();
++            MTLRenderPassDescriptor *rp2 = [MTLRenderPassDescriptor renderPassDescriptor];
++            rp2.colorAttachments[0].texture = o; rp2.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp2.colorAttachments[0].storeAction = MTLStoreActionStore;
++            id<MTLRenderCommandEncoder> en2 = [cb2 renderCommandEncoderWithDescriptor:rp2];
++            [en2 setRenderPipelineState:ps_a]; [en2 setFragmentTexture:v atIndex:0]; [en2 setFragmentSamplerState:sp atIndex:0];
++            [en2 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en2 endEncoding];
++            if (cb_run(cb2)) {
++                char apath[1024]; strlcpy(apath, path, sizeof apath);
++                char *adot = strrchr(apath, '.'), *asl = strrchr(apath, '/'); char aext[16] = "";
++                if (adot && asl && adot < asl) adot = NULL;
++                if (adot) { strlcpy(aext, adot, sizeof aext); *adot = 0; }
++                char atail[64]; snprintf(atail, sizeof atail, "_a%s", aext); strlcat(apath, atail, sizeof apath);
++                shot(o, apath, 0, NULL);
++            }
++        }
++        }
++    }
+     td_clear(0);
+ }
+ // DM_NVN_TEXSNAP=in-frame index,... (together with the frame number and path of DM_NVN_TEXDUMP): as soon as these render passes end, copy their color attachments and save them together with the end-of-frame dump
+diff --git a/graphics/nvn/gfx/nvn/nvn_refl.h b/graphics/nvn/gfx/nvn/nvn_refl.h
+index ba4e913..f9f1703 100644
+--- a/graphics/nvn/gfx/nvn/nvn_refl.h
++++ b/graphics/nvn/gfx/nvn/nvn_refl.h
+@@ -26,7 +26,7 @@ enum { NVN_RB_CBUF = 1, NVN_RB_SAMP, NVN_RB_TEX, NVN_RB_IMG, NVN_RB_TBUF,
+ //   the shader may read, and with rw write, anything in any pool that was given an address. GMEML: the write log of those stores ("gmem_log", a bitmap of table entries, nvn_mtl.m gml_take)
+ enum { NVN_DPF_FLOAT = 0, NVN_DPF_UINT, NVN_DPF_SINT, NVN_DPF_DEPTH };            // Dummy texture pixel class (determined by msl_type)
+ enum { NVN_CT_FLOAT = 0, NVN_CT_UINT, NVN_CT_INT };                               // Vertex input component type
+-#define NVN_REFL_MAXARG 1024   // argument buffer entries of one shader (an array binding takes n of them)
++#define NVN_REFL_MAXARG 2048   // argument buffer entries of one shader (an array binding takes n of them)
+ // 11-02 从 192 放宽：192 是 10-24 随上游 参考实现 搬来的常量，不是 Metal 的限制（参数缓冲 Tier 2 每阶段可访问的纹理 / 缓冲数以十万计，参数块只是一段 8 字节一项的缓冲）。
+ //   马力欧派对 超级巨星 真机 64 支片元整支不可用（编号到 198–207）：5 个 Ryujinx 无法追溯句柄的回退数组（TEXD / SAMPD，各 32 项）占 160 项，
+ //   其后的图像 / 界长表 / 宽屏表顶过 191。宿主按它开的定长表（encode_args slots、len_fill、lb_fill、se_bind）随之放大，栈上合计约 12 KB；aid 是 uint16
+@@ -40,7 +40,7 @@ typedef struct {
+     uint8_t dtt, dpf;        // Dummy texture when the texture slot is unbound: MTLTextureType value, pixel class
+     uint16_t reg, aid;       // D3D register number, index within the argument buffer
+     uint16_t off;            // TEXU / SAMPU / TBUFU: byte offset of the handle within the uniform buffer; SBUFU: of the 64-bit storage buffer address
+-    uint8_t n;               // TEXD / SAMPD, and TEXU / SAMPU arrays (element k = the handle at byte 8k of the uniform buffer): array length (argument buffer entries aid .. aid + n - 1)
++    uint16_t n;              // TEXD / SAMPD, and TEXU / SAMPU arrays (element k = the handle at byte 8k of the uniform buffer): array length (argument buffer entries aid .. aid + n - 1)
+     uint8_t sid;             // SAMPU: the uniform word is a sampler ID, not a handle (Ryujinx SeparateSamplerId: shifted into the handle's high bits; The Witcher 3)
+     uint8_t f1d;             // TEX: read by 1D integer fetches as 2D rows (json "fetch1d"): a buffer texture here is bound as rows (nvn_mtl.m tbuf_as_2d); 1 = rows of 16384 texels (Maxwell),
+                              //   2 = exact rows, W * H = the element count ("fetch1d_exact", Ampere: the shader reads W and H from the form and 0 past them)
+diff --git a/graphics/nvn/gfx/nvn/nvn_refl.m b/graphics/nvn/gfx/nvn/nvn_refl.m
+index 40db3d7..5161f11 100644
+--- a/graphics/nvn/gfx/nvn/nvn_refl.m
++++ b/graphics/nvn/gfx/nvn/nvn_refl.m
+@@ -3,6 +3,7 @@
+ #import <Metal/Metal.h>
+ #include <stdio.h>
+ #include <string.h>
++#include <stdlib.h>   // getenv (S2A_TEXARR_SAMP)
+ 
+ // Dummy texture type: same prefix rules as the original dummy_tex (an unbound texture slot reads 0 per D3D semantics)
+ static void dummy_kind(NSString *t, uint8_t *tt, uint8_t *pf) {
+@@ -88,7 +89,12 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
+                 r->kind = NVN_RB_IMGA; r->rw = 1; o->nb++; continue;
+             }
+             if ([k isEqualToString:@"cbuf"]) r->kind = NVN_RB_CBUF;
+-            else if ([k isEqualToString:@"samp"]) r->kind = NVN_RB_SAMP;
++            else if ([k isEqualToString:@"samp"]) { r->kind = NVN_RB_SAMP;
++                // hogwarts-s8: an array of samplers (array<sampler, 32>): the translator writes kind "samp" without a count, so the
++                //   host bound one sampler at the array's first id and every index past 0 read an unbound slot (the default sampler:
++                //   wrong wrap / filter / LOD). Keep the count here; the second pass below turns it into a separate-handle array when
++                //   it shares its uniform slot with a tex_ubo array (the same handle table)
++                if (n > 0 && [el hasPrefix:@"sampler"]) r->n = (uint16_t)n; }
+             else if ([k isEqualToString:@"samp_tex"]) r->kind = NVN_RB_SAMPT;
+             else if ([k isEqualToString:@"tex"]) { r->kind = NVN_RB_TEX; dummy_kind(b[@"msl_type"], &r->dtt, &r->dpf); r->f1d = [b[@"fetch1d"] boolValue] ? ([b[@"fetch1d_exact"] boolValue] ? 2 : 1) : 0;
+                 // #968: the s2a_flags.yzw bit the translator reads for this binding's coordinate normalization (Dsh.cs Reflect); absent in an older library = no bit, as before
+@@ -151,7 +157,22 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
+             if (r->kind == NVN_RB_TEXU || r->kind == NVN_RB_SAMPU || r->kind == NVN_RB_TBUFU || r->kind == NVN_RB_IMGU) pair_from_name(nm, r);   // the second word of a separate handle
+             o->nb++;
+         }
+-        for (NSNumber *li in lead_for) {   // #798：前导项配给它的纹素缓冲（名字对上、且是纹素缓冲那几种）
++        {   // hogwarts-s8 (S2A_TEXARR_SAMP=1): the sampler array of a handle table (see the "samp" branch) becomes a
++            //   separate-handle array (NVN_RB_SAMPU) when a tex_ubo array of the same uniform slot exists: the host then binds
++            //   all its entries from the handle's high bits at byte 8k. Off by default (it changes which samplers are bound).
++            static int s8_on = -1;
++            if (s8_on < 0) { const char *e = getenv("S2A_TEXARR_SAMP");
++                // hogwarts-s19: a widened handle table also needs its sampler array bound as an array (otherwise the
++                //   shader indexes entries the host never bound and the GPU faults): S2A_TEXARR_BUF implies it too
++                const char *b = getenv("S2A_TEXARR_BUF");
++                s8_on = (e && *e && atoi(e) > 0) || (b && *b && atoi(b) > 0); }
++            if (s8_on) for (int si = 0; si < o->nb; si++) {
++                nvn_rbind *s = &o->b[si];
++                if (s->kind != NVN_RB_SAMP || s->n == 0) continue;
++                for (int ti = 0; ti < o->nb; ti++) if (o->b[ti].kind == NVN_RB_TEXU && o->b[ti].reg == s->reg) {
++                    s->kind = NVN_RB_SAMPU; s->off = o->b[ti].off; s->sid = 0; break; }
++            }
++        }        for (NSNumber *li in lead_for) {   // #798：前导项配给它的纹素缓冲（名字对上、且是纹素缓冲那几种）
+             NSNumber *ti = by_name[lead_for[li]]; int L = li.intValue, T = ti ? ti.intValue : -1;
+             // 几何拓扑缓冲 trb_data：翻译器先把它声明成纹素缓冲，spv_tbias（gal_spvx.c）照例给它加了前导项；几何变体再把它改写成宿主填的 uint 指针
+             //   （Dsh.cs TopologyPointer），反射里成了几何辅助缓冲。宿主自己写的缓冲没有不对齐偏移，前导数恒为 0——不配对正是 0（tbl_lead_of 无配对返回 0），
+diff --git a/graphics/nvn/gfx/nvn/nvn_session.inc b/graphics/nvn/gfx/nvn/nvn_session.inc
+index 6dbc92a..65e04ec 100644
+--- a/graphics/nvn/gfx/nvn/nvn_session.inc
++++ b/graphics/nvn/gfx/nvn/nvn_session.inc
+@@ -86,6 +86,7 @@ static void session_resource_release(void *v) {
+ int nvn_be_drain_session(void) { return session_wait_backend(); }
+ int nvn_be_shutdown_session(void) {
+     int e = session_wait_backend(); if (e) { MLOG("【红】重启：Metal 工作仍持有旧会话 (%d)", e); return e; }
++    alias_done_report();   // 2026-11-19 v058tiny: [aliasq] done / [packaged] done（整局一行，内部只打一次）
+     // Keep completed immutable shader loads in the device cache. This also
+     // consumes the old prefetch handoff before its pipeline maps are cleared.
+     warm_claim();
