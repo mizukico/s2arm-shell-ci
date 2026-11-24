@@ -1,0 +1,284 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 3c6ea9d..255fc76 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -6852,7 +6852,8 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
+     }
+     { void td_note(id pd, NSUInteger nc); td_note(pd, (NSUInteger)R.rt.n);
+       void ts_note(id pd, NSUInteger nc); ts_note(pd, (NSUInteger)R.rt.n);
+-      void ms_note(id pd, NSUInteger nc); ms_note(pd, (NSUInteger)R.rt.n); }
++      void ms_note(id pd, NSUInteger nc); ms_note(pd, (NSUInteger)R.rt.n);
++      void dh_note(MTL4RenderPassDescriptor *pd); dh_note(pd); }   // DM_NVN_DEPTHHIST: depth endpoints, see dh_note
+     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }   // the copy encoder the shadows' blocks were moved in with (bcrt_attach)
+     ser_gate();
+     g_enc = enc_r_begin_pass(pd);
+@@ -14010,6 +14011,7 @@ static void dbl_retire(NSMutableArray *keep) {
+     [g_commit_blocks addObject:^{ for (id<MTLResource> r in held) res_remove(r); }];
+ }
+ static void draw(const p_draw *dw, const p_draw_idx *di);
++static void dh_fog_hit(NvProg *pr);
+ static void fz_snap_take(const p_draw *dw, const p_draw_idx *di) {
+     if (g_nfzs >= 8) { g_fzs_bad = 1; return; }
+     fz_snap *z = &g_fzs[g_nfzs++]; z->idx = di != NULL; if (dw) z->dw = *dw; if (di) z->di = *di; z->sc = R.sc; z->has_sc = R.has_sc;
+@@ -16428,6 +16430,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
+     //   draw below crashed inside the driver (11-02 Need for Speed: Hot Pursuit Remastered, SIGSEGV at 0x7bc in drawIndexedPrimitives, right after "texture upgraded to allow format views").
+     //   Draw again in a new pass: the texture is upgraded now, so the second binding does not copy (the depth guard stops a binding that would end every pass)
+     if (g_enc != en) { static int again; if (again < 2) { again++; draw(dw, di); again--; return; } RED_ONCE(136, "a draw's binding ended its render pass again on the retry; the draw is skipped"); return; }
++    dh_fog_hit(pr);   // DM_NVN_DEPTHHIST: the fog shell's pass is the one whose depth is read (see dh_note)
+     tm_note(pr);   // 2026-11-19 v058tiny: [tonemapin] post_tonemap 读的 1×1 排队
+     // Parameter binding captures the actual resources under the registry lock; if the version changed between the eligibility check and the binding, split and retry before any GPU draw.
+     if (g_rt_range_active && (g_pass.reg_gen != g_reg_gen || g_pass.ser_gen != g_ser_gen || g_pass.range_dirty != nvn_dirty_now())) { rp_end(); draw(dw, di); return; }
+@@ -16939,6 +16942,37 @@ static void dispatch(const p_dispatch *dp) {
+         id<MTLBuffer> sb; size_t so = arena_alloc((size_t)bytes, &sb); enc_c_args(ce, sb.gpuAddress + so, cs->spill_slot);
+         static int once; if (!once++) MLOG("compute shared-memory spill: first dispatch of %s (%u bytes per threadgroup, %llu threadgroups)", cs->key, cs->spill, (unsigned long long)n);
+     }
++    // Always-on observation (no env key, no behaviour change): the compute pipeline's threadgroup limit against
++    // the size the game actually dispatches. Upstream (nxnative #2276/#2425) lost fog, light shafts and lamp halos
++    // because a kernel's local size exceeded this limit on Apple GPUs without Dynamic Caching (52 registers ->
++    // 1024, 104 -> 512, 128 -> 384); Metal then writes nothing and the pass reading that buffer adds zero.
++    // The corpus carries the declared sizes (json threadgroup_size): 1339 computes, 47 above 384 (4 at 1024,
++    // 10 at 512x1x1, 33 at 8x8x8), none above 1024, none carrying [[max_total_threads_per_threadgroup]]. Whether
++    // the limit really drops on this device is exactly what these lines answer.
++    // A hash table, not a list: this sits on the dispatch path, and a linear scan of every kernel already seen
++    // would cost the submit thread a strcmp per kernel per dispatch. The 24-byte key is copied, never kept as a
++    // pointer (NvShader holds it inline, so the record can go away underneath a stored pointer).
++    { enum { TG_SEEN = 2048 }; static struct { uint64_t h; char k[24]; } seen[TG_SEEN]; static uint64_t tg_all, tg_over;
++      const char *k = cs->key; uint64_t h = 1469598103934665603ull;
++      for (const char *q = k; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ull; } if (!h) h = 1;
++      unsigned base = (unsigned)(h & (TG_SEEN - 1)), slot = TG_SEEN; int have = 0;
++      for (unsigned i = 0; i < 64; i++) {
++          unsigned j = (base + i) & (TG_SEEN - 1);
++          if (!seen[j].h) { slot = j; break; }
++          if (seen[j].h == h && !strncmp(seen[j].k, k, sizeof seen[0].k - 1)) { have = 1; break; }
++      }
++      if (!have) {
++          unsigned long cnt = (unsigned long)tg[0] * (unsigned long)tg[1] * (unsigned long)tg[2];
++          unsigned long lim = ps ? (unsigned long)ps.maxTotalThreadsPerThreadgroup : 0;
++          unsigned long tw = ps ? (unsigned long)ps.threadExecutionWidth : 0;
++          tg_all++;
++          if (cnt > lim) { tg_over++; MLOG("[tg] compute %s local=%lu (%ux%ux%u) limit=%lu tw=%lu OVER: this kernel writes nothing on this device", k, cnt, (unsigned)tg[0], (unsigned)tg[1], (unsigned)tg[2], lim, tw); }
++          else MLOG("[tg] compute %s local=%lu (%ux%ux%u) limit=%lu tw=%lu ok", k, cnt, (unsigned)tg[0], (unsigned)tg[1], (unsigned)tg[2], lim, tw);
++          if (slot < TG_SEEN) { seen[slot].h = h; snprintf(seen[slot].k, sizeof seen[slot].k, "%s", k); }
++          // The per-kernel lines are the criterion. This tally only makes a long run readable: a run that
++          // dispatches fewer kernels than the interval prints no tally at all, and that is not a pass.
++          if (tg_all % 64 == 0) MLOG("[tg] %llu compute kernels seen, %llu with local > limit (the per-kernel lines are the criterion)", (unsigned long long)tg_all, (unsigned long long)tg_over);
++      } }
+     if (dp->ind) {   // The shader reads the group counts from c0 + 0x200: copy the GPU-written ones there first (Metal 4 orders nothing inside an encoder without a barrier)
+         if (g_c0_dim_buf && g_m3) {
+             // Metal 3 needs compute -> blit -> compute, ordered by g_fence3 at each encoder boundary.
+@@ -18621,6 +18655,215 @@ static void td_clear(int pending_gpu) {
+     [g_td_3d removeAllObjects];   // 3D textures are the game's own (no copy): just forget them
+     [g_td_2d removeAllObjects];   // hogwarts-s2: the sampled 2D textures are the game's own too
+ }
++// ---------- DM_NVN_DEPTHHIST=<frame>[:<buckets, default 32>] ----------
++// DM_NVN_TEXDUMP walks the COLOR attachments only (td_note, below), so a depth target never reaches a package
++// and a depth endpoint distribution cannot be read out of one at all (Hogwarts 11-24: 86 [texdump] lines, all
++// "55 color targets": format 260 and ser=5897 zero times). This probe closes that gap with no new shader, no
++// file and no fixed serial: it reads the depth plane of the ONE pass that draws the fog shell
++// (f9d9ae507d9c6935) and counts it into buckets on the CPU, one log line per capture.
++//   DM_NVN_DEPTHHIST=selftest -- buckets a synthetic {0, 0.25, 1, NaN} without touching the GPU, so the
++//   bucketing is proven inside the same run that uses it.
++// Bucket 0 is [0, 1/nb) and bucket nb-1 is [1-1/nb, 1); under this game's reverse-Z (near=0) convention a
++// stored value near 1 is close geometry and near 0 is far, so the two ENDS are what a caller reads.
++//
++// WHEN it reads is the whole probe. Any "first depth of the frame" rule reads the frame's clear: in the S54
++// F3600 case the first 2D depth is 283745 (ser=5897, the clear) and the next different one arrives 8 passes
++// later at 283753 (256x256), while the fog draw is 283793 -- such a reading is almost all clear value 0 and
++// would come back as "the scene wrote no depth", the opposite of the truth. The frame end is no better:
++// ser=5897 is used by 9 more passes after 283793. So the fog draw itself sets the capture (dh_fog_hit) and the
++// read happens when the NEXT pass opens, the only moment at which the depth is what that pass left.
++//
++// HOW it reads: encoded into the frame's own command buffer (blit() on g_cb) right after that pass ended, never
++// into a command buffer of its own -- this runs while the frame is still being recorded, so a separate commit
++// would run before the frame's passes and read the PREVIOUS frame's depth. The counting runs in a commit block
++// once the GPU is done (the same pattern as the double-render checks).
++#define DH_FOG_KEY "f9d9ae507d9c6935"
++static long g_dh_frame = -2, g_dh_end; static int g_dh_buckets = 32; static NSMutableArray *g_dh_list; static int g_dh_self;
++static int g_dh_pend;                 // the fog draw landed: read at the next pass boundary
++static uint64_t g_dh_pass;            // the pass that drew it (one capture per frame)
++static long g_dh_hit_frame = -1;      // one capture per frame (this draw can land more than once in a frame)
++static long g_dh_last_frame = -1;     // the last frame dh_note saw, for the "never landed" line
++static const char *dh_fmt_name(MTLPixelFormat pf) {
++    return pf == MTLPixelFormatDepth32Float_Stencil8 ? "Depth32Float_Stencil8" :
++           pf == MTLPixelFormatDepth32Float ? "Depth32Float" :
++           pf == MTLPixelFormatDepth16Unorm ? "Depth16Unorm" : "other";
++}
++
++// The band follows the judge, not a guess: this draw is near=0 / main0_z (log depth mode line), which leaves z
++// as it is, so depth = z/w = near/d -- the fog shell lands around 1e-5..1e-4 and the scene around 1e-3. A band
++// around 0.5 covers the main0 convention (0.5z+0.5w) and would read nothing here, so the fine band is
++// LOGARITHMIC over 1e-6..1e-2 at 32 bins per decade (about 3 % wide, enough to separate 1e-5 from 1.05e-5),
++// plus a linear [0,1e-4] band for the "no geometry wrote here" end.
++#define DH_LOG_LO 1e-6f
++#define DH_LOG_HI 1e-2f
++#define DH_LOG_N 128
++#define DH_FINE_LO 0.f
++#define DH_FINE_HI 1e-4f
++#define DH_FINE_N 128
++typedef struct { uint64_t n, zero, one, nan_, lt05, ge05, lt1e5, lt1e4, lt1e3, lt01; float mn, mx; double mean;
++                 uint64_t buckets[64], logb[DH_LOG_N], fine[DH_FINE_N]; } dh_stat;
++
++static void dh_hist(const float *z, uint64_t n, int nb, dh_stat *o) {
++    memset(o, 0, sizeof *o);
++    o->n = n; o->mn = 3.4e38f; o->mx = -3.4e38f; double sum = 0; uint64_t finite = 0;
++    const float logspan = __builtin_log10f(DH_LOG_HI) - __builtin_log10f(DH_LOG_LO);
++    for (uint64_t i = 0; i < n; i++) {
++        float v = z[i];
++        if (v != v) { o->nan_++; continue; }                       // NaN is its own count, not a bucket
++        finite++; sum += v;
++        if (v < o->mn) o->mn = v; if (v > o->mx) o->mx = v;
++        if (v == 0.f) { o->zero++; continue; }                     // the clear value, counted apart
++        if (v >= 1.f) { o->one++; continue; }
++        if (v < 0.5f) o->lt05++; else o->ge05++;                   // the side of 0.5
++        if (v < 1e-5f) o->lt1e5++;                                 // quantile fractions, no preset band to guess
++        if (v < 1e-4f) o->lt1e4++;
++        if (v < 1e-3f) o->lt1e3++;
++        if (v < 0.1f) o->lt01++;
++        int k = (int)(v * (float)nb); if (k < 0) k = 0; if (k >= nb) k = nb - 1;
++        o->buckets[k]++;
++        if (v >= DH_LOG_LO && v <= DH_LOG_HI) {
++            int j = (int)((__builtin_log10f(v) - __builtin_log10f(DH_LOG_LO)) / logspan * DH_LOG_N);
++            if (j < 0) j = 0; if (j >= DH_LOG_N) j = DH_LOG_N - 1;
++            o->logb[j]++;
++        }
++        if (v >= DH_FINE_LO && v <= DH_FINE_HI) {
++            int j = (int)((v - DH_FINE_LO) / ((DH_FINE_HI - DH_FINE_LO) / DH_FINE_N));
++            if (j < 0) j = 0; if (j >= DH_FINE_N) j = DH_FINE_N - 1;
++            o->fine[j]++;
++        }
++    }
++    if (!finite) { o->mn = 0; o->mx = 0; }
++    o->mean = finite ? sum / (double)finite : 0.0;
++}
++
++// Called once per capture: when the pass that drew the fog shell has ended and the next one opens (dh_note), or
++// when the frame has moved on. The capture is released first: whatever happens below, this frame is read once.
++static void dh_emit(void) {
++    g_dh_pend = 0;
++    if (!g_dh_list.count) return;
++    NSArray *e = g_dh_list[0]; id<MTLTexture> t = e[0];
++    uint64_t ser = [e[1] unsignedLongLongValue], pass = g_dh_pass; long fr = g_dh_hit_frame;
++    NSUInteger w = t ? t.width : 0, h = t ? t.height : 0;
++    if (!t || !w || !h) { MLOG("[depthhist] ser=%llu %lux%lu pass=%llu frame=%ld read did not run: the depth attachment has no size", (unsigned long long)ser, (unsigned long)w, (unsigned long)h, (unsigned long long)pass, fr); [g_dh_list removeAllObjects]; return; }
++    if (g_enc) { MLOG("[depthhist] ser=%llu %lux%lu pass=%llu frame=%ld read did not run: a render encoder is open, the copy cannot be encoded between encoders", (unsigned long long)ser, (unsigned long)w, (unsigned long)h, (unsigned long long)pass, fr); [g_dh_list removeAllObjects]; return; }
++    if (t.pixelFormat != MTLPixelFormatDepth32Float && t.pixelFormat != MTLPixelFormatDepth32Float_Stencil8) {
++        MLOG("[depthhist] ser=%llu %lux%lu pass=%llu format %lu (%s) is not a 32-bit float depth target; read did not run", (unsigned long long)ser, (unsigned long)w, (unsigned long)h, (unsigned long long)pass, (unsigned long)t.pixelFormat, dh_fmt_name(t.pixelFormat)); [g_dh_list removeAllObjects]; return; }
++    size_t row = (size_t)w * 4, img = row * (size_t)h;
++    if (img > (size_t)(512ull << 20)) { MLOG("[depthhist] ser=%llu %lux%lu pass=%llu read did not run: %zu bytes is past the 512 MiB ceiling", (unsigned long long)ser, (unsigned long)w, (unsigned long)h, (unsigned long long)pass, img); [g_dh_list removeAllObjects]; return; }
++    if (!g_commit_blocks) { MLOG("[depthhist] ser=%llu %lux%lu pass=%llu read did not run: this submission keeps no commit blocks (it is not being recorded)", (unsigned long long)ser, (unsigned long)w, (unsigned long)h, (unsigned long long)pass); [g_dh_list removeAllObjects]; return; }
++    id<MTLBuffer> buf = [g_dev newBufferWithLength:img options:MTLResourceStorageModeShared];
++    if (!buf) { MLOG("[depthhist] ser=%llu %lux%lu pass=%llu read did not run: no read-back buffer of %zu bytes", (unsigned long long)ser, (unsigned long)w, (unsigned long)h, (unsigned long long)pass, img); [g_dh_list removeAllObjects]; return; }
++    // A combined depth-stencil is read through a depth-only view: the same storage, the same depth value (the
++    // same view fb_narrow_view makes), while a copy of the combined format to a buffer would need the
++    // MTLBlitOptionDepthFromDepthStencil path. The depth plane is 4 bytes a pixel either way.
++    id<MTLTexture> rd = t;
++    if (t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) rd = [t newTextureViewWithPixelFormat:MTLPixelFormatDepth32Float textureType:MTLTextureType2D levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
++    if (!rd) { MLOG("[depthhist] ser=%llu %lux%lu pass=%llu read did not run: no depth-only view of format %lu", (unsigned long long)ser, (unsigned long)w, (unsigned long)h, (unsigned long long)pass, (unsigned long)t.pixelFormat); [g_dh_list removeAllObjects]; return; }
++    int nb = g_dh_buckets; if (nb < 1) nb = 1; if (nb > 64) nb = 64;
++    const char *fmt = dh_fmt_name(t.pixelFormat);
++    NSMutableArray *keep = [NSMutableArray array];
++    dbl_keep(keep, buf); dbl_keep(keep, rd);
++    enc_b_copy_texture_buffer(blit(), rd, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, 1), buf, 0, row, img);
++    MLOG("[depthhist] ser=%llu %lux%lu pass=%llu frame=%ld format=%s: the copy is encoded after that pass in the frame's own command buffer (the histogram follows once the GPU is done)", (unsigned long long)ser, (unsigned long)w, (unsigned long)h, (unsigned long long)pass, fr, fmt);
++    [g_dh_list removeAllObjects];
++    [g_commit_blocks addObject:^{
++        dh_stat st;
++        dh_hist((const float *)buf.contents, (uint64_t)w * (uint64_t)h, nb, &st);
++        char bs[900]; size_t bo = 0;
++        for (int k = 0; k < nb && bo < sizeof bs - 12; k++) bo += snprintf(bs + bo, sizeof bs - bo, "%s%llu", k ? "," : "", (unsigned long long)st.buckets[k]);
++        char ls[2048]; size_t lo_ = 0; int lhits = 0;
++        { const float lspan = __builtin_log10f(DH_LOG_HI) - __builtin_log10f(DH_LOG_LO);
++          for (int k = 0; k < DH_LOG_N && lo_ < sizeof ls - 24; k++)
++              if (st.logb[k]) { lo_ += snprintf(ls + lo_, sizeof ls - lo_, "%s%.2e:%llu", lhits++ ? "," : "",
++                                                (double)__builtin_powf(10.f, __builtin_log10f(DH_LOG_LO) + (k + 0.5f) / DH_LOG_N * lspan),
++                                                (unsigned long long)st.logb[k]); } }
++        char fs[2048]; size_t fo = 0; int fhits = 0;
++        for (int k = 0; k < DH_FINE_N && fo < sizeof fs - 16; k++)
++            if (st.fine[k]) { fo += snprintf(fs + fo, sizeof fs - fo, "%s%.3g:%llu", fhits++ ? "," : "",
++                                             (double)(DH_FINE_LO + (k + 0.5f) * ((DH_FINE_HI - DH_FINE_LO) / DH_FINE_N)),
++                                             (unsigned long long)st.fine[k]); }
++        MLOG("[depthhist] ser=%llu %lux%lu pass=%llu frame=%ld format=%s exact0=%llu lt1e-5=%llu lt1e-4=%llu lt1e-3=%llu lt0.1=%llu lt0.5=%llu ge0.5=%llu ge1=%llu nan=%llu min=%.9g max=%.9g mean=%.9g coarse[%d]=%s logb[1e-6,1e-2]x%d=%s fine[0,1e-4]x%d=%s",
++             (unsigned long long)ser, (unsigned long)w, (unsigned long)h, (unsigned long long)pass, fr, fmt,
++             (unsigned long long)st.zero, (unsigned long long)st.lt1e5, (unsigned long long)st.lt1e4,
++             (unsigned long long)st.lt1e3, (unsigned long long)st.lt01, (unsigned long long)st.lt05,
++             (unsigned long long)st.ge05, (unsigned long long)st.one, (unsigned long long)st.nan_,
++             (double)st.mn, (double)st.mx, st.mean, nb, bs, DH_LOG_N, lhits ? ls : "(none)", DH_FINE_N, fhits ? fs : "(none)");
++    }];
++    dbl_retire(keep);   // buf and the view live until this submission's GPU work is done (the block above runs first)
++}
++
++// The fog shell's draw: remember THAT pass's depth as the capture. Called from draw() once the pass is open and
++// this draw really draws, so R.rt is that pass's targets and this is the depth the fog is tested against.
++static void dh_fog_hit(NvProg *pr) {
++    if (g_dh_frame < 0 || g_dh_frame == -3) return;
++    if (!pr || !pr->sh[1] || !R.rt.depth) return;
++    long f = (long)atomic_load(&g_cur_frame);
++    if (f < g_dh_frame || f > g_dh_end || g_dh_hit_frame == f) return;   // one capture per frame
++    if (strncmp(pr->sh[1]->key, DH_FOG_KEY, sizeof DH_FOG_KEY - 1)) return;
++    id<MTLTexture> t = tex_mtl(R.rt.depth);
++    if (!t) return;
++    uint64_t ser = R.rt.depth->serial;
++    if (t.textureType != MTLTextureType2D) { MLOG("[depthhist] frame=%ld pass=%llu ser=%llu depth is type %lu, not 2D; nothing read", f, (unsigned long long)g_stat_pass, (unsigned long long)ser, (unsigned long)t.textureType); return; }
++    [g_dh_list removeAllObjects];
++    [g_dh_list addObject:@[t, @(ser)]];   // the array holds the texture for us (a raw static would not)
++    g_dh_pass = g_stat_pass; g_dh_hit_frame = f; g_dh_pend = 1;
++    MLOG("depthhist: frame=%ld pass=%llu ser=%llu type=%s %lux%lu clear=%.9g (the fog draw %s landed; its depth is read when this pass ends)",
++         f, (unsigned long long)g_stat_pass, (unsigned long long)ser, dh_fmt_name(t.pixelFormat), (unsigned long)t.width, (unsigned long)t.height, (double)R.cd, pr->sh[1]->key);
++}
++
++void dh_note(MTL4RenderPassDescriptor *pd) {
++    (void)pd;
++    if (g_dh_frame == -2) {
++        const char *e = getenv("DM_NVN_DEPTHHIST");
++        g_dh_frame = -1; g_dh_end = -1; g_dh_list = [NSMutableArray array];
++        if (e && *e) {
++            if (!strcmp(e, "selftest")) g_dh_frame = -3;
++            else if (!strcmp(e, "1")) {   // follow the PASSDUMP window: no second frame number to guess
++                const char *ps = getenv("DM_NVN_PASSDUMP");
++                if (ps && *ps) {
++                    long a = atol(ps); const char *dash = strchr(ps, '-'); long b = dash ? atol(dash + 1) : a;
++                    if (a >= 0 && b >= a) { g_dh_frame = a; g_dh_end = b; }
++                }
++                if (g_dh_frame < 0) MLOG("DM_NVN_DEPTHHIST=1 needs DM_NVN_PASSDUMP=<frame> or <start>-<end>; the depth probe is off");
++            } else {
++                const char *c = strchr(e, ':');
++                long f = atol(e); if (f < 0) f = -1;
++                g_dh_frame = f; g_dh_end = f;
++                if (c) { int nb = atoi(c + 1); if (nb > 0) g_dh_buckets = nb; }
++                if (g_dh_frame < 0) MLOG("DM_NVN_DEPTHHIST: %s is not a frame number; the depth probe is off", e);
++            }
++            if (g_dh_frame >= 0) MLOG("depthhist: frame=%ld..%ld buckets=%d logb=[1e-6,1e-2]x128 fine=[0,1e-4]x128 fog=%s -- armed (diagnostic, log only; the game's memory is not written)",
++                                      g_dh_frame, g_dh_end ? g_dh_end : g_dh_frame, g_dh_buckets, DH_FOG_KEY);
++        }
++    }
++    if (g_dh_frame == -3) {   // selftest: {0, 1e-6, 1e-4, 0.5, 1, NaN} -> exact0=1, lt1e-5=1, lt1e-3=1, lt0.1=1, ge0.5=1, ge1=1, nan=1
++        if (g_dh_self++) return;
++        float v[6] = {0.f, 1e-6f, 1e-4f, 0.5f, 1.f, __builtin_nanf("")};
++        dh_stat st;
++        dh_hist(v, 6, 8, &st);
++        char bs[200]; size_t o = 0;
++        for (int k = 0; k < 8; k++) o += snprintf(bs + o, sizeof bs - o, "%s%llu", k ? "," : "", (unsigned long long)st.buckets[k]);
++        char fs[200]; size_t fo = 0; int fhits = 0;
++        for (int k = 0; k < DH_FINE_N; k++) if (st.fine[k]) { fo += snprintf(fs + fo, sizeof fs - fo, "%s%d:%llu", fhits++ ? "," : "", k, (unsigned long long)st.fine[k]); }
++        MLOG("[depthhist] selftest exact0=%llu lt1e-5=%llu lt1e-3=%llu lt0.1=%llu ge0.5=%llu ge1=%llu nan=%llu min=%.9g max=%.9g buckets[8]=%s fine=%s (expect 1/1/1/1/1/1/1, 0..1, fine 1:1,127:1)",
++             (unsigned long long)st.zero, (unsigned long long)st.lt1e5, (unsigned long long)st.lt1e3,
++             (unsigned long long)st.lt01, (unsigned long long)st.ge05, (unsigned long long)st.one,
++             (unsigned long long)st.nan_, (double)st.mn, (double)st.mx, bs, fhits ? fs : "(none)");
++        return;
++    }
++    if (g_dh_frame < 0) return;
++    long f = (long)atomic_load(&g_cur_frame);
++    // This call is the first pass opened after the fog pass ended (rp_begin_ex_ runs it just above
++    // enc_r_begin_pass), so the depth is exactly what that pass left. A pass that ends by a split stores and the
++    // next one reloads: the value does not change. The frame moving on is covered too, because g_stat_pass only
++    // grows; the second clause keeps the fallback readable if that ever stops holding.
++    if (g_dh_pend && (g_stat_pass >= g_dh_pass || f != g_dh_hit_frame)) dh_emit();
++    if (g_dh_last_frame != f) {
++        long pv = g_dh_last_frame; g_dh_last_frame = f;
++        if (pv >= g_dh_frame && pv <= g_dh_end && g_dh_hit_frame != pv)
++            MLOG("[depthhist] frame=%ld the fog draw (%s) never landed in this frame; nothing was read", pv, DH_FOG_KEY);
++    }
++}
+ // DM_NVN_TEXDUMP=size=WxH:path instead picks the frame by content: the first frame that opens a render pass whose first color attachment level is WxH (for one-off work whose frame differs between runs)
+ static unsigned g_td_w, g_td_h;
+ void td_note(MTL4RenderPassDescriptor *pd, NSUInteger nc) {
