@@ -237,6 +237,7 @@ jobs:
           set -euo pipefail
           W="$(mktemp -d)"; cd "$W"
           cp "$GITHUB_WORKSPACE/shaders/39027e0d81129414_b.pristine.metal" p.metal
+          echo "pristine bytes=$(stat -f%z p.metal) sha256=$(shasum -a 256 p.metal | cut -d' ' -f1)"
           xcrun -sdk iphoneos metal -c p.metal -o p.air
           echo "pristine compiles: $(stat -f%z p.air) B of AIR"
 
@@ -246,9 +247,14 @@ jobs:
           set -euo pipefail
           W="$(mktemp -d)"; cd "$W"
           cp "$GITHUB_WORKSPACE/shaders/39027e0d81129414_b.edited.metal" e.metal
+          echo "edited bytes=$(stat -f%z e.metal) sha256=$(shasum -a 256 e.metal | cut -d' ' -f1)"
+          # 上一版这里翻过车：行中 // 注释把 s2a_alpha_pass 的定义整段吃掉，编译才炸。
+          # 定义必须在活代码行上、且只出现一次。
+          echo "s2a_alpha_pass definition count: $(grep -c 'static inline bool s2a_alpha_pass' e.metal)"
+          test "$(grep -c 'static inline bool s2a_alpha_pass' e.metal)" -eq 1
+          echo "S2A_FSOUT_ON occurrences in the edited source: $(grep -c S2A_FSOUT_ON e.metal)"
           xcrun -sdk iphoneos metal -c e.metal -o e.air
           echo "edited compiles: $(stat -f%z e.air) B of AIR"
-          echo "S2A_FSOUT_ON occurrences in the edited source: $(grep -c S2A_FSOUT_ON e.metal)"
           echo "METAL-CHECK: PASS"
 
       - name: Summary line for the gate

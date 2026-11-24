@@ -3,7 +3,7 @@
 
 using namespace metal;
 
-constant int S2A_AT [[function_constant(100)]]; constant bool S2A_AT_ON = is_function_constant_defined(S2A_AT); constant bool S2A_MSOFF [[function_constant(101)]]; constant bool S2A_MSOFF_ON = is_function_constant_defined(S2A_MSOFF) ? S2A_MSOFF : false; constant bool S2A_FSOUT [[function_constant(102)]]; constant bool S2A_FSOUT_ON = is_function_constant_defined(S2A_FSOUT) ? S2A_FSOUT : false;   // S2Arm S2A_FSOUT: forced-output diagnosis (102 is free in all 3,935 shaders) static inline bool s2a_alpha_pass(int f, float a, float r) { return f == 8 || (f == 2 && a < r) || (f == 3 && a == r) || (f == 4 && a <= r) || (f == 5 && a > r) || (f == 6 && a != r) || (f == 7 && a >= r); }
+constant int S2A_AT [[function_constant(100)]]; constant bool S2A_AT_ON = is_function_constant_defined(S2A_AT); constant bool S2A_MSOFF [[function_constant(101)]]; constant bool S2A_MSOFF_ON = is_function_constant_defined(S2A_MSOFF) ? S2A_MSOFF : false; constant bool S2A_FSOUT [[function_constant(102)]]; constant bool S2A_FSOUT_ON = is_function_constant_defined(S2A_FSOUT) ? S2A_FSOUT : false;   static inline bool s2a_alpha_pass(int f, float a, float r) { return f == 8 || (f == 2 && a < r) || (f == 3 && a == r) || (f == 4 && a <= r) || (f == 5 && a > r) || (f == 6 && a != r) || (f == 7 && a >= r); }   // S2Arm S2A_FSOUT: forced-output diagnosis (102 is free in all 3,935 shaders)
 
 struct _12
 {
