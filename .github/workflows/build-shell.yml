@@ -149,3 +149,94 @@ jobs:
           path: out-shell
           if-no-files-found: error
           retention-days: 7
+
+
+  # 打包期崩溃 A/B/C/D 的证据闸门：只跑诊断包相关单测与「zip 逐字节不变」，不编壳、不动上面 shell 的任何一步。
+  # 放 CI 的原因：团队手上没有 Mac，macOS 的 clang/Foundation 只有这台 runner 有（Windows 上连 clang 都没有）。
+  # 门禁口径：最后一行必须是 DIAG-TESTS: PASS，并且两个 zip sha256 相同。
+  diag-tests:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout this helper repo
+        uses: actions/checkout@v4
+
+      - name: Checkout S2Arm
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.s2arm_repo }}
+          ref: ${{ inputs.s2arm_ref }}
+          path: s2arm
+          persist-credentials: false
+
+      - name: Keep the pristine diagzip.m for the byte-identity check
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd s2arm
+          git rev-parse HEAD | sed 's/^/base commit: /'
+          cp ios/diagzip.m "$RUNNER_TEMP/diagzip.base.m"
+
+      - name: Apply patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd s2arm
+          if [ -n "${{ inputs.patch_in_repo }}" ]; then
+            git -c core.autocrlf=false apply --check -v "$GITHUB_WORKSPACE/${{ inputs.patch_in_repo }}"
+            git -c core.autocrlf=false apply -v "$GITHUB_WORKSPACE/${{ inputs.patch_in_repo }}"
+          fi
+          git status --short
+
+      - name: diagzip unit test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd s2arm
+          bash tests/diagzip_test.sh
+
+      - name: diag contract test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd s2arm
+          bash tests/diag_contract_test.sh
+
+      - name: zip is byte-identical before/after the patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd s2arm
+          W="$(mktemp -d)"
+          mkdir -p "$W/fx/logs" "$W/fx/metrickit"
+          printf '{"schema": 1}\n' > "$W/fx/manifest.json"
+          python3 -c "import sys;open(sys.argv[1],'w').write('诊断包：已生成\n'*5000)" "$W/fx/logs/host.log"
+          printf 'crash\n' > "$W/fx/metrickit/崩溃 一.json"
+          cat > "$W/main.m" <<'M'
+          #import <Foundation/Foundation.h>
+          #include "diagzip.h"
+          int main(int argc, char **argv) { (void)argc; @autoreleasepool { return s2a_write_zip(@(argv[1]), @(argv[2])) ? 0 : 1; } }
+          M
+          build() {   # $1 = diagzip.m, $2 = 输出 zip
+            clang -fobjc-arc -O1 -I ios -o "$W/z" "$W/main.m" "$1" -framework Foundation -lz
+            "$W/z" "$W/fx" "$2"
+          }
+          build "$RUNNER_TEMP/diagzip.base.m" "$W/before.zip"
+          build ios/diagzip.m "$W/after.zip"
+          S1="$(shasum -a 256 "$W/before.zip" | awk '{print $1}')"
+          S2="$(shasum -a 256 "$W/after.zip" | awk '{print $1}')"
+          echo "zip sha256 before (base diagzip.m): $S1  $(stat -f%z "$W/before.zip") B"
+          echo "zip sha256 after  (this patch)    : $S2  $(stat -f%z "$W/after.zip") B"
+          if [ "$S1" != "$S2" ]; then echo "the added log lines changed the zip bytes"; exit 1; fi
+          echo "bytes identical"
+
+      - name: Summary line for the gate
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "DIAG-TESTS: PASS"
+          else
+            echo "DIAG-TESTS: FAIL one of the steps above (see its log; nothing here is a pass by omission)"
+          fi
