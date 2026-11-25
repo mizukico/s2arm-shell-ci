@@ -327,7 +327,24 @@ jobs:
         run: |
           set -euo pipefail
           cd s2arm
-          bash tests/diag_contract_test.sh
+          # rev23 把 salvage tar 改成 opt-in（DM_NVN_SALVAGE_PACK=1）。夹具本身就带 shader_miss 输入，所以这里要验两件事：
+          #   1) 开了开关，两个 tar 仍然进包（能力没丢，收件契约仍然收得下）；
+          #   2) 不设开关，收集器不再产 tar —— 而且"缺这两个 tar"必须是它唯一的失败原因，别的失败不许被这层吞掉。
+          # 注意：getenv 只判非 NULL，设为空串仍会进分支，所以取消必须是 env -u，不能是 VAR= 。
+          echo "=== opt-in run (DM_NVN_SALVAGE_PACK=1) ==="
+          DM_NVN_SALVAGE_PACK=1 bash tests/diag_contract_test.sh
+          echo "=== default run (variable absent) ==="
+          if env -u DM_NVN_SALVAGE_PACK bash tests/diag_contract_test.sh > /tmp/diag_default.log 2>&1; then
+            echo "::error::默认（无 DM_NVN_SALVAGE_PACK）居然也把 salvage tar 打进包了，rev23 的开关没有生效"
+            exit 1
+          fi
+          if ! grep -q '缺 shader_miss/' /tmp/diag_default.log; then
+            echo "::error::默认这次失败的原因不是缺少 salvage tar，说明别的地方也坏了："
+            tail -30 /tmp/diag_default.log
+            exit 1
+          fi
+          grep -o '缺 shader_miss/[^ ]*' /tmp/diag_default.log | head -3 || true
+          echo "SALVAGE-OPTIN: PASS（开开关两个 tar 都在；默认只在缺这两个 tar 上失败）"
 
       - name: zip is byte-identical before/after the patch
         shell: bash
