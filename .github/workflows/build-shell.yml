@@ -99,9 +99,9 @@ jobs:
           # rev22: the env.txt line buffer is 8 KB and the 2 KB one is gone (envfile.c:51), and cblog_note carries
           # exactly one PASSDUMP window gate (nvn_mtl.m:16863). Both facts are asserted on the tree that is built,
           # not on the patch file.
-          L8192=$(grep -c 'char line\[8192\];' "$E")
-          L2048=$(grep -c 'char line\[2048\];' "$E")
-          GATE=$(grep -c 'if (!passdump()) return;' "$F")
+          L8192=$(grep -c 'char line\[8192\];' "$E" || true)
+          L2048=$(grep -c 'char line\[2048\];' "$E" || true)
+          GATE=$(grep -c 'if (!passdump()) return;' "$F" || true)
           echo "line8192=$L8192 line2048=$L2048 window_gate=$GATE"
           test "$L8192" -eq 1
           test "$L2048" -eq 0
