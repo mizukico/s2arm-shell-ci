@@ -108,6 +108,80 @@ jobs:
           test "$GATE" -eq 1
           echo "REV22-SOURCE: PASS"
 
+      - name: Assert the rev23 edits are in the tree the build compiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd s2arm
+          F=graphics/nvn/gfx/nvn/nvn_mtl.m
+          D=ios/diagcollect.m
+          # rev23 只动诊断收集路径，渲染零改动：SNAPRAW 只作用于快照（e.count > 4）、raw 每文件 1 MiB 门限并逐张打
+          # skip 行、salvage tar 改成 DM_NVN_SALVAGE_PACK=1 才打包。断言对象是"要编进壳的那棵树"，不是补丁文件。
+          # grep -F：这些是字面串，正则里的 * ( [ 会让 -c 在无匹配时行为漂移。
+          SNAP_SCOPE=$(grep -cF 'if (e.count > 4 && getenv("DM_NVN_SNAPRAW")) {' "$F" || true); SNAP_SCOPE=${SNAP_SCOPE:-0}
+          THRESH=$(grep -cF 'if (rw * rh * bpp > (1u << 20)) {' "$F" || true); THRESH=${THRESH:-0}
+          SKIPLINE=$(grep -cF 'MLOG("[snapraw] skip ser=%llu %lux%lu %zu B per file (> threshold 1048576; the PNG is still dumped)"' "$F" || true); SKIPLINE=${SKIPLINE:-0}
+          OLD_SCOPE=$(grep -cF 'if (getenv("DM_NVN_SNAPRAW")) {   // Also save the raw' "$F" || true); OLD_SCOPE=${OLD_SCOPE:-0}
+          SALV_GATE=$(grep -cF 'if (getenv("DM_NVN_SALVAGE_PACK")) {' "$D" || true); SALV_GATE=${SALV_GATE:-0}
+          TAR_BUDGET=$(grep -cF 'used + game + n > (10ull << 20)' "$D" || true); TAR_BUDGET=${TAR_BUDGET:-0}
+          OWN_BUDGET=$(grep -cF 'It has its OWN budget: used+game is capped at 10 MiB below' "$D" || true); OWN_BUDGET=${OWN_BUDGET:-0}
+          BAD_NOTE=$(grep -cF '9.58 MB of the 40 MiB diagrun' "$D" || true); BAD_NOTE=${BAD_NOTE:-0}
+          echo "snap_scope=$SNAP_SCOPE threshold=$THRESH skipline=$SKIPLINE old_snapraw_scope=$OLD_SCOPE"
+          echo "salvage_gate=$SALV_GATE tar_budget=$TAR_BUDGET own_budget_note=$OWN_BUDGET wrong_note=$BAD_NOTE"
+          test "$SNAP_SCOPE" -eq 1
+          test "$THRESH" -eq 1
+          test "$SKIPLINE" -eq 1
+          test "$OLD_SCOPE" -eq 0
+          test "$SALV_GATE" -eq 1
+          test "$TAR_BUDGET" -eq 1
+          test "$OWN_BUDGET" -eq 1
+          test "$BAD_NOTE" -eq 0
+          # 括号平衡：去掉注释与字符串后 EOF 深度必须为 0。rev23 上一版就是死在这里，静态检查要永久留在这道闸上。
+          python3 - "$F" "$D" <<'PY'
+          import sys
+          def depth(path):
+              s = open(path, 'rb').read().decode('utf-8', 'replace')
+              i = 0
+              d = 0
+              n = len(s)
+              while i < n:
+                  c = s[i]
+                  if c == '/' and i + 1 < n and s[i+1] == '/':
+                      j = s.find('\n', i)
+                      i = n if j < 0 else j
+                      continue
+                  if c == '/' and i + 1 < n and s[i+1] == '*':
+                      j = s.find('*/', i + 2)
+                      i = n if j < 0 else j + 2
+                      continue
+                  if c == '"' or c == "'":
+                      q = c
+                      i += 1
+                      while i < n:
+                          if s[i] == '\\':
+                              i += 2
+                              continue
+                          if s[i] == q:
+                              i += 1
+                              break
+                          i += 1
+                      continue
+                  if c == '{':
+                      d += 1
+                  elif c == '}':
+                      d -= 1
+                  i += 1
+              return d
+          bad = 0
+          for p in sys.argv[1:]:
+              v = depth(p)
+              print('brace depth %s = %d' % (p, v))
+              if v != 0:
+                  bad = 1
+          sys.exit(bad)
+          PY
+          echo "REV23-SOURCE: PASS"
+
       - name: Regenerate the translation chain header
         shell: bash
         run: |
