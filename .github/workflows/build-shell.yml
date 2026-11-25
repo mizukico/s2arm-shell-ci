@@ -78,13 +78,15 @@ jobs:
           git add -A
           git -c user.name=s2arm-ci -c user.email=ci@local commit -m "ci: host patch + iOS SDK pin ($SDK_MAJOR)" || echo "nothing to commit"
 
-      - name: Assert the rev21b edits are in the tree the build compiles
+      - name: Assert the rev21b / rev22 edits are in the tree the build compiles
         shell: bash
         run: |
           set -euo pipefail
           cd s2arm
           F=graphics/nvn/gfx/nvn/nvn_mtl.m
+          E=runtime/src/envfile.c
           echo "nvn_mtl.m bytes=$(stat -f%z "$F") sha256=$(shasum -a 256 "$F" | cut -d' ' -f1)"
+          echo "envfile.c bytes=$(stat -f%z "$E") sha256=$(shasum -a 256 "$E" | cut -d' ' -f1)"
           echo "vertex call sites=$(grep -c 'cblog_note(pr->sh\[0\], 0)' "$F")"
           echo "out4096=$(grep -c 'char out\[4096\]' "$F")"
           echo "out2048=$(grep -c 'char out\[2048\]' "$F")"
@@ -94,6 +96,17 @@ jobs:
           test "$(grep -c 'char out\[4096\]' "$F")" -eq 1
           test "$(grep -c 'char out\[2048\]' "$F")" -eq 0
           echo "REV21B-SOURCE: PASS"
+          # rev22: the env.txt line buffer is 8 KB and the 2 KB one is gone (envfile.c:51), and cblog_note carries
+          # exactly one PASSDUMP window gate (nvn_mtl.m:16863). Both facts are asserted on the tree that is built,
+          # not on the patch file.
+          L8192=$(grep -c 'char line\[8192\];' "$E")
+          L2048=$(grep -c 'char line\[2048\];' "$E")
+          GATE=$(grep -c 'if (!passdump()) return;' "$F")
+          echo "line8192=$L8192 line2048=$L2048 window_gate=$GATE"
+          test "$L8192" -eq 1
+          test "$L2048" -eq 0
+          test "$GATE" -eq 1
+          echo "REV22-SOURCE: PASS"
 
       - name: Regenerate the translation chain header
         shell: bash
@@ -140,6 +153,27 @@ jobs:
           RC=$?
           kill "$WPID" 2>/dev/null || true
           exit $RC
+
+      - name: Assert envfile.c was compiled and linked into the shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          B="$GITHUB_WORKSPACE/out-shell/root/S2Arm"
+          test -f "$B" || { echo "no shell binary at $B"; exit 1; }
+          echo "shell binary bytes=$(stat -f%z "$B")"
+          # "来源 env.txt" is a format literal that exists only in runtime/src/envfile.c (checked on the historical
+          # packages: it appears exactly once in root/S2Arm). Finding it in this run's linked binary proves the file
+          # the patch changed is the one that got compiled in -- a prebuilt library would not carry it.
+          N=$(LC_ALL=C grep -a -o '来源 env.txt' "$B" | wc -l | tr -d ' ')
+          echo "envfile.c literal '来源 env.txt' in the linked binary: $N"
+          if [ -f "$GITHUB_WORKSPACE/make.log.last" ]; then
+            echo "make.log lines naming envfile.c: $(grep -a -c 'envfile\.c' "$GITHUB_WORKSPACE/make.log.last" || true)"
+            grep -a -n 'envfile\.c' "$GITHUB_WORKSPACE/make.log.last" | head -5 || true
+          else
+            echo "make.log.last absent (the build keeps it only while running)"
+          fi
+          test "$N" -ge 1
+          echo "REV22-ENVFILE: PASS"
 
       - name: Dump make log on failure
         if: failure()
