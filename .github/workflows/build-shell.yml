@@ -78,6 +78,23 @@ jobs:
           git add -A
           git -c user.name=s2arm-ci -c user.email=ci@local commit -m "ci: host patch + iOS SDK pin ($SDK_MAJOR)" || echo "nothing to commit"
 
+      - name: Assert the rev21b edits are in the tree the build compiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd s2arm
+          F=graphics/nvn/gfx/nvn/nvn_mtl.m
+          echo "nvn_mtl.m bytes=$(stat -f%z "$F") sha256=$(shasum -a 256 "$F" | cut -d' ' -f1)"
+          echo "vertex call sites=$(grep -c 'cblog_note(pr->sh\[0\], 0)' "$F")"
+          echo "out4096=$(grep -c 'char out\[4096\]' "$F")"
+          echo "out2048=$(grep -c 'char out\[2048\]' "$F")"
+          # git apply succeeding is not the same as the compiler seeing the edit: assert both on the source
+          # the build step will compile, so "passed the patch gate" cannot stand in for "is in the binary".
+          test "$(grep -c 'cblog_note(pr->sh\[0\], 0)' "$F")" -eq 1
+          test "$(grep -c 'char out\[4096\]' "$F")" -eq 1
+          test "$(grep -c 'char out\[2048\]' "$F")" -eq 0
+          echo "REV21B-SOURCE: PASS"
+
       - name: Regenerate the translation chain header
         shell: bash
         run: |
