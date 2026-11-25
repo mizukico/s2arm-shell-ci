@@ -164,7 +164,8 @@ jobs:
           # "来源 env.txt" is a format literal that exists only in runtime/src/envfile.c (checked on the historical
           # packages: it appears exactly once in root/S2Arm). Finding it in this run's linked binary proves the file
           # the patch changed is the one that got compiled in -- a prebuilt library would not carry it.
-          N=$(LC_ALL=C grep -a -o '来源 env.txt' "$B" | wc -l | tr -d ' ')
+          N=$(LC_ALL=C grep -a -o '来源 env.txt' "$B" | wc -l | tr -d ' ' || true)
+          N=${N:-0}
           echo "envfile.c literal '来源 env.txt' in the linked binary: $N"
           if [ -f "$GITHUB_WORKSPACE/make.log.last" ]; then
             echo "make.log lines naming envfile.c: $(grep -a -c 'envfile\.c' "$GITHUB_WORKSPACE/make.log.last" || true)"
