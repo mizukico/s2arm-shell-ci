@@ -2756,10 +2756,10 @@ index 4c4e7b1..1874936 100644
          lineno++;
          // 去行尾 CR / LF（VALUE 原样取到行尾，只去掉 \r）
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index c4ce1bb..8706139 100644
+index c4ce1bb..6c8a510 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
-@@ -12751,6 +12751,119 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
+@@ -12751,6 +12751,130 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
              }
              slots[aid] = gpu;
              USE((__bridge id<MTLBuffer>)mb, MTLResourceUsageRead);
@@ -2772,47 +2772,56 @@ index c4ce1bb..8706139 100644
 +              //   the material-fog family reads fp_c3[222].z (147 keys, the same keys that carry the `_m0[65].w < 100000` guard) and
 +              //   the geometric shell-fog family reads vp_c4[222].z (52 keys). Measured over the whole shader corpus: every one of those
 +              //   147 reads fp_c3[222].z and nothing else of vec 222, every one of the 52 reads vp_c4[222].z, and 49 MORE fragment
-+              //   shaders read fp_c3[222].z for other purposes -- those are NOT in the table on purpose.
++              //   shaders read fp_c3[222].z for other purposes -- those are NOT in the table on purpose. The two tables are disjoint.
 +              //   The block is located per key from its own json (bindings: fp_c3 -> reg, 147/147 reg 0 today; vp_c4 -> reg, 52/52
 +              //   reg 1 today; the mask keeps a key whose reg moves), the byte offset is 222*16 + 2*4 = 3560 in both, the game's memory
 +              //   is never written, alpha is untouched, and the length handed to the shader's bounds table is shrunk to the shadow
 +              //   (ubcap) so that table can never describe bytes our buffer does not have.
-+              //   This changes a game value; it is not a bug fix. Default off, diagnostic builds only.
-+              static const char *fogtab3 ="00fd1a8ebb3acd4a:1,01b976be3922943e:1,05a217eb68b3b92f:1,062988469e474faf:1,063b10d97229311f:1,06a97901c5cc49d8:1",
-+                      "09d1b0498b8cf021:1,09f5efc67f3e968b:1,0b4e8f5ba704b1f5:1,0d7ef6e6d10a48fb:1,0d8fd2c3babd6483:1,0f7fdcfbd0b662f4:1",
-+                      "13554943eff450c2:1,159bbce41b5c8be6:1,15bf6e025143daad:1,15f7e16c794943dc:1,1647e717a02038c4:1,16bc15afeb044384:1",
-+                      "1710e5785d4f749e:1,17aa5309fbc999f1:1,19ba51780a5e719b:1,1b0744cc9a3abfdd:1,1d7c381976e0eacf:1,1ee582eaa9b5461f:1",
-+                      "2007159dae36e6c7:1,21bf194275ea2370:1,238d728d3d5c4b55:1,2549175b48f9dd22:1,2d5c9cee9608b1b3:1,34e54693ab1adc9c:1",
-+                      "36310803131ac0b6:1,37b86ed41b6a3315:1,3820734bd7ba3107:1,39ab902bc44e1374:1,3d04ca764b6fefb1:1,3fc055a6098126bf:1",
-+                      "40aea3a44c0292d4:1,42030141b8663f64:1,424f9a1d48b98604:1,4269937712c9e1cc:1,432ebcb01cd433f9:1,4386f9c06e61c5df:1",
-+                      "49d5a4d7e7f7f874:1,505facb73bce4d63:1,534391aa2b9fa94a:1,5467b726d9e75478:1,546b027e372a0a28:1,54b4be31360f938c:1",
-+                      "55d409a35437eef8:1,568901cddfc2d95d:1,5760cadf6ecf2f2c:1,587f3abc2818d2e2:1,5ab09d7b508451e7:1,5c2f9a33437b5f0d:1",
-+                      "60ec47c35996e523:1,644a02603336f4dc:1,6503847447e6a109:1,652a6c6b107d55ee:1,6867722fa50e25ac:1,68e821bc0db874d7:1",
-+                      "693b05d92c4ee9d0:1,6a765ea29e04a144:1,6a785c10568580b6:1,6aba2b0d586e7765:1,6bb9fb470bab0950:1,6c00eb91c54f9451:1",
-+                      "712f912d2b296f54:1,71d10201ce019cec:1,7320e6c9878693fa:1,767735395d896423:1,770893213b26fc06:1,77b3b9bb4909421d:1",
-+                      "77e058a6e93e615c:1,788a6432bd8ebaf4:1,78ca669964360b46:1,7c96dff65c4abdf7:1,7ccaca6f53004c59:1,7d7271e5389ff3bf:1",
-+                      "80f38c356dbcdd41:1,81566174d2d3f66e:1,84c6cbb56b88f0ea:1,8696c81a1b2620c5:1,87b29a2b3bf825f2:1,87efdd18aca9af8c:1",
-+                      "88c4535fc2d12b1d:1,8e4ad8a13590b1bd:1,8f8e169e144ce7b0:1,9060083b2e2a25c4:1,94ec5f4432072104:1,95bdb97695641ff3:1",
-+                      "96b750499492d6e5:1,97bbf693be3cb1fd:1,9804fcfa8de7659d:1,9dcd556a4f95676c:1,a070bba025d1a4fe:1,a11e52c6d1657110:1",
-+                      "a28ede79fbd1a71a:1,a3d62f6a2ebd48bd:1,a45396b9f36feda6:1,a744ad2cfd0c3348:1,a9735bbce86c5743:1,aa454864d49417cc:1",
-+                      "ad84cd4676521115:1,aeb10c638d9f11c4:1,b1027ad7a352f026:1,b60c287b2e9cbb8a:1,b65e378fb672e051:1,b7bcebf7b0f35f2a:1",
-+                      "b9720b7cd1915ba0:1,bb72c48f3bab5a9d:1,bc4ed0940cbbe9bb:1,bc657058bc216d94:1,bce2d519c9106b72:1,c2957874abc638d9:1",
-+                      "c3364849b959023a:1,c35efedb4b9afb45:1,c54c1ae53e35cee6:1,c56678347673c123:1,c6f89be31f86a03e:1,c7a0b3c7a2298e01:1",
-+                      "cb33c631fb8a3bc6:1,cbd6b862dc96cbf1:1,cc14cbbfa56cf653:1,cfab52c847351e45:1,d1e6251e3a02f82a:1,d55f6145f1c310cd:1",
-+                      "d5c929dcfbabd0e7:1,d7a6f81d86e243aa:1,d8b1cfe88da8be85:1,d92fd988e3442275:1,db50030b63f8aab0:1,db6f14ad0920d600:1",
-+                      "e1d7735de8377831:1,e27f9df1747f3172:1,e49ccf9fb5af9697:1,e6d82cb85de69679:1,eaa85716c849777e:1,eb9c9fa6db29e040:1",
-+                      "eb9da3172c85f754:1,ec3af25978a89698:1,ecc4d017318b36e0:1,f1aeae9e3963c649:1,f1cdb1c3b1101db2:1,f3f2ead6d7b55166:1",
-+                      "f72d055a258367c4:1,f8faa6a7f1db2f3e:1,fc58ca1bd98fb749:1";
++              //   This changes a game value; it is not a bug fix. Default off, diagnostic builds only. A non-positive r is refused
++              //   (the switch does not take effect) rather than inverting the ramp.
++              static const char *fogtab3 =
++                      "00fd1a8ebb3acd4a:1,01b976be3922943e:1,05a217eb68b3b92f:1,062988469e474faf:1,063b10d97229311f:1,"
++                      "06a97901c5cc49d8:1,09d1b0498b8cf021:1,09f5efc67f3e968b:1,0b4e8f5ba704b1f5:1,0d7ef6e6d10a48fb:1,"
++                      "0d8fd2c3babd6483:1,0f7fdcfbd0b662f4:1,13554943eff450c2:1,159bbce41b5c8be6:1,15bf6e025143daad:1,"
++                      "15f7e16c794943dc:1,1647e717a02038c4:1,16bc15afeb044384:1,1710e5785d4f749e:1,17aa5309fbc999f1:1,"
++                      "19ba51780a5e719b:1,1b0744cc9a3abfdd:1,1d7c381976e0eacf:1,1ee582eaa9b5461f:1,2007159dae36e6c7:1,"
++                      "21bf194275ea2370:1,238d728d3d5c4b55:1,2549175b48f9dd22:1,2d5c9cee9608b1b3:1,34e54693ab1adc9c:1,"
++                      "36310803131ac0b6:1,37b86ed41b6a3315:1,3820734bd7ba3107:1,39ab902bc44e1374:1,3d04ca764b6fefb1:1,"
++                      "3fc055a6098126bf:1,40aea3a44c0292d4:1,42030141b8663f64:1,424f9a1d48b98604:1,4269937712c9e1cc:1,"
++                      "432ebcb01cd433f9:1,4386f9c06e61c5df:1,49d5a4d7e7f7f874:1,505facb73bce4d63:1,534391aa2b9fa94a:1,"
++                      "5467b726d9e75478:1,546b027e372a0a28:1,54b4be31360f938c:1,55d409a35437eef8:1,568901cddfc2d95d:1,"
++                      "5760cadf6ecf2f2c:1,587f3abc2818d2e2:1,5ab09d7b508451e7:1,5c2f9a33437b5f0d:1,60ec47c35996e523:1,"
++                      "644a02603336f4dc:1,6503847447e6a109:1,652a6c6b107d55ee:1,6867722fa50e25ac:1,68e821bc0db874d7:1,"
++                      "693b05d92c4ee9d0:1,6a765ea29e04a144:1,6a785c10568580b6:1,6aba2b0d586e7765:1,6bb9fb470bab0950:1,"
++                      "6c00eb91c54f9451:1,712f912d2b296f54:1,71d10201ce019cec:1,7320e6c9878693fa:1,767735395d896423:1,"
++                      "770893213b26fc06:1,77b3b9bb4909421d:1,77e058a6e93e615c:1,788a6432bd8ebaf4:1,78ca669964360b46:1,"
++                      "7c96dff65c4abdf7:1,7ccaca6f53004c59:1,7d7271e5389ff3bf:1,80f38c356dbcdd41:1,81566174d2d3f66e:1,"
++                      "84c6cbb56b88f0ea:1,8696c81a1b2620c5:1,87b29a2b3bf825f2:1,87efdd18aca9af8c:1,88c4535fc2d12b1d:1,"
++                      "8e4ad8a13590b1bd:1,8f8e169e144ce7b0:1,9060083b2e2a25c4:1,94ec5f4432072104:1,95bdb97695641ff3:1,"
++                      "96b750499492d6e5:1,97bbf693be3cb1fd:1,9804fcfa8de7659d:1,9dcd556a4f95676c:1,a070bba025d1a4fe:1,"
++                      "a11e52c6d1657110:1,a28ede79fbd1a71a:1,a3d62f6a2ebd48bd:1,a45396b9f36feda6:1,a744ad2cfd0c3348:1,"
++                      "a9735bbce86c5743:1,aa454864d49417cc:1,ad84cd4676521115:1,aeb10c638d9f11c4:1,b1027ad7a352f026:1,"
++                      "b60c287b2e9cbb8a:1,b65e378fb672e051:1,b7bcebf7b0f35f2a:1,b9720b7cd1915ba0:1,bb72c48f3bab5a9d:1,"
++                      "bc4ed0940cbbe9bb:1,bc657058bc216d94:1,bce2d519c9106b72:1,c2957874abc638d9:1,c3364849b959023a:1,"
++                      "c35efedb4b9afb45:1,c54c1ae53e35cee6:1,c56678347673c123:1,c6f89be31f86a03e:1,c7a0b3c7a2298e01:1,"
++                      "cb33c631fb8a3bc6:1,cbd6b862dc96cbf1:1,cc14cbbfa56cf653:1,cfab52c847351e45:1,d1e6251e3a02f82a:1,"
++                      "d55f6145f1c310cd:1,d5c929dcfbabd0e7:1,d7a6f81d86e243aa:1,d8b1cfe88da8be85:1,d92fd988e3442275:1,"
++                      "db50030b63f8aab0:1,db6f14ad0920d600:1,e1d7735de8377831:1,e27f9df1747f3172:1,e49ccf9fb5af9697:1,"
++                      "e6d82cb85de69679:1,eaa85716c849777e:1,eb9c9fa6db29e040:1,eb9da3172c85f754:1,ec3af25978a89698:1,"
++                      "ecc4d017318b36e0:1,f1aeae9e3963c649:1,f1cdb1c3b1101db2:1,f3f2ead6d7b55166:1,f72d055a258367c4:1,"
++                      "f8faa6a7f1db2f3e:1,fc58ca1bd98fb749:1";
 +              static const char *vstab3 =
-+                      "0173240dc516c1ab:2,02bbd1a05a1b3cb2:2,0ad70b00661215e5:2,0d8101fbc15257a1:2,17d7c07ac3aeeea1:2,1ac8b9256cce0089:2,"
-+                      "2553a68cda99a32c:2,2808eb75f00d916c:2,28206c7c557777e7:2,2a2ed93f43172edd:2,35c92d36e92216eb:2,43e27263e3a5bffe:2,"
-+                      "4b16907b86a11e00:2,4cd4c046948b5602:2,5223c6fe5db61ffc:2,5deddbe2acdf7c25:2,5e32b61d9ba505e2:2,6493e70ab5775c92:2,"
-+                      "66e86ed4ec0fb36b:2,6c65069cbef44dcd:2,6c7a9d671ca3d2ce:2,737d563abff2b1c4:2,7820060f956a158a:2,78f0179ed95aa019:2,"
-+                      "7f9c403901404c7d:2,8ff088935c581866:2,930f45868734feab:2,93ea7ea7d5a374a3:2,9db7f7da544942ce:2,a51ceccf89ae05a3:2,"
-+                      "a8fd251ff77558c1:2,aa7e988245a9598c:2,ac848595e7432852:2,ad141cc6ae1e8006:2,b19146b314447a2e:2,b3e193aba56f74b8:2,"
-+                      "baf2015902bda489:2,bc24f790b134efe5:2,cebbe756523f4001:2,d27b3b8debd1c1f0:2,e0b56a6304432f12:2,e5ff93db8fd74193:2,"
-+                      "e883d27a65420b1a:2,e90afd1da7ba14b4:2,ead6651e405409f5:2,f1d5bfe0b78056be:2,f2230b2d05ee9e63:2,f3d0302248d41116:2,"
-+                      "f5c8b5b002b8d857:2,f9bc27f6e067054a:2,fc417d256ea14b1e:2,fe04524d04d9e5ea:2";
++                      "0173240dc516c1ab:2,02bbd1a05a1b3cb2:2,0ad70b00661215e5:2,0d8101fbc15257a1:2,17d7c07ac3aeeea1:2,"
++                      "1ac8b9256cce0089:2,2553a68cda99a32c:2,2808eb75f00d916c:2,28206c7c557777e7:2,2a2ed93f43172edd:2,"
++                      "35c92d36e92216eb:2,43e27263e3a5bffe:2,4b16907b86a11e00:2,4cd4c046948b5602:2,5223c6fe5db61ffc:2,"
++                      "5deddbe2acdf7c25:2,5e32b61d9ba505e2:2,6493e70ab5775c92:2,66e86ed4ec0fb36b:2,6c65069cbef44dcd:2,"
++                      "6c7a9d671ca3d2ce:2,737d563abff2b1c4:2,7820060f956a158a:2,78f0179ed95aa019:2,7f9c403901404c7d:2,"
++                      "8ff088935c581866:2,930f45868734feab:2,93ea7ea7d5a374a3:2,9db7f7da544942ce:2,a51ceccf89ae05a3:2,"
++                      "a8fd251ff77558c1:2,aa7e988245a9598c:2,ac848595e7432852:2,ad141cc6ae1e8006:2,b19146b314447a2e:2,"
++                      "b3e193aba56f74b8:2,baf2015902bda489:2,bc24f790b134efe5:2,cebbe756523f4001:2,d27b3b8debd1c1f0:2,"
++                      "e0b56a6304432f12:2,e5ff93db8fd74193:2,e883d27a65420b1a:2,e90afd1da7ba14b4:2,ead6651e405409f5:2,"
++                      "f1d5bfe0b78056be:2,f2230b2d05ee9e63:2,f3d0302248d41116:2,f5c8b5b002b8d857:2,f9bc27f6e067054a:2,"
++                      "fc417d256ea14b1e:2,fe04524d04d9e5ea:2";
 +              if (rs == -2) {
 +                  const char *e = getenv("S2A_FOG_START_R"), *l = getenv("S2A_FOG_LOOP"), *d = getenv("DM_NVN_DEPTHOVR"),
 +                             *k = getenv("S2A_FOG_SCALE"), *g = getenv("S2A_FOG_GATE_W");
@@ -2830,10 +2839,12 @@ index c4ce1bb..8706139 100644
 +                  if (e && *e) {
 +                      if ((l && *l) || (d && *d) || (k && *k) || (g && *g)) { rs = -3;
 +                          RED_ONCE(182, "fog start: S2A_FOG_START_R is set together with another behaviour switch, and one behaviour switch per run is the rule: it does not take effect"); }
-+                      else { rs = 1; rsv = strtof(e, NULL);
-+                          MLOG("fog start: ON r=%g tables fs=%d vs=%d (sizes of the key lists, NOT matched counts), target byte offset 3560 = vec222.z in both stages", (double)rsv, rs_fn, rs_vn);
-+                          MLOG("fog start: fs=fp_c3[222].z of the material-fog family (147 keys), vs=vp_c4[222].z of the shell-fog family (52 keys); 49 other fragment shaders read the same slot for other purposes and stay untouched; block shadow-copied per draw, the game's memory is never written, alpha untouched");
-+                          if (!(rsv > 0.0f)) MLOG("\xe3\x80\x90\xe7\xba\xa2\xe3\x80\x91 fog start: r=%g is not positive, so (d - r) inverts the ramp and nothing sensible can come out", (double)rsv); } } }
++                      else { rsv = strtof(e, NULL);
++                          if (!(rsv > 0.0f)) { rs = -4;
++                              RED_ONCE(183, "fog start: r=%g is not positive, so (d - r) would invert the ramp: the switch does not take effect", (double)rsv); }
++                          else { rs = 1;
++                              MLOG("fog start: ON r=%g tables fs=%d vs=%d (sizes of the key lists, NOT matched counts), target byte offset 3560 = vec222.z in both stages", (double)rsv, rs_fn, rs_vn);
++                              MLOG("fog start: fs=fp_c3[222].z of the material-fog family (147 keys), vs=vp_c4[222].z of the shell-fog family (52 keys); 49 other fragment shaders read the same slot for other purposes and stay untouched; block shadow-copied per draw, the game's memory is never written, alpha untouched"); } } } }
 +              if (rs == 1) {
 +                  const uint64_t kk = (sh && sh->key[0]) ? strtoull(sh->key, NULL, 16) : 0;
 +                  int mi = -1;
