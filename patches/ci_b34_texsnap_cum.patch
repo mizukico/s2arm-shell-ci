@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index 64d36fd..2f8bd19 100644
+index 64d36fd..6145aa1 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
 @@ -749,6 +749,8 @@ static int present_link_from_env(void) {
@@ -2213,7 +2213,13 @@ index 64d36fd..2f8bd19 100644
      if (g_defer_ab >= 0 && getenv("DM_NVN_DEFER_AB") && !strcmp(getenv("DM_NVN_DEFER_AB"), "1") && ok) { static int shots; if (++shots == 2) { g_defer_ab_on = 1; MLOG("DM_NVN_DEFER_AB: second screenshot written; deferred pass merging on"); } }
      if (g_udc_ab >= 0 && getenv("DM_NVN_UDC_AB") && !strcmp(getenv("DM_NVN_UDC_AB"), "1") && ok) {
          static int shots;
-@@ -17415,6 +19068,62 @@ static long g_td_frame = -2; static const char *g_td_path; static NSMutableArray
+@@ -17412,9 +19065,68 @@ static void shot(id<MTLTexture> src, const char *path, int screen, const int cro
+ // ---------- DM_NVN_TEXDUMP=frame[,frame...]:path (%d remains "serial*100+layer*10+mip level"): save each selected guest frame's color targets ----------
+ // Diagnostic: before the first render pass of the next frame is opened, wait for the GPU to finish, then draw each one (the mip level used by that frame) by full-screen sampling into RGBA8 and save as PNG (float formats are clamped to [0,1])
+ static long g_td_frame = -2; static const char *g_td_path; static NSMutableArray *g_td_list; static int g_td_done;
++// DM_NVN_TEXSNAP_FRAMES: declared here because td_note() below already consults it (it re-checks whether an output
++// path exists once DM_NVN_TEXDUMP has been parsed). Definitions stay with the rest of the TEXSNAP code further down.
++static int g_tsf_n;
  static char *g_td_owned_path;
  static NSIndexSet *g_td_frames;   // only the explicit comma-list mode; sorted and deduplicated
  static NSMutableArray *g_td_3d;   // 3D textures sampled in the selected frame: @[texture, serial] (at most 16; saved by td_dump as slice atlases)
@@ -2276,7 +2282,7 @@ index 64d36fd..2f8bd19 100644
  static void td_note_3d(id<MTLTexture> t, uint64_t ser) {
      if (g_td_done || (long)atomic_load(&g_cur_frame) != g_td_frame) return;
      if (!g_td_3d) g_td_3d = [NSMutableArray array];
-@@ -17436,6 +19145,280 @@ static void td_clear(int pending_gpu) {
+@@ -17436,6 +19148,280 @@ static void td_clear(int pending_gpu) {
      for (NSArray *e in g_td_list) if (e.count > 4) { if (pending_gpu) defer_obj_release(e[0]); else res_remove(e[0]); }
      [g_td_list removeAllObjects];
      [g_td_3d removeAllObjects];   // 3D textures are the game's own (no copy): just forget them
@@ -2557,7 +2563,7 @@ index 64d36fd..2f8bd19 100644
  }
  // DM_NVN_TEXDUMP=size=WxH:path instead picks the frame by content: the first frame that opens a render pass whose first color attachment level is WxH (for one-off work whose frame differs between runs)
  static unsigned g_td_w, g_td_h;
-@@ -17451,7 +19434,16 @@ void td_note(MTL4RenderPassDescriptor *pd, NSUInteger nc) {
+@@ -17451,7 +19437,16 @@ void td_note(MTL4RenderPassDescriptor *pd, NSUInteger nc) {
              }
              if (!frames.count || !c[1]) MDIE("invalid DM_NVN_TEXDUMP frame list: %s", e);
              g_td_frames = frames; g_td_frame = (long)frames.firstIndex;
@@ -2574,7 +2580,7 @@ index 64d36fd..2f8bd19 100644
      if (g_td_frame < 0 || g_td_done) return;
      long f = (long)atomic_load(&g_cur_frame);
      if (g_td_frame == LONG_MAX) { id<MTLTexture> t0 = nc ? pd.colorAttachments[0].texture : nil; NSUInteger lv = pd.colorAttachments[0].level;
-@@ -17484,18 +19476,25 @@ static void td_dump(void) {
+@@ -17484,18 +19479,25 @@ static void td_dump(void) {
      g_td_done = 1;
      rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
      mtl_finish_gpu();
@@ -2602,7 +2608,7 @@ index 64d36fd..2f8bd19 100644
          MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sp = [g_dev newSamplerStateWithDescriptor:sd];
          if (!ps) { MLOG("【红】 TEXDUMP pipeline failed %s", e.localizedDescription.UTF8String); td_clear(0); return; }
          // Integer targets (G-buffer normals / material IDs): a float view reads them as undefined (shows black); read the integer and show 0-255 per channel (signed: +128)
-@@ -17520,6 +19519,7 @@ static void td_dump(void) {
+@@ -17520,6 +19522,7 @@ static void td_dump(void) {
              if (k < 2) ps_i[k] = p; else ps_3d[k - 2] = p;
          }
          if (!il || !ps_i[0] || !ps_i[1] || !ps_3d[0] || !ps_3d[1] || !ps_3d[2]) MLOG("【红】 TEXDUMP integer / 3D pipelines failed %s (those targets are dumped as float)", e.localizedDescription.UTF8String);
@@ -2610,7 +2616,7 @@ index 64d36fd..2f8bd19 100644
      }
      MLOG("[texdump] frame %ld: %lu color targets", g_td_frame, (unsigned long)g_td_list.count);
      // DM_NVN_TEXRAW=index,...: save raw bytes by texture index (including 3D; file: %d in the path is replaced with the index, suffix .raw, first-line text header: width height depth format bytes-per-row)
-@@ -17546,18 +19546,29 @@ static void td_dump(void) {
+@@ -17546,18 +19549,29 @@ static void td_dump(void) {
      for (NSArray *e in g_td_list) {
          id<MTLTexture> t = e[0]; uint64_t ser = [e[1] unsignedLongLongValue]; NSUInteger lv = [e[2] unsignedIntegerValue], sl = [e[3] unsignedIntegerValue];
          // 2D arrays are saved by the attached layer (file index ser*100 + layer*10 + level; layer 0 is named like 2D)
@@ -2645,7 +2651,7 @@ index 64d36fd..2f8bd19 100644
          }
          id<MTLTexture> v = [t newTextureViewWithPixelFormat:t.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(lv, 1) slices:NSMakeRange(sl, 1)];
          NSUInteger w = MAX(t.width >> lv, 1u), h = MAX(t.height >> lv, 1u);
-@@ -17584,6 +19595,13 @@ static void td_dump(void) {
+@@ -17584,6 +19598,13 @@ static void td_dump(void) {
          int cls = mtl_pf_dpf(t.pixelFormat); id<MTLRenderPipelineState> use = ps_3d[cls == NVN_DPF_UINT ? 1 : cls == NVN_DPF_SINT ? 2 : 0];
          NSUInteger W = t.width, H = t.height, D = t.depth, cols = MIN(D, (NSUInteger)16), rows = (D + cols - 1) / cols;
          if (!use || W * cols > 8192 || H * rows > 8192) { MLOG("[texdump] 3D ser=%llu %lux%lux%lu format %lu: not saved (%s)", ser, (unsigned long)W, (unsigned long)H, (unsigned long)D, (unsigned long)t.pixelFormat, use ? "atlas too large" : "no pipeline"); continue; }
@@ -2659,7 +2665,7 @@ index 64d36fd..2f8bd19 100644
          for (uint32_t a = 0; a < 2; a++) {
              MTLTextureDescriptor *od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:W * cols height:H * rows mipmapped:NO];
              od.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; od.storageMode = MTLStorageModePrivate;
-@@ -17602,6 +19620,144 @@ static void td_dump(void) {
+@@ -17602,6 +19623,144 @@ static void td_dump(void) {
              MLOG("[texdump] 3D ser=%llu %lux%lux%lu format %lu (%s) → %lu slices per row", ser, (unsigned long)W, (unsigned long)H, (unsigned long)D, (unsigned long)t.pixelFormat, a ? "alpha" : "rgb", (unsigned long)cols);
              shot(o, path, 0, NULL);
          }
@@ -2804,14 +2810,14 @@ index 64d36fd..2f8bd19 100644
      }
      td_clear(0);
  }
-@@ -17609,14 +19765,139 @@ static void td_dump(void) {
+@@ -17609,14 +19768,139 @@ static void td_dump(void) {
  // (the same target is often cleared and reused within a frame, so the end-of-frame state cannot reflect the output of intermediate passes); saved as <TEXDUMP path with %d = 0>_s<in-frame index>_<serial>_<level>.png
  static int g_ts_idx[64], g_ts_n = -1, g_ts_on; static uint64_t g_ts_first, g_ts_curf = ~0ull;
  static __strong id<MTLTexture> g_ts_att[8]; static uint64_t g_ts_ser[8]; static NSUInteger g_ts_lv[8]; static int g_ts_na;
 +// DM_NVN_TEXSNAP_FRAMES=3600,3601: frame selection for TEXSNAP on its own (read-only key).
 +// It never reads or writes g_td_frame / g_td_done / g_td_list: a snapshot must not depend on DM_NVN_TEXDUMP,
 +// otherwise td_note advancing the dump frame inside one frame silently drops that frame's snapshots.
-+static long g_tsf_set[32]; static int g_tsf_n = -1;   // -1 = not parsed yet, 0 = off (legacy dump-driven behaviour)
++static long g_tsf_set[32];   // g_tsf_n itself: -1 = not parsed yet, 0 = off (legacy dump-driven behaviour); declared above
 +static long g_tsf_captured = -1;                      // frame the pending snapshot attachments belong to
 +static void tsf_init(void) {
 +    g_tsf_n = 0;
@@ -2946,7 +2952,7 @@ index 64d36fd..2f8bd19 100644
      for (NSUInteger i = 0; i < nc && i < 8; i++) { id<MTLTexture> t = pd.colorAttachments[i].texture; if (!t) continue;
          g_ts_att[g_ts_na] = t; g_ts_ser[g_ts_na] = R.rt.color[i] ? R.rt.color[i]->serial : 0; g_ts_lv[g_ts_na] = pd.colorAttachments[i].level; g_ts_na++; }
  }
-@@ -17632,7 +19913,14 @@ void ts_after(void) {
+@@ -17632,7 +19916,14 @@ void ts_after(void) {
          id<MTLTexture> c = [g_dev newTextureWithDescriptor:d]; res_add(c);
          NSUInteger lv = g_ts_lv[i], w = MAX((NSUInteger)1, t.width >> lv), h = MAX((NSUInteger)1, t.height >> lv);
          enc_b_copy_texture(blit(), t, 0, lv, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, 1), c, 0, lv, MTLOriginMake(0, 0, 0));
