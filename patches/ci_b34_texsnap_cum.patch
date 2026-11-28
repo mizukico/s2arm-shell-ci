@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index 64d36fd..6145aa1 100644
+index 64d36fd..e5384e7 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
 @@ -749,6 +749,8 @@ static int present_link_from_env(void) {
@@ -2219,7 +2219,7 @@ index 64d36fd..6145aa1 100644
  static long g_td_frame = -2; static const char *g_td_path; static NSMutableArray *g_td_list; static int g_td_done;
 +// DM_NVN_TEXSNAP_FRAMES: declared here because td_note() below already consults it (it re-checks whether an output
 +// path exists once DM_NVN_TEXDUMP has been parsed). Definitions stay with the rest of the TEXSNAP code further down.
-+static int g_tsf_n;
++static int g_tsf_n = -1;   // -1 = not parsed yet (ts_note() calls tsf_init() on it), 0 = off
  static char *g_td_owned_path;
  static NSIndexSet *g_td_frames;   // only the explicit comma-list mode; sorted and deduplicated
  static NSMutableArray *g_td_3d;   // 3D textures sampled in the selected frame: @[texture, serial] (at most 16; saved by td_dump as slice atlases)
@@ -2817,7 +2817,7 @@ index 64d36fd..6145aa1 100644
 +// DM_NVN_TEXSNAP_FRAMES=3600,3601: frame selection for TEXSNAP on its own (read-only key).
 +// It never reads or writes g_td_frame / g_td_done / g_td_list: a snapshot must not depend on DM_NVN_TEXDUMP,
 +// otherwise td_note advancing the dump frame inside one frame silently drops that frame's snapshots.
-+static long g_tsf_set[32];   // g_tsf_n itself: -1 = not parsed yet, 0 = off (legacy dump-driven behaviour); declared above
++static long g_tsf_set[32];   // g_tsf_n is defined above (L19070), before td_note() reads it
 +static long g_tsf_captured = -1;                      // frame the pending snapshot attachments belong to
 +static void tsf_init(void) {
 +    g_tsf_n = 0;
