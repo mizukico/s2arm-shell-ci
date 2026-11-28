@@ -1,0 +1,110 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 12e33a9..be23c07 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -16309,6 +16309,32 @@ static void alpha_ref_bind(id en, NvShader *fs) {
+     __unsafe_unretained id<MTLBuffer> b; size_t o = arena_alloc_u(sizeof S.alpha_ref, &b); memcpy((uint8_t *)b.contents + o, &S.alpha_ref, sizeof S.alpha_ref);
+     enc_r_args(en, MTLRenderStageFragment, b.gpuAddress + o, 30);
+ }
++// S2A_FOG_A (stage A): Dsh.cs FsFogA appends `constant float* s2a_fog [[buffer(31)]]` to 6c00eb91's
++//   fragment entry and adds c5[125].xyz to _969/_965/_967. This is where that pointer gets its value.
++//   env is read once at start-up, 0 or 1 only: any other value is rejected and treated as 0, so the
++//   key can never act as a free float multiplier. 0 = the MSL does not contain the declaration at all.
++//   The value rides the argument table like alpha_ref does (enc_r_args), not a classic binding path.
++static int g_fog_a = -1; static int g_fog_a_applied;
++static int fog_a_on(void) {
++    if (g_fog_a >= 0) return g_fog_a;
++    g_fog_a = 0;
++    const char *e = getenv("S2A_FOG_A");
++    if (e && *e) {
++        char *end = NULL; long v = strtol(e, &end, 10);
++        if (end == e || (end && *end) || (v != 0 && v != 1))
++            MLOG("[S2A_FOG_A] %s rejected (only 0 or 1 accepted): treated as 0", e);
++        else if (v == 1) { g_fog_a = 1; MLOG("[S2A_FOG_A] 1: fog add-term on (fragment slot %d = 1.0)", 31); }
++        else MLOG("[S2A_FOG_A] 0: fog add-term off");
++    }
++    return g_fog_a;
++}
++static void fog_a_bind(id en) {   // called for every draw of the fragment stage; the pointer must be there or the pipeline reads garbage
++    if (!fog_a_on()) return;
++    if (!g_fog_a_applied) { g_fog_a_applied = 1; MLOG("[S2A_FOG_A] bound to fragment slot %d at first draw", 31); }
++    __unsafe_unretained id<MTLBuffer> b; static const float one = 1.0f; size_t o = arena_alloc_u(sizeof one, &b);
++    memcpy((uint8_t *)b.contents + o, &one, sizeof one);
++    enc_r_args(en, MTLRenderStageFragment, b.gpuAddress + o, 31);
++}
+ static int draw_pass_state(id en, NvShader *fs) {   // en: the render encoder (typed id: enc_r_dss and friends take the Metal 4 type; naming it here would add an unguarded Metal 4 symbol, tools/avail_count.sh)
+     static id<MTLDepthStencilState> cur_ds; static uint64_t cur_ds_pass;
+     // Diagnostic DM_NVN_DEPTHOVR=fragment shader key prefix,...: those draws compare depth with ALWAYS, which tells "the depth test rejects every fragment" from "nothing rasterizes" (with DM_NVN_HILITE); unset = unchanged
+@@ -16875,6 +16901,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
+     enc_r_half_mask(en, cur_ps_round);
+     if (!draw_pass_state(en, pr->sh[1])) return;   // depth-stencil / viewport / scissor / cull / ... (shared with tess_draw ④): 0 = this draw draws nothing
+     alpha_ref_bind(en, pr->sh[1]);   // gap family 34
++    fog_a_bind(en);   // S2A_FOG_A: fragment slot 31 (no-op unless the env is 1)
+     if (!g_mtk.on) bind_vbufs(en, pr->sh[0]);   // a task / mesh draw fetches no vertices
+     if (pr->sh[0]) vconv_bind(en, pr->sh[0], 0, dw, di);   // integer inputs fed float-type formats or 8 / 16-bit integers of the other sign (see vconv_ncomp, vconv_int)
+     g_kd_force = kd_draw(pr, dw, di);
+diff --git a/graphics/tools/direct/dsh/Dsh.cs b/graphics/tools/direct/dsh/Dsh.cs
+index a6b9742..82e9c4f 100644
+--- a/graphics/tools/direct/dsh/Dsh.cs
++++ b/graphics/tools/direct/dsh/Dsh.cs
+@@ -439,6 +439,7 @@ namespace S2A.Dsh
+                 }
+                 // 片元：Alpha 测试与多重采样关的可选函数常量（FsAlphaMs，族 34 / 37）进库里的主入口；src 不带它（反射、可读瓦片 _bf、输出类型 _ft 照旧读 src）
+                 string srcx = stage == "ps" ? FsAlphaMs(src) : src;
++                if (stage == "ps") srcx = FsFogA(Key, srcx);   // S2A_FOG_A：雾加性项（只在 env=1 且 key 是 6c00eb91 时生成）
+                 if (stage == "ps") full = srcx;
+                 var (fu, uMask) = stage == "ps" ? FsUint(srcx, colorAnalysis) : (null, 0u);
+                 if (fu != null) { plain = srcx; full = fu; }
+@@ -1239,6 +1240,52 @@ namespace S2A.Dsh
+             return outp[..u2] + "\n" + FC_DECL + "\n" + outp[u2..];
+         }
+ 
++        // ---- S2A_FOG_A：阶段 A 的雾加性项（只给 6c00eb91 这一支，只在 env=1 时生成）----
++        // 独立于 FsAlphaMs：后者 L1223 有 src.Contains("S2A_AT_ON") -> return src，
++        // 而本支的 MSL 自带 S2A_AT_ON 声明，挂在那里注入会静默失效。
++        // 落点：_671<1.0 块内、65.w 块外（缩进 8、L1136 的 "float _1113 = _963;" 之前）。
++        // 三行加的是全额 c5[125].xyz，之后仍只乘一次 c3[140].y（L1137-1139）。
++        internal const int FOG_SLOT = 31;   // 片元缓冲槽 31：盘上已占 0 / 8 / 13 / 26 / 27 / 28 / 29 / 30，31 空闲
++        internal const string FOG_KEY = "6c00eb91c54f9451";   // Key 恒为 16 位小写十六进制（L86 正则强校验），不含 "_b"
++        internal static string FsFogA(string key, string src)
++        {
++            if (Environment.GetEnvironmentVariable("S2A_FOG_A") != "1") return src;
++            if (!string.Equals(key, FOG_KEY, StringComparison.Ordinal)) return src;
++
++            // ① 入口参数：在参数表尾追加 s2a_fog（签名正则贪婪吞整表，尾上是 s2a_aref [[buffer(30)]]）
++            var sig = Search(@"^((?:\[\[[^\]]*\]\]\s*)*)fragment main0_out main0\((.*)\)\n\{\n", src, RegexOptions.Multiline);
++            if (!sig.Success) { FogARed(key, "main0 signature not found"); return src; }
++            string prm = sig.Groups[2].Value;
++            string ext = (prm.Trim().Length > 0 ? ", " : "") + $"constant float* s2a_fog [[buffer({FOG_SLOT})]]";
++            string outp = src[..sig.Index] + sig.Groups[1].Value + "fragment main0_out main0(" + prm + ext + ")\n{\n"
++                        + src[(sig.Index + sig.Length)..];
++
++            // ② 函数体：锚点只用 L1136 那一行（8 空格缩进），必须唯一命中
++            const string anchor = "\n        float _1113 = _963;";
++            int hit = outp.IndexOf(anchor, StringComparison.Ordinal);
++            if (hit < 0) { FogARed(key, "anchor not found"); return src; }
++            if (outp.IndexOf(anchor, hit + anchor.Length, StringComparison.Ordinal) >= 0) { FogARed(key, "anchor matched more than once"); return src; }
++
++            string fin = outp.Replace(anchor,
++                  "\n        _969 = fma(s2a_fog[0], (*spvDescriptorSet0.fp_c5)._m0[125].x, _969);"
++                + "\n        _965 = fma(s2a_fog[0], (*spvDescriptorSet0.fp_c5)._m0[125].y, _965);"
++                + "\n        _967 = fma(s2a_fog[0], (*spvDescriptorSet0.fp_c5)._m0[125].z, _967);"
++                + anchor);
++
++            // ③ 自检：与入口原文比长度差（相对 src，含 ext 与三行两段增量），且三行必须各在
++            int delta = fin.Length - src.Length, n = 0;
++            for (int i = fin.IndexOf("s2a_fog[0]", StringComparison.Ordinal); i >= 0; i = fin.IndexOf("s2a_fog[0]", i + 1, StringComparison.Ordinal)) n++;
++            if (delta <= 0 || n != 3) { FogARed(key, $"self-check failed (delta={delta}, s2a_fog[0]={n}, want 3)"); return src; }
++
++            Console.Error.WriteLine($"[S2A_FOG_A] fog injected into {key} (slot {FOG_SLOT})");
++            return fin;
++        }
++        // 注入失败一律只打一条红、由调用处 return src：throw 会让整支 shader 翻译失败并带崩游戏
++        static void FogARed(string key, string why)
++        {
++            Console.Error.WriteLine($"[RED] {key}: S2A_FOG_A {why}; fog not injected");
++        }
++
+         internal static string FsUvx(string src)
+         {
+             var body = Search(@"struct spvDescriptorSetBuffer0\s*\{(.*?)\};", src, RegexOptions.Singleline);
